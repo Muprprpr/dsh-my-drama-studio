@@ -97,13 +97,26 @@ func (p *project) query(ctx context.Context, r Request) (queryResult, error) {
 		params = append(params, args.Q, args.Q, args.Q)
 	}
 	if args.TaskStatus != "" {
+		var states []string
 		switch args.TaskStatus {
-		case "pending", "submitting", "polling", "succeeded", "failed", "uncertain":
+		case "queued":
+			states = []string{"pending"}
+		case "processing":
+			states = []string{"submitting", "polling", "paused"}
+		case "completed":
+			states = []string{"succeeded"}
+		case "failed":
+			states = []string{"failed", "uncertain"}
+		case "cancelled", "pending", "submitting", "polling", "paused", "succeeded", "uncertain":
+			states = []string{args.TaskStatus}
 		default:
 			return queryResult{}, invalid("未知任务状态")
 		}
-		query += " AND (SELECT status FROM tasks WHERE node_id=nodes.id OR result_node_id=nodes.id ORDER BY rowid DESC LIMIT 1)=?"
-		params = append(params, args.TaskStatus)
+		query += " AND (SELECT status FROM tasks WHERE node_id=nodes.id OR result_node_id=nodes.id ORDER BY rowid DESC LIMIT 1) IN (?" +
+			strings.Repeat(",?", len(states)-1) + ")"
+		for _, state := range states {
+			params = append(params, state)
+		}
 	}
 	rows, err := tx.QueryContext(ctx, query+" ORDER BY rowid DESC LIMIT ? OFFSET ?", append(params, args.Limit+1, args.Offset)...)
 	if err != nil {
@@ -215,7 +228,7 @@ func appendNodes(ctx context.Context, tx *sql.Tx, session string, nodes []NodeIn
 			return appendResult{}, err
 		}
 		if target == "video" {
-			if source != "image" && source != "video" {
+			if !isVideoMedia(source) {
 				return appendResult{}, invalid("视频节点只接受媒体输入")
 			}
 			checkVideos[edge.Target] = struct{}{}
@@ -246,7 +259,7 @@ func nodeType(ctx context.Context, tx *sql.Tx, id string) (string, error) {
 
 func validateNode(n NodeInput) error {
 	switch n.Type {
-	case "script", "shot", "prompt", "image", "video", "note":
+	case "script", "shot", "prompt", "image", "video", "audio", "note":
 	default:
 		return invalid("不支持的节点类型 %q", n.Type)
 	}
@@ -259,7 +272,7 @@ func validateNode(n NodeInput) error {
 	if err := json.Unmarshal(n.Content, &content); err != nil || content == nil {
 		return invalid("节点 content 必须是 JSON 对象")
 	}
-	if n.Type != "image" && n.Type != "video" {
+	if !isVideoMedia(n.Type) {
 		return nil
 	}
 	if len(n.Content) > 64<<10 {
@@ -277,8 +290,8 @@ func validateNode(n NodeInput) error {
 	}
 	if raw, ok := content["path"]; ok {
 		var value string
-		prefix := "assets/" + n.Type + "s/"
-		if json.Unmarshal(raw, &value) != nil || !filepath.IsLocal(value) || strings.Contains(value, "\\") ||
+		prefix := map[string]string{"image": "assets/images/", "video": "assets/", "audio": "assets/audio/"}[n.Type]
+		if json.Unmarshal(raw, &value) != nil || !filepath.IsLocal(value) || strings.ContainsAny(value, "\\:") ||
 			!strings.HasPrefix(value, prefix) || path.Clean(value) != value || len(value) == len(prefix) {
 			return invalid("媒体文件必须使用 %s 下的相对路径", prefix)
 		}
@@ -286,7 +299,63 @@ func validateNode(n NodeInput) error {
 	return nil
 }
 
-var mediaReference = regexp.MustCompile(`(?i)@(图片|视频|音频|文本|脚本|image|video|audio|text|script)[ \t]*([0-9]+)|<<<(image|video|audio|text|script)_([0-9]+)>>>`)
+var mediaReference = regexp.MustCompile(`(?i)@(图片|视频|音频|文本|脚本|提示词|说明|image|video|audio|text|script|prompt|note)[ \t]*([0-9]+)|<<<(image|video|audio|text|script|prompt|note)_([0-9]+)>>>`)
+
+func isVideoMedia(kind string) bool {
+	return kind == "image" || kind == "video" || kind == "audio"
+}
+
+func validateVideoInputs(mode string, kinds []string) error {
+	switch mode {
+	case "t2v":
+		if len(kinds) != 0 {
+			return invalid("T2V 只接受完整提示词")
+		}
+	case "i2v":
+		if len(kinds) == 0 || len(kinds) > 2 || kinds[0] != "image" || len(kinds) == 2 && kinds[1] != "image" {
+			return invalid("I2V 需要首帧图片，可选一张尾帧图片")
+		}
+	case "r2v":
+		if len(kinds) == 0 {
+			return invalid("R2V 需要至少一个参考媒体")
+		}
+		for _, kind := range kinds {
+			if !isVideoMedia(kind) {
+				return invalid("R2V 只接受图片、视频或音频素材")
+			}
+		}
+	case "v2v":
+		if len(kinds) != 1 || kinds[0] != "video" {
+			return invalid("V2V 需要一个源视频")
+		}
+	default:
+		return invalid("未知视频生成方式")
+	}
+	return nil
+}
+
+func validateVideoDraftFields(raw string) error {
+	var content map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &content); err != nil {
+		return invalid("视频生成节点格式无效")
+	}
+	for field := range content {
+		switch strings.ReplaceAll(strings.ReplaceAll(strings.ToLower(field), "_", ""), "-", "") {
+		case "apikey", "apitoken", "authorization", "credentials", "baseurl", "apiurl", "protocol", "headers",
+			"authheader", "auth", "requestmapping", "taskplugin", "advanced", "submiturl", "queryurl":
+			return invalid("视频生成节点须从 Drama Studio 全局设置读取渠道配置")
+		}
+	}
+	return nil
+}
+
+func decodeVideoParams(raw json.RawMessage) (VideoParams, error) {
+	var params VideoParams
+	if err := decodeData(raw, &params); err != nil {
+		return VideoParams{}, invalid("视频节点参数仅支持时长、分辨率、画幅和生成音频")
+	}
+	return params, validateVideoParams(params)
+}
 
 func validateVideo(ctx context.Context, tx *sql.Tx, id string) error {
 	var raw string
@@ -300,15 +369,13 @@ func validateVideo(ctx context.Context, tx *sql.Tx, id string) error {
 		URL            string            `json:"url"`
 		TextList       []json.RawMessage `json:"textList"`
 		MixedListOrder []string          `json:"mixedListOrder"`
+		Params         json.RawMessage   `json:"params"`
 	}
 	if err := json.Unmarshal([]byte(raw), &data); err != nil {
 		return invalid("视频提示词或媒体引用格式无效：%s", err)
 	}
 	if len(data.TextList) != 0 {
 		return invalid("视频节点 textList 必须为空")
-	}
-	if strings.TrimSpace(data.Prompt) == "" && data.Path == "" && data.URL == "" {
-		return invalid("视频生成节点必须在 content.prompt 内联完整提示词")
 	}
 	rows, err := tx.QueryContext(ctx, "SELECT source,type,content FROM edges JOIN nodes ON nodes.id=source WHERE target=? ORDER BY edges.rowid", id)
 	if err != nil {
@@ -321,6 +388,9 @@ func validateVideo(ctx context.Context, tx *sql.Tx, id string) error {
 		var source, kind, rawContent string
 		if err := rows.Scan(&source, &kind, &rawContent); err != nil {
 			return err
+		}
+		if !isVideoMedia(kind) {
+			return invalid("视频节点只接受媒体输入")
 		}
 		var ref struct {
 			Path string `json:"path"`
@@ -335,20 +405,34 @@ func validateVideo(ctx context.Context, tx *sql.Tx, id string) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	if len(media) > 0 && strings.TrimSpace(data.Prompt) == "" {
-		return invalid("带媒体输入的视频节点必须在 content.prompt 内联完整提示词")
+	isDraft := data.Path == "" && data.URL == "" || data.Mode != "" || len(media) > 0
+	if isDraft {
+		if strings.TrimSpace(data.Prompt) == "" {
+			return invalid("视频生成节点必须在 content.prompt 内联完整提示词")
+		}
+		if err := validateVideoDraftFields(raw); err != nil {
+			return err
+		}
+		if _, err := decodeVideoParams(data.Params); err != nil {
+			return err
+		}
 	}
 	if len(data.MixedListOrder) != len(media) {
 		return invalid("mixedListOrder 必须与已连接的媒体一一对应")
 	}
-	if data.Mode != "" && (counts["image"] != len(media) || !validVideoMode(data.Mode, len(media))) {
-		return invalid("T2V 不接收素材，I2V 需要一张首帧，R2V 需要至少一张参考图片")
-	}
+	kinds := make([]string, 0, len(media))
 	for _, source := range data.MixedListOrder {
-		if _, ok := media[source]; !ok {
+		kind, ok := media[source]
+		if !ok {
 			return invalid("mixedListOrder 只能引用已连接媒体且不得重复")
 		}
+		kinds = append(kinds, kind)
 		delete(media, source)
+	}
+	if data.Mode != "" {
+		if err := validateVideoInputs(data.Mode, kinds); err != nil {
+			return err
+		}
 	}
 	for _, ref := range mediaReference.FindAllStringSubmatch(data.Prompt, -1) {
 		kind, number := ref[1], ref[2]

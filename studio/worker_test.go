@@ -243,3 +243,36 @@ func TestGenerationRejectsLoopbackReferenceAndOutputTraversal(t *testing.T) {
 	}
 	t.Log("private URLs usable as previews cannot reach a provider, and provider-controlled path traversal is rejected")
 }
+
+func TestTaskMetadataMigrationPreservesHistoricalResult(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	service := New(providerFixture{})
+	bindSession(t, service, dir, "a")
+	draft, output, taskID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	const saved = "assets/videos/legacy.mp4"
+	mustCall(t, service, dir, "a", "append", appendArgs{operation: operation{ID: "historical"}, Nodes: []NodeInput{
+		{ID: draft, Type: "video", Content: json.RawMessage(`{"mode":"t2v","prompt":"Historical complete prompt."}`)},
+		{ID: output, Type: "video", BasedOn: draft, Content: json.RawMessage(`{"path":"` + saved + `"}`)},
+	}})
+	project, err := service.open(ctx, dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := project.db.ExecContext(ctx, `ALTER TABLE tasks DROP COLUMN completed_at;
+		ALTER TABLE tasks DROP COLUMN output_path;
+		INSERT INTO tasks(id,node_id,session_id,type,status,input,provider_id,result_node_id,created_at,updated_at)
+		VALUES(?,?,'a','video','succeeded','{"mode":"t2v"}','legacy-task',?,'2025-01-01','2025-01-02')`, taskID, draft, output); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Close(); err != nil {
+		t.Fatal(err)
+	}
+	service = New(providerFixture{})
+	defer service.Close()
+	recoverProject(t, service, dir)
+	task := tasksIn(t, service, dir, "a")[0]
+	if task.ID != taskID || task.OutputPath != saved || task.CompletedAt != "2025-01-02" || task.ResultNodeID != output {
+		t.Fatalf("historical task metadata: %+v", task)
+	}
+}

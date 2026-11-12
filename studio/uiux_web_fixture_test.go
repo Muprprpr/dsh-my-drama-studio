@@ -2,6 +2,7 @@ package studio
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,8 +13,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 func TestMain(m *testing.M) {
@@ -35,14 +34,10 @@ func runUIUXWebFixture(video string) error {
 	if home == "" || token == "" || !filepath.IsAbs(video) {
 		return errors.New("isolated DSH home, token and existing absolute video path required")
 	}
-	settings, err := OpenProviderSettings(filepath.Join(home, "my-drama-studio", "providers.dpapi"))
+	settings, err := OpenProfileSettings("")
 	if err != nil {
 		return err
 	}
-	preset := ProviderProfile{ID: uuid.NewString(), Provider: "replicate", Name: "本地验收夹具", Model: "wan-video/wan-2.7-t2v", Mode: "t2v"}
-	settings.data.Profiles = []ProviderProfile{preset}
-	settings.data.Defaults["t2v"] = preset.ID
-	settings.data.Keys["replicate"] = "uiux-local-fixture-token"
 	settings.client.Transport = testTransport(func(req *http.Request) (*http.Response, error) {
 		if req.Header.Get("Authorization") != "Bearer uiux-local-fixture-token" {
 			return nil, errors.New("unexpected fixture credential")
@@ -52,15 +47,20 @@ func runUIUXWebFixture(video string) error {
 		headers.Set("Content-Type", "application/json")
 		var body string
 		switch req.Method + " " + req.URL.Host + req.URL.Path {
-		case "POST api.replicate.com/v1/models/wan-video/wan-2.7-t2v/predictions":
-			code = http.StatusCreated
-			body = `{"id":"uiux-fixture-task","status":"starting"}`
-		case "GET api.replicate.com/v1/predictions/uiux-fixture-task":
-			body = `{"id":"uiux-fixture-task","status":"processing"}`
-			if _, err := os.Stat(filepath.Join(home, "allow-fixture-result")); err == nil {
-				body = `{"id":"uiux-fixture-task","status":"succeeded","output":"https://replicate.delivery/uiux/existing-asset.mp4"}`
+		case "POST video.example.com/v1/videos":
+			var input map[string]any
+			if json.NewDecoder(req.Body).Decode(&input) != nil || input["model"] != "fixture-video" ||
+				input["seconds"] != "8" || input["prompt"] != "固定中景。人物推开餐厅门，在门口停顿。" {
+				return nil, errors.New("unexpected fixture generation parameters")
 			}
-		case "GET replicate.delivery/uiux/existing-asset.mp4":
+			code = http.StatusCreated
+			body = `{"id":"uiux-fixture-task","status":"queued"}`
+		case "GET video.example.com/v1/videos/uiux-fixture-task":
+			body = `{"id":"uiux-fixture-task","status":"in_progress"}`
+			if _, err := os.Stat(filepath.Join(home, "allow-fixture-result")); err == nil {
+				body = `{"id":"uiux-fixture-task","status":"completed"}`
+			}
+		case "GET video.example.com/v1/videos/uiux-fixture-task/content":
 			file, err := os.Open(video)
 			if err != nil {
 				return nil, err

@@ -114,10 +114,6 @@
   font-size: 12px;
   line-height: 18px;
 }
-.drama-shell-more {
-  width: 28px;
-  padding: 0;
-}
 .drama-shell-body {
   display: grid;
   grid-template-rows: minmax(0, 1fr);

@@ -50,6 +50,7 @@
 }
 .drama-canvas-content .react-flow__minimap .drama-map-image,
 .drama-canvas-content .react-flow__minimap .drama-map-video { fill: var(--drama-accent); }
+.drama-canvas-content .react-flow__minimap .drama-map-audio { fill: var(--drama-accent); }
 
 .drama-v2-tools {
   position: absolute;

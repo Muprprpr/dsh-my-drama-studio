@@ -8,8 +8,8 @@ import { GraphNode, cardStyle } from './node-card.jsx'
 import { TaskDrawer, taskActive } from './task-drawer.jsx'
 import { availablePosition, layoutCanvas } from './canvas-layout.js'
 import {
-  isMedia,
-  nodeLabels, nodeTitle, presets, referenceIds, shotLabel, videoMode,
+  isMedia, mediaTypes,
+  nodeLabels, nodeTitle, presets, profileCandidates, referenceIds, referenceLimit, resolveProfile, shotLabel, videoMode,
 } from './canvas-node.jsx'
 
 const nodeTypes = { drama: GraphNode }
@@ -53,7 +53,7 @@ function usePositions(key) {
 }
 
 export function CanvasViewport({
-  snapshot, filters, setFilters, append, mediaURL, submitGeneration, openProviderSettings, queryCanvas, generationProfiles = [],
+  snapshot, filters, setFilters, append, mediaURL, submitGeneration, changeTask, queryCanvas, generationProfiles = [], generationDefaults,
 }) {
   const { nodes, edges, hasMore, status, tasks = [] } = snapshot
   const [positions, setPositions] = usePositions(`drama-layout:${status.canvasId}:${status.sessionId}`)
@@ -91,10 +91,12 @@ export function CanvasViewport({
   const pageSize = filters.limit || 100
   const offset = filters.offset || 0
   const selectedResultIds = new Set(Object.values(selectedResults))
-  const media = useMemo(() => nodes.filter(node => node.type === 'image' && isMedia(node)), [nodes])
+  const media = useMemo(() => nodes.filter(isMedia), [nodes])
 
-  const visibleReferences = edges.filter(edge => visibleIds.has(edge.source) && visibleIds.has(edge.target))
-  const visibleVersions = visible.filter(node => node.basedOn && visibleIds.has(node.basedOn))
+  const visibleReferences = edges.filter(edge => visibleIds.has(edge.source) && visibleIds.has(edge.target) &&
+    (index.get(edge.target).type !== 'video' || isMedia(index.get(edge.source))))
+  const visibleVersions = visible.filter(node => node.basedOn && visibleIds.has(node.basedOn) &&
+    (node.type !== 'video' || mediaTypes.has(index.get(node.basedOn)?.type)))
     .map(node => ({ source: node.basedOn, target: node.id }))
   const relations = [...visibleReferences, ...visibleVersions]
   const ordered = [...visible].sort((a, b) => shotLabel(a).localeCompare(shotLabel(b))
@@ -119,7 +121,6 @@ export function CanvasViewport({
     locate,
     selectResult: node => setSelectedResults(current => ({ ...current, [node.basedOn || node.id]: node.id })),
     submitGeneration,
-    openProviderSettings,
   }
   const graphNodes = visible.map(node => ({
     id: node.id,
@@ -129,7 +130,7 @@ export function CanvasViewport({
     className: 'drama-flow-node',
     dragHandle: '.drama-node-titlebar',
     ariaLabel: nodeTitle(node) || nodeLabels[node.type],
-    data: { node, compact: compact.includes(node.id), actions, index, edges, mediaURL, generationProfiles,
+    data: { node, compact: compact.includes(node.id), actions, index, edges, mediaURL, generationProfiles, generationDefaults,
       tasks: taskIndex.get(node.id), selectedResult: selectedResultIds.has(node.id) },
   }))
   for (const draft of drafts) {
@@ -143,7 +144,7 @@ export function CanvasViewport({
     }
     graphNodes.push({ id: draft.id, type: 'drama', position: positions[draft.id] ?? draft.at, selected: selected.includes(draft.id),
       className: 'drama-flow-node', dragHandle: '.drama-node-titlebar', ariaLabel: '未保存 ' + nodeLabels[type],
-      data: { node, draft, editor, mediaURL, generationProfiles } })
+      data: { node, draft, editor, mediaURL, generationProfiles, generationDefaults } })
   }
 
   const graphEdges = visibleReferences
@@ -151,9 +152,8 @@ export function CanvasViewport({
       ...edge, id: `${edge.source}:${edge.target}`, sourceHandle: 'out', targetHandle: 'in', type: 'smoothstep',
       className: isMedia(index.get(edge.source)) ? 'drama-edge-media' : 'drama-edge-reference',
     }))
-  for (const node of visible) {
-    if (!node.basedOn || !visibleIds.has(node.basedOn)) continue
-    graphEdges.push({ id: `version:${node.id}`, source: node.basedOn, target: node.id,
+  for (const { source, target } of visibleVersions) {
+    graphEdges.push({ id: `version:${target}`, source, target,
       sourceHandle: 'out', targetHandle: 'lineage', label: '派生', type: 'smoothstep', className: 'drama-edge-version' })
   }
 
@@ -244,8 +244,7 @@ export function CanvasViewport({
 
   function choosePreset(preset) {
     const { at, seed } = picker
-    const asLineage = preset.type === 'video' && seed && !(seed.type === 'image' && isMedia(seed))
-    openEditor({ at, seed: asLineage ? undefined : seed, base: asLineage ? seed : undefined, preset, group: seed })
+    openEditor({ at, seed, preset, group: seed })
   }
 
   function canLink({ source, target, targetHandle }) {
@@ -255,17 +254,23 @@ export function CanvasViewport({
     if (!from || !to || source === target || edges.some(edge => edge.source === source && edge.target === target)
         || referenceIds(to).includes(source)) return false
     if (to.type !== 'video') return true
-    return videoMode(to) !== 'asset' && from.type === 'image' && isMedia(from)
+    const mode = videoMode(to)
+    return mode !== 'asset' && isMedia(from) &&
+      (mode !== 'v2v' || from.type === 'video' && referenceIds(to).length === 0)
   }
 
   async function connect({ source, target, targetHandle }) {
     if (!canLink({ source, target, targetHandle })) return
     const to = index.get(target)
     if (to.type === 'video') {
-      const preset = presets.find(item => item.mode === 'r2v')
       const mode = videoMode(to)
-      const usePreset = mode === 't2v' || mode === 'i2v' && referenceIds(to).length > 0
-      openEditor({ base: to, seed: index.get(source), preset: usePreset ? preset : undefined })
+      const seed = index.get(source)
+      const profile = resolveProfile(profileCandidates(generationProfiles, mode), to.content.profileId)
+      let nextMode = mode
+      if (mode === 't2v') nextMode = seed.type === 'video' ? 'v2v' : 'r2v'
+      if (mode === 'i2v' && referenceIds(to).length >= referenceLimit(mode, seed.type, profile)) nextMode = 'r2v'
+      const preset = nextMode === mode ? undefined : presets.find(item => item.mode === nextMode)
+      openEditor({ base: to, seed, preset })
       return
     }
     setEdgeError('')
@@ -373,7 +378,7 @@ export function CanvasViewport({
       <CanvasToolbar filters={filters} update={filter} filterGroup={setFilters} groups={groups} collapsed={collapsed}
         toggleGroup={group => setCollapsed(current => current.includes(group) ? current.filter(id => id !== group) : [...current, group])}
         fit={fitCanvas} arrange={arrange} add={() => openPicker()} setAddAnchor={addAnchor}
-        tasksOpen={tasksOpen} toggleTasks={() => setTasksOpen(value => !value)} activeTasks={tasks.filter(task => taskActive(task.status)).length} />
+        tasksOpen={tasksOpen} toggleTasks={() => setTasksOpen(value => !value)} activeTasks={tasks.filter(taskActive).length} />
       <CanvasCorners showMap={showMap} toggleMap={() => setShowMap(value => !value)} boxSelect={boxSelect}
         toggleBox={() => setBoxSelect(value => !value)} selected={selected}
         compact={selected.every(id => compact.includes(id))} toggleCompact={() => toggleCompact(selected)} />
@@ -391,9 +396,10 @@ export function CanvasViewport({
       {picker && <CanvasPicker key={picker.seed?.id ?? 'all'} picker={picker} choose={choosePreset}
         presets={presets.filter(item => {
           if (!picker.seed) return true
-          const picture = picker.seed.type === 'image' && isMedia(picker.seed)
           if (item.type !== 'video') return true
-          if (picture) return item.mode === 'i2v' || item.mode === 'r2v'
+          if (isMedia(picker.seed)) return item.mode === 'r2v' ||
+            (picker.seed.type === 'image' && item.mode === 'i2v') ||
+            (picker.seed.type === 'video' && item.mode === 'v2v')
           return item.mode === 't2v' && ['script', 'shot', 'prompt', 'note'].includes(picker.seed.type)
         })}
         close={() => setPicker(null)} />}
@@ -409,13 +415,15 @@ export function CanvasViewport({
           else openEditor({ base: node, duplicate: id === 'copy' })
         }} />}
       {tasksOpen && <TaskDrawer tasks={tasks} nodes={nodes} onLocate={id => { locate(id); setTasksOpen(false) }}
+        changeTask={changeTask}
         onClose={() => setTasksOpen(false)} />}
     </div>
     {preview && <Modal open onClose={() => setPreview(null)} title={nodeTitle(preview) || nodeLabels[preview.type]}
       closeLabel="关闭预览" contentClassName="drama-v2-preview-modal">
       <div className="drama-v2-preview">
-        {preview.type === 'image' ? <img src={mediaURL(preview)} alt={nodeTitle(preview) || '图片预览'} />
-          : <video controls playsInline preload="metadata" src={mediaURL(preview)} aria-label="视频预览" />}
+        {preview.type === 'image' && <img src={mediaURL(preview)} alt={nodeTitle(preview) || '图片预览'} />}
+        {preview.type === 'video' && <video controls playsInline preload="metadata" src={mediaURL(preview)} aria-label="视频预览" />}
+        {preview.type === 'audio' && <audio controls preload="metadata" src={mediaURL(preview)} aria-label="音频预览" />}
       </div>
     </Modal>}
   </div>

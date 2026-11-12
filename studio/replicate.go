@@ -66,6 +66,7 @@ type replicatePrediction struct {
 	ID     string          `json:"id"`
 	Status string          `json:"status"`
 	Output json.RawMessage `json:"output"`
+	Error  json.RawMessage `json:"error"`
 }
 
 func replicateRequest(profile ProviderProfile, input GenerationInput) (string, replicatePredictionInput, error) {
@@ -262,30 +263,34 @@ func replicateRejected(code int) bool {
 
 func (p *replicateProvider) Poll(ctx context.Context, id string) (ProviderResult, error) {
 	if !replicateIdentifier.MatchString(id) {
-		return ProviderResult{}, errors.New("Replicate 预测 ID 无效")
+		return ProviderResult{}, permanentProviderError("Replicate 预测 ID 无效")
 	}
 	var prediction replicatePrediction
 	if _, err := p.request(ctx, http.MethodGet, "/predictions/"+id, "", nil, &prediction); err != nil {
 		return ProviderResult{}, err
 	}
 	if prediction.ID != id {
-		return ProviderResult{}, errors.New("Replicate 返回了不匹配的预测 ID")
+		return ProviderResult{}, permanentProviderError("Replicate 返回了不匹配的预测 ID")
 	}
 	switch prediction.Status {
 	case "starting":
 		return ProviderResult{Status: "pending"}, nil
 	case "processing":
 		return ProviderResult{Status: "running"}, nil
-	case "canceled", "failed":
-		return ProviderResult{Status: "failed"}, nil
+	case "canceled":
+		return ProviderResult{Status: "cancelled"}, nil
+	case "failed":
+		var message string
+		_ = json.Unmarshal(prediction.Error, &message)
+		return ProviderResult{Status: "failed", Error: (videoHTTP{key: p.apiKey}).safeMessage(message)}, nil
 	case "succeeded":
 		asset, extension := replicateOutput(prediction.Output, p.profile.Mode == "t2i")
 		if asset == "" {
-			return ProviderResult{Status: "failed"}, nil
+			return ProviderResult{Status: "failed", Error: "Replicate 生成完成但未返回可下载的视频或图片"}, nil
 		}
 		return ProviderResult{Status: "succeeded", URL: asset, Extension: extension}, nil
 	default:
-		return ProviderResult{}, errors.New("Replicate 返回了未知预测状态")
+		return ProviderResult{}, permanentProviderError("Replicate 返回了未知预测状态")
 	}
 }
 
@@ -431,7 +436,13 @@ func (p *replicateProvider) request(ctx context.Context, method, endpoint, conte
 	defer response.Body.Close()
 	code := response.StatusCode
 	if code < http.StatusOK || code >= http.StatusMultipleChoices {
-		return code, fmt.Errorf("Replicate API 返回 HTTP %d", code)
+		var data map[string]any
+		_ = json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&data)
+		message := providerMessage(data)
+		if message == "" {
+			message, _ = data["detail"].(string)
+		}
+		return code, (videoHTTP{key: p.apiKey}).responseError(code, message)
 	}
 	if err := json.NewDecoder(io.LimitReader(response.Body, 4<<20)).Decode(output); err != nil {
 		return code, errors.New("无法读取 Replicate API 响应")

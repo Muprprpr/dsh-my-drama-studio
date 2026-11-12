@@ -40,8 +40,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY, node_id TEXT NOT NULL REFERENCES nodes(id), session_id TEXT NOT NULL,
   type TEXT NOT NULL, status TEXT NOT NULL, input TEXT NOT NULL,
   provider_id TEXT NOT NULL DEFAULT '', result_node_id TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '',
-  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  completed_at TEXT NOT NULL DEFAULT '', output_path TEXT NOT NULL DEFAULT ''
 );
+CREATE INDEX IF NOT EXISTS tasks_status_created ON tasks(status,created_at);
 CREATE TRIGGER IF NOT EXISTS nodes_no_update BEFORE UPDATE ON nodes BEGIN SELECT RAISE(ABORT, 'nodes are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS nodes_no_delete BEFORE DELETE ON nodes BEGIN SELECT RAISE(ABORT, 'nodes are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS edges_no_update BEFORE UPDATE ON edges BEGIN SELECT RAISE(ABORT, 'edges are append-only'); END;
@@ -59,10 +61,12 @@ type Status struct {
 }
 
 type Service struct {
-	mu       sync.Mutex
-	projects map[string]*project
-	provider providerRegistry
-	wake     chan struct{}
+	mu           sync.Mutex
+	projects     map[string]*project
+	provider     providerRegistry
+	wake         chan struct{}
+	pollInterval time.Duration
+	pollTimeout  time.Duration
 }
 
 type project struct {
@@ -72,8 +76,16 @@ type project struct {
 	changed chan struct{}
 }
 
+var videoActions = map[string]string{
+	"generateT2V": "t2v",
+	"generateI2V": "i2v",
+	"generateR2V": "r2v",
+	"generateV2V": "v2v",
+}
+
 func New(provider providerRegistry) *Service {
-	return &Service{projects: make(map[string]*project), provider: provider, wake: make(chan struct{}, 1)}
+	return &Service{projects: make(map[string]*project), provider: provider, wake: make(chan struct{}, 1),
+		pollInterval: 2 * time.Second, pollTimeout: 30 * time.Minute}
 }
 
 func (s *Service) Close() error {
@@ -155,6 +167,9 @@ func (s *Service) open(ctx context.Context, directory string, create bool) (*pro
 	}
 	_, err = tx.ExecContext(ctx, schema)
 	if err == nil {
+		err = migrateTaskFields(ctx, tx)
+	}
+	if err == nil {
 		_, err = tx.ExecContext(ctx, `INSERT INTO canvas_meta VALUES(1,?) ON CONFLICT DO NOTHING`, uuid.NewString())
 	}
 	if err == nil {
@@ -190,12 +205,16 @@ func getStatus(ctx context.Context, db rowQuery, r Request) (Status, error) {
 }
 
 func (s *Service) Execute(ctx context.Context, r Request) (any, error) {
-	if strings.HasPrefix(r.Action, "provider_") {
+	if strings.HasPrefix(r.Action, "provider_") || r.Action == "channel_test" {
 		settings, ok := s.provider.(*ProviderSettings)
 		if !ok || r.SessionID != "" || r.WorkspaceID != "" || r.WorkspacePath != "" {
 			return nil, invalid("无效的供应商设置操作")
 		}
-		return settings.execute(ctx, r.Action, r.Data)
+		result, err := settings.execute(ctx, r.Action, r.Data)
+		if err == nil && r.Action == "provider_configure" {
+			s.wakeWorker()
+		}
+		return result, err
 	}
 	if r.Action == "recover" {
 		if r.SessionID != "" || strings.TrimSpace(r.WorkspaceID) == "" {
@@ -208,6 +227,10 @@ func (s *Service) Execute(ctx context.Context, r Request) (any, error) {
 			return map[string]bool{"recovered": false}, nil
 		}
 		p, err := s.open(ctx, r.WorkspacePath, false)
+		if err == nil && p != nil {
+			_, err = p.db.ExecContext(ctx, `UPDATE tasks SET status='polling',error='',updated_at=?
+				WHERE status='paused' AND provider_id<>''`, time.Now().UTC().Format(time.RFC3339Nano))
+		}
 		s.wakeWorker()
 		return map[string]bool{"recovered": p != nil}, err
 	}
@@ -223,7 +246,8 @@ func (s *Service) Execute(ctx context.Context, r Request) (any, error) {
 		if err := op.validate(); err != nil {
 			return nil, err
 		}
-	case "context", "query", "append", "events", "permission", "submit", "submit_manual", "tasks":
+	case "context", "query", "append", "events", "permission", "submit", "submit_manual", "tasks",
+		"generateT2V", "generateI2V", "generateR2V", "generateV2V", "cancel_task", "resume_task":
 	default:
 		return nil, invalid("未知 Studio 操作：%s", r.Action)
 	}
@@ -248,14 +272,20 @@ func (s *Service) Execute(ctx context.Context, r Request) (any, error) {
 		return p.append(ctx, r)
 	case "permission":
 		return p.permission(ctx, r)
-	case "submit", "submit_manual":
-		result, err := p.submit(ctx, r, s.provider)
+	case "submit", "submit_manual", "generateT2V", "generateI2V", "generateR2V", "generateV2V":
+		result, err := p.submit(ctx, r, s.provider, videoActions[r.Action])
 		if err == nil {
 			s.wakeWorker()
 		}
 		return result, err
 	case "tasks":
 		return p.tasks(ctx, r)
+	case "cancel_task", "resume_task":
+		result, err := p.controlTask(ctx, r)
+		if err == nil {
+			s.wakeWorker()
+		}
+		return result, err
 	default:
 		return p.events(ctx, r)
 	}

@@ -1,16 +1,17 @@
 import React, { useCallback, useEffect, useState, useSyncExternalStore } from 'react'
 import { CanvasViewport } from './canvas.jsx'
-import { ProviderSettings } from './provider-settings.jsx'
+import { videoMode } from './canvas-node.jsx'
+import { ProviderSettings, getProviderSettingsRevision, subscribeProviderSettings } from './provider-settings.jsx'
 import {
-  Button, IconChevronDownOutlineRegular, IconEllipsisOutlineRegular, IconPanelLeftOutlineRegular,
-  IconSettingsOutlineRegular, Menu, MenuItemButton, StateDot, Switch, Tooltip,
+  Button, IconChevronDownOutlineRegular, IconPanelLeftOutlineRegular, Menu, MenuItemButton, StateDot, Switch, Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import shellStyle from './studio-shell.css'
-import { initialize, mediaURL, operation, providerRequest, subscribe } from './studio-api.js'
+import { generateT2V, generateI2V, generateR2V, generateV2V, initialize, mediaURL, operation, providerRequest, subscribe } from './studio-api.js'
 
 const kind = 'drama-canvas'
 const tabId = 'dsh-my-drama-studio.canvas'
 const statusChanges = new EventTarget()
+const videoGeneration = { t2v: generateT2V, i2v: generateI2V, r2v: generateR2V, v2v: generateV2V }
 
 export const inject = ['slots', 'sidebarRight', 'sidebarRightTabs', 'locale']
 
@@ -34,6 +35,8 @@ export function apply(ctx) {
     ctx.slots.register({ name: 'conversation.input.left', id: 'drama-session-control' },
       ({ sessionId, useWorkspaces }) => <SessionCanvasControl key={sessionId} sessionId={sessionId}
         sidebar={sidebar} useWorkspaces={useWorkspaces} />)))
+  ctx.effect(() => ctx.slots.inject('settings.section', () =>
+    ctx.slots.register({ name: 'settings.section', id: 'drama-studio', order: 60, label: 'Drama Studio' }, ProviderSettings)))
 }
 
 function notify(sessionId) {
@@ -172,19 +175,13 @@ function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
   const [filters, setFilters] = useState({})
   const [providerData, setProviderData] = useState(null)
   const [providerError, setProviderError] = useState('')
-  const [settingsOpen, setSettingsOpen] = useState(false)
-  const [moreOpen, setMoreOpen] = useState(false)
+  const settingsRevision = useSyncExternalStore(subscribeProviderSettings, getProviderSettingsRevision)
   const [revision, setRevision] = useState(0)
   const [error, setError] = useState('')
   const ticket = session?.ticket
   const connected = session?.status.connected
   const workspaceTitle = useWorkspaces(snapshot => snapshot.items.find(item => item.workspaceId === session?.status.workspaceId)?.title)
   const queryCanvas = useCallback((query, signal) => operation(ticket, 'query', query, signal), [ticket])
-  const closeMore = useCallback(() => setMoreOpen(false), [])
-  const openProviderSettings = useCallback(() => {
-    setMoreOpen(false)
-    setSettingsOpen(true)
-  }, [])
 
   useEffect(() => {
     if (!visible || !connected) return
@@ -220,7 +217,7 @@ function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
   }, [ticket, connected, visible, sessionId])
 
   useEffect(() => {
-    if (!visible) return
+    if (!visible || !connected) return
     const controller = new AbortController()
     providerRequest('provider_settings', {}, controller.signal).then(result => {
       if (!controller.signal.aborted) { setProviderData(result); setProviderError('') }
@@ -228,7 +225,7 @@ function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
       if (!controller.signal.aborted) setProviderError(failure.message)
     })
     return () => controller.abort()
-  }, [visible, settingsOpen])
+  }, [visible, connected, settingsRevision])
 
   async function append(data) {
     const result = await operation(ticket, 'append', { ...data, operationId: crypto.randomUUID() })
@@ -237,19 +234,20 @@ function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
   }
 
   async function submitGeneration(node, profileId) {
-    const result = await operation(ticket, 'submit_manual', {
+    const request = {
       operationId: crypto.randomUUID(), nodeId: node.id, profileId, confirmed: true,
-    })
+    }
+    const result = node.type === 'video'
+      ? await videoGeneration[videoMode(node)](ticket, request)
+      : await operation(ticket, 'submit_manual', request)
     setRevision(value => value + 1)
     return result
   }
 
-  useEffect(() => {
-    if (!visible) {
-      setMoreOpen(false)
-      setSettingsOpen(false)
-    }
-  }, [visible])
+  async function changeTask(action, taskId) {
+    await operation(ticket, action, { operationId: crypto.randomUUID(), taskId })
+    setRevision(value => value + 1)
+  }
 
   const snapshot = view?.ticket === ticket && view?.result.status.canvasId === session?.status.canvasId
     ? view?.result : null
@@ -265,25 +263,15 @@ function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
       {connected && <span className="drama-shell-connected" title={`${status.connectedSessions} 个会话已连接`}>
         <StateDot state="done" size={7} />{status.connectedSessions} 个会话
       </span>}
-      <Menu open={visible && moreOpen} onClose={closeMore} portal compact align="end"
-        anchor={<Tooltip portal side="bottom" label="画布更多">
-          <Button size="sm" className="drama-shell-more" aria-label="画布更多" aria-haspopup="menu"
-            aria-expanded={visible && moreOpen} onClick={() => setMoreOpen(value => !value)}>
-            <IconEllipsisOutlineRegular />
-          </Button>
-        </Tooltip>}
-        items={[{ id: 'settings', label: '生成服务设置', icon: <IconSettingsOutlineRegular /> }]}
-        onSelect={openProviderSettings} />
     </header>
     <div className="drama-shell-body">
       {connected && snapshot ? <CanvasViewport snapshot={snapshot} filters={filters}
         setFilters={setFilters} append={append} mediaURL={node => mediaURL(ticket, node)}
-        generationProfiles={providerData?.profiles ?? []} queryCanvas={queryCanvas}
-        submitGeneration={submitGeneration} openProviderSettings={openProviderSettings} />
+        generationProfiles={providerData?.profiles ?? []} generationDefaults={providerData?.generation}
+        queryCanvas={queryCanvas} submitGeneration={submitGeneration} changeTask={changeTask} />
         : !issue && <p className="drama-shell-empty">{session && !connected ? '从输入栏连接项目画布' : '正在读取画布…'}</p>}
       {issue && <p role="alert" className="drama-shell-error">{issue}</p>}
+      {providerError && <p role="alert" className="drama-shell-error">{providerError}</p>}
     </div>
-    {settingsOpen && visible && <ProviderSettings data={providerData} error={providerError}
-      close={() => setSettingsOpen(false)} update={setProviderData} />}
   </section>
 }

@@ -41,7 +41,7 @@ func run() error {
 		}
 		home = filepath.Join(userHome, ".dsh")
 	}
-	providers, err := studio.OpenProviderSettings(filepath.Join(home, "my-drama-studio", "providers.dpapi"))
+	providers, err := studio.OpenProfileSettings(filepath.Join(home, "my-drama-studio", "providers.dpapi"))
 	if err != nil {
 		return err
 	}

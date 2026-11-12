@@ -8,4 +8,8 @@ DSH 原生 Web 负责 Workspace、Session、对话和侧栏生命周期。一个
 
 自动生成许可独立于持久绑定，按 Session 存在于服务内存。人工确认与 Agent 自动提交在服务端分别检查，使用同一个生成任务入口。Studio 权限覆盖 Studio 任务入口，DSH 的其他工具遵循各自的权限和凭据规则。
 
-任务只在选择了与节点模式匹配的已配置预设时入队。内部 Provider 契约负责提交、查询和文件传输，任务快照保存完整提示词、有序媒体引用和供应商模型预设，不保存密钥。项目图片按供应商契约在提交前上传或编码。单进程 worker 在提交前写入 submitting，收到任务 ID 后持久化再轮询。服务重启时 Host 从 DSH Workspace Registry 发起恢复，任务与页面或 Session 的连接状态无关。缺少供应商 ID 的不确定提交进入 uncertain，需先核查供应商侧记录。下载文件限制在项目资产目录，结果节点与任务完成状态事务提交。供应商设置只接受已认证的 DSH Browser Owner Peer 请求，Host 通过私有通道交给 Go。密钥与预设保存在当前 Windows 用户的 DPAPI 文件，Worker 取任务时按快照中的供应商查找当前密钥。已有任务继续沿用原模型和参数。
+任务只在节点和所选模型通过模式、参数和素材校验后入队。四种视频方法复用同一个 Provider 契约、SQLite 队列与资产管理。任务快照保存内联提示词、有序媒体引用、模型、参数、渠道协议和结果目录。Worker 取任务时从当前 Profile 的内存配置查找密钥。
+
+同一 Host 的所有工作区共享生成并发额度，默认 2。每个任务从提交到轮询及下载占用一个额度。Worker 在提交前持久化提交阶段，收到上游 ID 后先落盘再轮询。到达轮询期限后可继续查询，Host 重启时从 DSH Workspace Registry 恢复已知 ID。提交结果不确定且未收到 ID 时，记录待对账原因并停止自动执行。下载落在项目资产目录，结果节点、完成时间和本地路径在同一事务提交，原有 SSE 事件触发画布刷新。
+
+浏览器通过 DSH 原生根作用域 `settings.section` 注册 Drama Studio。已认证的 DSH Browser Owner 可以读写设置。渠道和预设由 DSH Host Settings 写入当前 Profile 的 Cordis patch，凭据由 DSH credentials 服务按 Profile 和渠道寻址。旧 Web Profile 的 DPAPI 文件仅供读取和导入。

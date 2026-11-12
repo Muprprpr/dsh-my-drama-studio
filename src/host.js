@@ -3,9 +3,11 @@ import { once } from 'node:events'
 import { startKernel, StudioError } from './kernel.js'
 import { streamMedia } from './media.js'
 import { registerTools } from './tools.js'
+import { openProfileSettings } from './profile-settings.js'
 
 export const name = 'my-drama-studio'
-export const inject = ['connection', 'webServer', 'workspaceRegistry', 'tools']
+export const inject = ['connection', 'webServer', 'workspaceRegistry', 'tools', 'settings', 'credentials', 'profileContext']
+export { Config } from './profile-settings.js'
 
 export function keys(value, ...allowed) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -72,10 +74,12 @@ function route(ctx, path, run, method = 'POST') {
   }))
 }
 
-const browserActions = new Set(['context', 'bind', 'disconnect', 'query', 'append', 'permission', 'submit_manual', 'tasks'])
+const browserActions = new Set(['context', 'bind', 'disconnect', 'query', 'append', 'permission', 'submit_manual', 'tasks',
+  'generateT2V', 'generateI2V', 'generateR2V', 'generateV2V', 'cancel_task', 'resume_task'])
 
-export async function apply(ctx) {
+export async function apply(ctx, config) {
   const kernel = await startKernel(ctx)
+  const providerRequest = await openProfileSettings(ctx, config, kernel)
   const signingKey = randomBytes(32)
   const lifetime = new AbortController()
   ctx.effect(() => () => lifetime.abort())
@@ -112,10 +116,7 @@ export async function apply(ctx) {
 
   route(ctx, '/api/drama/providers', async body => {
     const { action, data } = keys(body, 'action', 'data')
-    if (!['provider_settings', 'provider_save', 'provider_remove', 'provider_test'].includes(action)) {
-      throw new StudioError(400, 'Unknown provider setting action')
-    }
-    return kernel('', { id: '', path: '' }, action, keysData(data))
+    return providerRequest(action, keysData(data))
   })
 
   route(ctx, '/api/drama/operation', async (body, peer) => {

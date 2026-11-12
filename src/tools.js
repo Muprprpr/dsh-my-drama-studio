@@ -1,7 +1,7 @@
 import { StudioError } from './kernel.js'
 
 const string = { type: 'string' }
-const types = { type: 'string', enum: ['script', 'shot', 'prompt', 'image', 'video', 'note'] }
+const types = { type: 'string', enum: ['script', 'shot', 'prompt', 'image', 'video', 'audio', 'note'] }
 const object = (properties, required = []) => ({ type: 'object', properties, required, additionalProperties: false })
 
 const query = {
@@ -12,7 +12,7 @@ const node = object({
   id: string, type: types, basedOn: string, episodeId: string, sceneId: string, shotId: string,
   content: {
     type: 'object', additionalProperties: true,
-    description: 'Immutable creative content. A video draft must contain its full prompt and receive only actual image/video input edges.',
+    description: 'Immutable creative content. A video draft must contain its full prompt and receive only actual image, video or audio input edges.',
   },
 }, ['type', 'content'])
 const edge = object({ source: string, target: string }, ['source', 'target'])

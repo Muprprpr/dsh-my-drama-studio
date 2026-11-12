@@ -20,27 +20,36 @@ func (transport testTransport) RoundTrip(req *http.Request) (*http.Response, err
 	return transport(req)
 }
 
-func TestProviderSettingsProtectedPersistence(t *testing.T) {
+func TestLegacyProviderSettingsImportAndRedaction(t *testing.T) {
+	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "providers.dpapi")
-	settings, err := OpenProviderSettings(path)
+	settings, err := OpenProfileSettings(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	const key = "fixture-not-a-live-provider-token"
-	profile := ProviderProfile{Name: "Veo Reference", Provider: "replicate", Mode: "r2v", Model: "google/veo-3.1", InputField: "reference_images"}
-	keyValue := key
-	if err := settings.save(profile, &keyValue, true); err != nil {
-		t.Fatal(err)
-	}
-	encrypted, err := os.ReadFile(path)
+	profile := ProviderProfile{ID: uuid.NewString(), Name: "Veo Reference", Provider: "replicate", Mode: "r2v", Model: "google/veo-3.1", InputField: "reference_images"}
+	document, err := json.Marshal(providerData{Profiles: []ProviderProfile{profile},
+		Keys: map[string]string{"replicate": key}, Defaults: map[string]string{"r2v": profile.ID}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(encrypted, []byte(key)) || json.Valid(encrypted) {
-		t.Fatal("Settings file contains plaintext data")
-	}
-	settings, err = OpenProviderSettings(path)
+	encrypted, err := providerSecret(document, true)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, encrypted, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	imported, err := settings.execute(ctx, "provider_legacy", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(imported)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := settings.execute(ctx, "provider_configure", payload); err != nil {
 		t.Fatal(err)
 	}
 	view := settings.view()
@@ -63,9 +72,7 @@ func TestProviderSettingsProtectedPersistence(t *testing.T) {
 	if input.Profile.ID != profiles[0].ID || input.Profile.Model != profile.Model {
 		t.Fatal("Default preset not selected")
 	}
-	if err := settings.remove(input.Profile.ID); err != nil {
-		t.Fatal(err)
-	}
+	settings.data.Profiles = nil
 	if _, err := settings.Resolve(input.Profile); err != nil {
 		t.Fatal("Preset removal must preserve credentials for queued tasks:", err)
 	}
@@ -76,16 +83,16 @@ func TestProviderSettingsProtectedPersistence(t *testing.T) {
 
 func TestConfiguredProviderJobKeepsPresetAcrossEdits(t *testing.T) {
 	ctx := context.Background()
-	settings, err := OpenProviderSettings(filepath.Join(t.TempDir(), "providers.dpapi"))
+	settings, err := OpenProfileSettings("")
 	if err != nil {
 		t.Fatal(err)
 	}
 	const token = "fixture-token"
-	key := token
-	initial := ProviderProfile{Name: "Wan Text", Provider: "replicate", Mode: "t2v", Model: "wan-video/wan-2.7-t2v"}
-	if err := settings.save(initial, &key, true); err != nil {
-		t.Fatal(err)
-	}
+	initial := ProviderProfile{ID: uuid.NewString(), Name: "Wan Text", Provider: "replicate",
+		ChannelID: "replicate", Modes: []string{"t2v"}, Model: "wan-video/wan-2.7-t2v"}
+	settings.data.Profiles = []ProviderProfile{initial}
+	settings.data.Channels = []VideoChannel{{ID: "replicate", Name: "Replicate", Protocol: "replicate"}}
+	settings.data.Keys["replicate"] = token
 	settings.client.Transport = testTransport(func(req *http.Request) (*http.Response, error) {
 		if req.Header.Get("Authorization") != "Bearer "+token {
 			t.Fatal("Expected provider credential")
@@ -101,7 +108,7 @@ func TestConfiguredProviderJobKeepsPresetAcrossEdits(t *testing.T) {
 		case "GET api.replicate.com/v1/predictions/fixture-task":
 			body = `{"id":"fixture-task","status":"succeeded","output":"https://replicate.delivery/demo/fixture.mp4"}`
 		case "GET replicate.delivery/demo/fixture.mp4":
-			body = "fixture video bytes"
+			body = string(protocolTestVideo)
 		default:
 			t.Fatalf("Unexpected fixture request %s %s", req.Method, req.URL)
 		}
@@ -133,11 +140,7 @@ func TestConfiguredProviderJobKeepsPresetAcrossEdits(t *testing.T) {
 	if strings.Contains(input, token) {
 		t.Fatal("Provider key stored in task snapshot")
 	}
-	preset := settings.view()["profiles"].([]providerView)[0].ProviderProfile
-	preset.Model = "google/veo-3.1"
-	if err := settings.save(preset, nil, true); err != nil {
-		t.Fatal(err)
-	}
+	settings.data.Profiles[0].Model = "google/veo-3.1"
 	for range 2 {
 		if err := project.advance(ctx, settings); err != nil {
 			t.Fatal(err)
@@ -154,18 +157,6 @@ func TestProviderTemplatesAndModeConstraints(t *testing.T) {
 	for _, profile := range providerTemplates() {
 		if err := validateProfile(profile); err != nil {
 			t.Errorf("%s %s: %v", profile.Provider, profile.Name, err)
-		}
-	}
-	for _, tc := range []struct {
-		mode  string
-		count int
-		want  bool
-	}{
-		{"t2v", 0, true}, {"t2v", 1, false}, {"i2v", 1, true}, {"i2v", 2, false},
-		{"r2v", 1, true}, {"r2v", 0, false}, {"v2v", 1, false},
-	} {
-		if validVideoMode(tc.mode, tc.count) != tc.want {
-			t.Errorf("%s with %d images", tc.mode, tc.count)
 		}
 	}
 }

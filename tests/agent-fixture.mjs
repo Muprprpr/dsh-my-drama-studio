@@ -56,7 +56,15 @@ async function verify(ctx, signal) {
     return response.json()
   }
 
-  const init = async sessionId => ok(await request('init', { sessionId }), 'init')
+  const init = async sessionId => until(async () => {
+    const response = await request('init', { sessionId })
+    // Native Web can admit its owner while the plugin is still starting the kernel.
+    if (response.status === 404 && !response.headers.get('content-type')?.includes('application/json')) {
+      await response.body?.cancel()
+      return undefined
+    }
+    return ok(response, 'init')
+  }, signal, 'Studio Host routes')
   const op = async (ticket, action, data = {}) => ok(
     await request('operation', { ticket, action, data: { operationId: randomUUID(), ...data } }), action,
   )

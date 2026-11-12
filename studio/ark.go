@@ -19,6 +19,9 @@ const (
 	arkTasksPath       = "/api/v3/contents/generations/tasks"
 	arkMaxImageBytes   = 30_000_000
 	arkMaxBodyBytes    = 64_000_000
+	arkSeedance10      = "seedance-1.0"
+	arkSeedance20      = "seedance-2.0"
+	arkSeedance25      = "seedance-2.5"
 )
 
 type arkProvider struct {
@@ -42,46 +45,64 @@ func newArkProvider(profile ProviderProfile, apiKey string, client *http.Client)
 	return &arkProvider{profile: profile, apiKey: strings.TrimSpace(apiKey), origin: origin, client: &transport}
 }
 
-func arkModelFamily(profile ProviderProfile) string {
-	model := profile.Model
+type arkModelContract struct {
+	family     string
+	fastOrMini bool
+}
+
+// Match only the published API IDs. An inference endpoint ID does not identify
+// its deployed model.
+func knownArkModelContract(profile ProviderProfile) arkModelContract {
 	prefix := "doubao-"
-	if profile.Provider == "byteplus" {
-		prefix = "dreamina-"
-	}
-	switch model {
-	case prefix + "seedance-2-5-260628":
-		return "2.5"
-	case prefix + "seedance-2-0-260128", prefix + "seedance-2-0-fast-260128", prefix + "seedance-2-0-mini-260615":
-		return "2.0"
-	}
 	legacyPrefix := prefix
 	if profile.Provider == "byteplus" {
+		prefix = "dreamina-"
 		legacyPrefix = ""
 	}
-	switch model {
+	switch profile.Model {
+	case prefix + "seedance-2-5-260628":
+		return arkModelContract{family: arkSeedance25}
+	case prefix + "seedance-2-0-260128":
+		return arkModelContract{family: arkSeedance20}
+	case prefix + "seedance-2-0-fast-260128", prefix + "seedance-2-0-mini-260615":
+		return arkModelContract{family: arkSeedance20, fastOrMini: true}
 	case legacyPrefix + "seedance-1-0-pro-250528", legacyPrefix + "seedance-1-0-pro-fast-251015":
-		return "1.0"
+		return arkModelContract{family: arkSeedance10}
 	}
-	if strings.HasPrefix(model, "ep-") {
-		return "endpoint"
+	return arkModelContract{}
+}
+
+func arkContractFor(profile ProviderProfile) arkModelContract {
+	contract := knownArkModelContract(profile)
+	if contract.family == "" {
+		contract.family = profile.ArkFamily
 	}
-	return ""
+	return contract
 }
 
 func validateArkProfile(profile ProviderProfile) error {
 	if strings.TrimSpace(profile.Model) == "" {
 		return errors.New("Ark requires a model or inference endpoint ID")
 	}
-	modelFamily := arkModelFamily(profile)
+	contract := arkContractFor(profile)
+	modelFamily := contract.family
+	switch profile.ArkFamily {
+	case "", arkSeedance10, arkSeedance20, arkSeedance25:
+	default:
+		return errors.New("方舟端点的部署模型系列无效")
+	}
+	if profile.ArkFamily != "" && profile.ArkFamily != modelFamily {
+		return errors.New("方舟部署模型系列与已知 API Model ID 冲突")
+	}
 	switch profile.Mode {
 	case "t2v":
 	case "i2v":
-		if modelFamily == "2.5" && profile.AspectRatio != "" && profile.AspectRatio != "adaptive" {
+		if modelFamily == arkSeedance25 && profile.AspectRatio != "" && profile.AspectRatio != "adaptive" {
 			return errors.New("Seedance 2.5 I2V derives the ratio from the first frame; use adaptive or leave the ratio blank")
 		}
 	case "r2v":
-		if modelFamily != "2.5" && modelFamily != "2.0" && modelFamily != "endpoint" {
-			return errors.New("Ark R2V requires a Seedance 2.0/2.5 model or an endpoint deploying one")
+		if modelFamily == arkSeedance10 {
+			return errors.New("Seedance 1.0 does not support Ark R2V")
 		}
 	default:
 		return errors.New("Ark supports T2V, I2V and R2V video modes")
@@ -96,11 +117,11 @@ func validateArkProfile(profile ProviderProfile) error {
 	duration := profile.Duration
 	validDuration := duration == 0 || duration == -1 || (duration >= 2 && duration <= 30)
 	switch modelFamily {
-	case "2.5":
+	case arkSeedance25:
 		validDuration = duration == 0 || duration == -1 || (duration >= 4 && duration <= 30)
-	case "2.0":
+	case arkSeedance20:
 		validDuration = duration == 0 || duration == -1 || (duration >= 4 && duration <= 15)
-	case "1.0":
+	case arkSeedance10:
 		validDuration = duration == 0 || (duration >= 2 && duration <= 12)
 	}
 	if !validDuration {
@@ -114,16 +135,15 @@ func validateArkProfile(profile ProviderProfile) error {
 			if resolution != "480p" && resolution != "720p" && resolution != "1080p" && resolution != "4K" {
 				return errors.New("Ark resolution must be 480p, 720p, 1080p or 4K")
 			}
-			fastOrMini := strings.HasSuffix(profile.Model, "-fast-260128") || strings.HasSuffix(profile.Model, "-mini-260615")
-			if (resolution == "1080p" && modelFamily == "2.0" && fastOrMini) ||
-				(resolution == "4K" && (modelFamily == "2.5" || modelFamily == "1.0" || modelFamily == "2.0" && fastOrMini)) {
+			if (resolution == "1080p" && contract.fastOrMini) ||
+				(resolution == "4K" && (modelFamily == arkSeedance25 || modelFamily == arkSeedance10 || contract.fastOrMini)) {
 				return errors.New("Ark resolution is unavailable for this model")
 			}
 		case "generate_audio", "watermark":
 			if _, ok := value.(bool); !ok {
 				return fmt.Errorf("Ark option %s must be a boolean", option)
 			}
-			if option == "generate_audio" && modelFamily == "1.0" {
+			if option == "generate_audio" && modelFamily == arkSeedance10 {
 				return errors.New("Seedance 1.0 has no generate_audio option")
 			}
 		default:
@@ -155,7 +175,7 @@ func (p *arkProvider) Validate(input GenerationInput) error {
 		}
 	case "r2v":
 		maxImages := 9
-		if arkModelFamily(p.profile) == "2.5" {
+		if arkContractFor(p.profile).family == arkSeedance25 {
 			maxImages = 30
 		}
 		if count == 0 || count > maxImages {
@@ -216,7 +236,7 @@ func (p *arkProvider) payload(input GenerationInput) ([]byte, error) {
 	}
 
 	body := map[string]any{"model": p.profile.Model, "content": content}
-	if p.profile.Mode == "r2v" && arkModelFamily(p.profile) == "2.5" {
+	if p.profile.Mode == "r2v" && arkContractFor(p.profile).family == arkSeedance25 {
 		body["omni_reference_task_type"] = "reference"
 	}
 	if p.profile.Duration != 0 {
@@ -276,13 +296,8 @@ func (p *arkProvider) Submit(ctx context.Context, input GenerationInput) (Provid
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		// These responses are definitive rejections under the Ark error contract.
-		rejected := false
-		switch res.StatusCode {
-		case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusTooManyRequests:
-			rejected = true
-		}
-		return ProviderSubmission{Rejected: rejected}, fmt.Errorf("Ark create task returned HTTP %d", res.StatusCode)
+		err := p.responseError(res)
+		return ProviderSubmission{Rejected: submissionRejected(err)}, err
 	}
 	var task struct {
 		ID string `json:"id"`
@@ -304,7 +319,7 @@ func validArkTaskID(id string) bool {
 
 func (p *arkProvider) Poll(ctx context.Context, id string) (ProviderResult, error) {
 	if !validArkTaskID(id) {
-		return ProviderResult{}, errors.New("Invalid Ark task ID")
+		return ProviderResult{}, permanentProviderError("Invalid Ark task ID")
 	}
 	res, err := p.request(ctx, http.MethodGet, "/"+id, nil)
 	if err != nil {
@@ -312,7 +327,7 @@ func (p *arkProvider) Poll(ctx context.Context, id string) (ProviderResult, erro
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		return ProviderResult{}, fmt.Errorf("Ark query task returned HTTP %d", res.StatusCode)
+		return ProviderResult{}, p.responseError(res)
 	}
 	var task struct {
 		ID           string `json:"id"`
@@ -321,20 +336,25 @@ func (p *arkProvider) Poll(ctx context.Context, id string) (ProviderResult, erro
 		Content      struct {
 			VideoURL string `json:"video_url"`
 		} `json:"content"`
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
 	}
 	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&task); err != nil || task.ID != id {
-		return ProviderResult{}, errors.New("Ark returned an invalid task response")
+		return ProviderResult{}, permanentProviderError("Ark returned an invalid task response")
 	}
 	switch task.Status {
 	case "queued":
 		return ProviderResult{Status: "pending"}, nil
 	case "running":
 		return ProviderResult{Status: "running"}, nil
-	case "failed", "cancelled", "expired":
-		return ProviderResult{Status: "failed"}, nil
+	case "cancelled":
+		return ProviderResult{Status: "cancelled"}, nil
+	case "failed", "expired":
+		return ProviderResult{Status: "failed", Error: (videoHTTP{key: p.apiKey}).safeMessage(task.Error.Message)}, nil
 	case "succeeded":
 		if !arkOutputURL(task.Content.VideoURL) {
-			return ProviderResult{}, errors.New("Ark did not return a valid HTTPS video URL")
+			return ProviderResult{}, permanentProviderError("Ark did not return a valid HTTPS video URL")
 		}
 		switch task.OutputFormat {
 		case "", "mp4":
@@ -342,11 +362,17 @@ func (p *arkProvider) Poll(ctx context.Context, id string) (ProviderResult, erro
 		case "mov":
 			return ProviderResult{Status: "succeeded", URL: task.Content.VideoURL, Extension: ".mov"}, nil
 		default:
-			return ProviderResult{}, errors.New("Ark returned an unsupported output format")
+			return ProviderResult{}, permanentProviderError("Ark returned an unsupported output format")
 		}
 	default:
-		return ProviderResult{}, errors.New("Ark returned an unknown task status")
+		return ProviderResult{}, permanentProviderError("Ark returned an unknown task status")
 	}
+}
+
+func (p *arkProvider) responseError(response *http.Response) error {
+	var body map[string]any
+	_ = json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&body)
+	return (videoHTTP{key: p.apiKey}).responseError(response.StatusCode, providerMessage(body))
 }
 
 func arkOutputURL(value string) bool {
@@ -384,7 +410,7 @@ func (p *arkProvider) Verify(ctx context.Context) error {
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		return fmt.Errorf("Ark list tasks returned HTTP %d", res.StatusCode)
+		return p.responseError(res)
 	}
 	var result struct {
 		Total *int64 `json:"total"`

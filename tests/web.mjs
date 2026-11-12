@@ -115,9 +115,28 @@ async function withWeb(run, { providerFixture = false } = {}) {
   const home = await mkdtemp(join(runtime, 'web-'))
   const profile = join(home, 'profiles', 'web')
   const fixture = join(home, 'fixture.mjs')
-  await mkdir(profile, { recursive: true })
+  const entryRoot = join(profile, 'node_modules', 'dsh-my-drama-studio')
+  await mkdir(join(entryRoot, 'dist'), { recursive: true })
   await writeFile(join(home, 'package.json'), '{"name":"drama-web-fixture","private":true}\n')
+  await writeFile(join(profile, 'package.json'), JSON.stringify({
+    name: 'dsh-profile-web', private: true, dependencies: { 'dsh-my-drama-studio': '0.1.0' },
+    dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'dsh-my-drama-studio'] } },
+  }))
   await writeFile(fixture, fixtureSource)
+  const port = await freePort()
+  const env = { ...process.env, DSH_HOME: home, DSH_AGENTS_HOME: join(home, 'agents'), DSH_TELEMETRY_DISABLED: '1', DEEPSEEK_API_KEY: '' }
+  for (const file of ['package.json', 'dsh.bundle.patch', 'dist/host.js', 'dist/client.js']) {
+    await copyFile(join(root, file), join(entryRoot, file))
+  }
+  const executable = join(entryRoot, 'dist', 'studio.exe')
+  if (providerFixture) {
+    const compile = spawnSync('go.exe', ['test', '-c', '-o', executable, './studio'], {
+      cwd: root, encoding: 'utf8', timeout: 90_000, windowsHide: true,
+      env: { ...process.env, GOARCH: 'amd64', CGO_ENABLED: '0', GOCACHE: join(runtime, 'uiux-go-cache') },
+    })
+    assert.equal(compile.status, 0, compile.stderr || compile.error?.message)
+    env.DRAMA_UIUX_PROVIDER_FIXTURE = resolve(videoAsset)
+  } else await copyFile(join(root, 'dist', 'studio.exe'), executable)
   await writeFile(join(profile, 'cordis.patch.yml'), `- id: ui-settings-models
   config:
     credentialOnboarding: false
@@ -125,26 +144,10 @@ async function withWeb(run, { providerFixture = false } = {}) {
     - id: drama-web-fixture
       name: ${JSON.stringify(fixture.replaceAll('\\', '/'))}
 `)
-  const port = await freePort()
-  const env = { ...process.env, DSH_HOME: home, DSH_AGENTS_HOME: join(home, 'agents'), DEEPSEEK_API_KEY: '' }
-  let entryRoot = root
-  if (providerFixture) {
-    entryRoot = join(home, 'provider-fixture')
-    await mkdir(join(entryRoot, 'dist'), { recursive: true })
-    await mkdir(join(entryRoot, 'scripts'), { recursive: true })
-    for (const file of ['package.json', 'dsh.bundle.patch', 'scripts/dev.ps1', 'dist/host.js', 'dist/client.js']) {
-      await copyFile(join(root, file), join(entryRoot, file))
-    }
-    const output = join(entryRoot, 'dist', 'studio.exe')
-    const compile = spawnSync('go.exe', ['test', '-c', '-o', output, './studio'], {
-      cwd: root, encoding: 'utf8', timeout: 90_000, windowsHide: true,
-      env: { ...process.env, GOARCH: 'amd64', CGO_ENABLED: '0', GOCACHE: join(runtime, 'uiux-go-cache') },
-    })
-    assert.equal(compile.status, 0, compile.stderr || compile.error?.message)
-    env.DRAMA_UIUX_PROVIDER_FIXTURE = resolve(videoAsset)
-  }
-  const dsh = spawn('pwsh.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
-    join(entryRoot, 'scripts', 'dev.ps1'), '-Port', String(port), '-NoOpen'], {
+  const launch = `$launcher = Join-Path $env:LOCALAPPDATA 'Programs/DeepSeek Harness/resources/runtime/cli/bin/dsh.cmd'
+& $launcher web --host 127.0.0.1 --port ${port} --no-open
+exit $LASTEXITCODE`
+  const dsh = spawn('pwsh.exe', ['-NoProfile', '-Command', launch], {
     cwd: root, windowsHide: true, env,
   })
   let output = ''
@@ -321,7 +324,7 @@ async function setPermission(page, enabled) {
 }
 
 test('U1 native composer menu and Canvas shell', { timeout: 75_000 }, async () => {
-  await withWeb(async ({ page, records }) => {
+  await withWeb(async ({ page, records, home }) => {
     const [a] = records
     await select(page, a)
     await menu(page).click()
@@ -340,33 +343,106 @@ test('U1 native composer menu and Canvas shell', { timeout: 75_000 }, async () =
       }).length
     })
     assert.equal(nativeControls, 0, 'unreset user-agent buttons are still visible')
-    await page.getByRole('button', { name: '画布更多', exact: true }).click()
-    await page.getByText('生成服务设置', { exact: true }).click()
-    const settings = page.getByRole('dialog', { name: '生成服务设置', exact: true })
-    await settings.waitFor()
-    await settings.getByRole('button', { name: '从模板创建', exact: true }).waitFor()
-    assert.equal(await settings.locator('select').count(), 0)
+    async function openSettings() {
+      await page.getByRole('button', { name: 'Account menu', exact: true }).click()
+      await page.getByRole('menuitem', { name: 'Settings', exact: true }).click()
+      const dialog = page.getByRole('dialog', { name: 'Settings', exact: true })
+      await dialog.getByRole('button', { name: 'Drama Studio', exact: true }).click()
+      const section = dialog.getByTestId('drama-settings')
+      await section.getByRole('button', { name: '新增渠道', exact: true }).waitFor()
+      return section
+    }
+    const settings = await openSettings()
     await screenshot(page, '11-after-settings.png')
-    await settings.getByRole('button', { name: '从模板创建', exact: true }).click()
-    await page.getByRole('menuitem', { name: /火山方舟 · Seedance 2\.0 · T2V/u }).click()
+
     const apiKey = 'uiux-isolated-provider-credential'
-    await settings.getByLabel('预设名称').fill('测试自动时长')
+    await settings.getByRole('button', { name: '新增渠道', exact: true }).click()
+    await settings.getByRole('button', { name: '协议', exact: true }).click()
+    await page.getByRole('menuitem', { name: 'OpenAI 兼容视频', exact: true }).click()
+    await settings.getByLabel('渠道名称').fill('隔离测试渠道')
+    await settings.getByLabel('Base URL').fill('https://video.invalid')
     await settings.locator('input[type="password"]').fill(apiKey)
-    await settings.getByText('模型参数', { exact: true }).click()
-    await settings.getByRole('spinbutton', { name: /时长（秒）/u }).fill('-1')
-    await settings.getByRole('button', { name: '保存预设', exact: true }).click()
-    await settings.getByText('预设已保存', { exact: true }).waitFor()
-    const data = await ok(page, 'providers', { action: 'provider_settings', data: {} })
-    const profile = data.profiles.find(item => item.name === '测试自动时长')
-    assert.equal(profile?.duration, -1)
-    assert.equal(profile?.configured, true)
-    assert.ok(!JSON.stringify(data).includes(apiKey))
-    await settings.getByRole('button', { name: '编辑', exact: true }).click()
+    await settings.getByRole('button', { name: '保存渠道', exact: true }).click()
+    await settings.getByText('渠道已保存', { exact: true }).waitFor()
+    await settings.getByRole('button', { name: '编辑渠道', exact: true }).click()
     assert.equal(await settings.locator('input[type="password"]').inputValue(), '')
-    await settings.getByRole('button', { name: '删除预设', exact: true }).click()
-    await settings.getByRole('button', { name: '确认删除', exact: true }).click()
-    await settings.getByText('预设已删除', { exact: true }).waitFor()
-    console.info('U1 native DSH shell and provider settings PASS: template, auto duration, protected credential and delete')
+    await settings.getByLabel('渠道名称').fill('已编辑的测试渠道')
+    await settings.getByRole('button', { name: '保存渠道', exact: true }).click()
+    await settings.getByText('已编辑的测试渠道', { exact: true }).waitFor()
+
+    await settings.getByRole('tab', { name: '模型预设', exact: true }).click()
+    for (const name of ['测试视频模型 A', '测试视频模型 B']) {
+      await settings.getByRole('button', { name: '新建预设', exact: true }).click()
+      await settings.getByLabel('预设名称').fill(name)
+      await settings.getByLabel('API Model ID').fill(name.endsWith('A') ? 'test-video-a' : 'test-video-b')
+      await settings.getByRole('button', { name: '保存预设', exact: true }).click()
+      await settings.getByText(name, { exact: true }).waitFor()
+    }
+    await settings.getByRole('tab', { name: '生成设置', exact: true }).click()
+    await settings.getByRole('button', { name: '默认视频模型', exact: true }).click()
+    await page.getByRole('menuitem', { name: '测试视频模型 A', exact: true }).click()
+    await settings.getByLabel('最大并发数').fill('3')
+    await settings.getByRole('button', { name: '保存生成设置', exact: true }).click()
+    await settings.getByText('生成设置已保存', { exact: true }).waitFor()
+
+    const data = await ok(page, 'providers', { action: 'provider_settings', data: {} })
+    const channel = data.channels.find(item => item.name === '已编辑的测试渠道')
+    assert.equal(channel?.configured, true)
+    assert.equal(data.profiles.filter(profile => profile.channelId === channel.id).length, 2)
+    assert.equal(data.generation.maxConcurrent, 3)
+    assert.equal(data.profiles.find(profile => profile.id === data.generation.defaultModelId)?.name, '测试视频模型 A')
+    assert.ok(!JSON.stringify(data).includes(apiKey))
+    const patch = await readFile(join(home, 'profiles', 'web', 'cordis.patch.yml'), 'utf8')
+    assert.ok(patch.includes('test-video-a') && !patch.includes(apiKey))
+
+    await page.reload()
+    await select(page, records.at(-1))
+    const reopened = await openSettings()
+    await reopened.getByText('已编辑的测试渠道', { exact: true }).waitFor()
+    const shared = await ok(page, 'providers', { action: 'provider_settings', data: {} })
+    assert.deepEqual(shared.generation, data.generation)
+    assert.deepEqual(shared.profiles, data.profiles)
+    await reopened.getByRole('tab', { name: '模型预设', exact: true }).click()
+    for (const name of ['测试视频模型 A', '测试视频模型 B']) {
+      const row = reopened.getByRole('listitem').filter({ hasText: name })
+      await row.getByRole('button', { name: '删除预设', exact: true }).click()
+      await row.getByRole('button', { name: '确认删除', exact: true }).click()
+      await row.waitFor({ state: 'detached' })
+    }
+    await reopened.getByRole('tab', { name: '视频渠道', exact: true }).click()
+    await reopened.getByRole('button', { name: '删除渠道', exact: true }).click()
+    await reopened.getByRole('button', { name: '确认删除', exact: true }).click()
+    await reopened.getByText('渠道已删除', { exact: true }).waitFor()
+    const removed = await ok(page, 'providers', { action: 'provider_settings', data: {} })
+    assert.ok(!removed.channels.some(item => item.id === channel.id))
+
+    await reopened.getByRole('button', { name: '新增渠道', exact: true }).click()
+    await reopened.getByRole('button', { name: '协议', exact: true }).click()
+    await page.getByRole('menuitem', { name: 'Custom REST', exact: true }).click()
+    const customName = 'Custom REST 编辑夹具'
+    for (const [label, value] of [
+      ['渠道名称', customName], ['Base URL', 'https://video.invalid'],
+      ['提交任务 URL', '/jobs'], ['查询任务 URL', '/jobs/{taskId}'],
+      ['任务 ID 字段路径', 'id'], ['任务状态字段路径', 'status'],
+      ['下载 URL', '/jobs/{taskId}/content'], ['时长字段', 'seconds'],
+      ['成功状态值', 'done'], ['失败状态值', 'error'],
+    ]) await reopened.getByLabel(label, { exact: true }).fill(value)
+    await reopened.getByRole('button', { name: '保存渠道', exact: true }).click()
+    const customRow = reopened.getByRole('listitem').filter({ hasText: customName })
+    await customRow.getByText('密钥未设置', { exact: true }).waitFor()
+    await customRow.getByRole('button', { name: '编辑渠道', exact: true }).click()
+    assert.equal(await reopened.getByLabel('成功状态值', { exact: true }).inputValue(), 'done')
+    await reopened.locator('input[type="password"]').fill(apiKey)
+    await reopened.getByRole('button', { name: '保存渠道', exact: true }).click()
+    await customRow.getByText('密钥已设置', { exact: true }).waitFor()
+    const saved = await ok(page, 'providers', { action: 'provider_settings', data: {} })
+    const custom = saved.channels.find(item => item.name === customName)
+    assert.equal(custom?.configured, true)
+    assert.equal(custom.advanced.downloadUrl, '/jobs/{taskId}/content')
+    assert.deepEqual(custom.advanced.fields, { duration: 'seconds' })
+    assert.deepEqual(custom.advanced.statusMap, { done: 'completed', error: 'failed' })
+    assert.ok(!JSON.stringify(saved).includes(apiKey))
+    console.info('U1 native DSH settings PASS: channel CRUD, shared models/defaults, browser reload, and protected credential')
   })
 })
 
@@ -789,13 +865,38 @@ test('U3 shot filter, group and node collapse preserve saved contents', { timeou
 test('U4 native task drawer follows real Go worker in isolated provider fixture', { timeout: 150_000, skip: !hasVideo }, async () => {
   await withWeb(async ({ page, records, home }) => {
     const [a] = records
+    const settings = (action, data) => ok(page, 'providers', { action, data })
+    const configured = await settings('channel_save', {
+      channel: { name: '本地验收渠道', protocol: 'openai-video', baseUrl: 'https://video.example.com' },
+      apiKey: 'uiux-local-fixture-token',
+    })
+    const models = await settings('provider_save', {
+      revision: configured.revision,
+      profile: {
+        name: '本地验收夹具', channelId: configured.channels[0].id, model: 'fixture-video', modes: ['t2v'],
+        defaults: { duration: 4 }, limits: { durations: [4, 8] },
+      },
+    })
+    await settings('generation_save', {
+      revision: models.revision,
+      generation: { defaultModelId: models.profiles[0].id, maxConcurrent: 2, outputDirectory: 'assets/native-results' },
+    })
     await select(page, a)
     await open(page, a)
     const ticket = await ticketFor(page, a.sessionId)
-    const nodeId = randomUUID()
-    await append(page, ticket, [{ id: nodeId, type: 'video', episodeId: 'EP01', sceneId: 'S01', shotId: 'SH03', content: {
-      title: '排队与结果定位验收', mode: 't2v', prompt: '固定中景。人物推开餐厅门，在门口停顿。',
-    } }])
+    const draft = await pick(page, 't2v')
+    await draft.getByLabel('节点名称', { exact: true }).fill('排队与结果定位验收')
+    await draft.getByLabel('完整视频提示词', { exact: true }).fill('固定中景。人物推开餐厅门，在门口停顿。')
+    await draft.getByText('更多参数', { exact: true }).click()
+    await draft.getByRole('button', { name: '时长（秒）', exact: true }).click()
+    await page.getByRole('menuitem', { name: '8', exact: true }).click()
+    await draft.getByRole('button', { name: '创建节点', exact: true }).click()
+    await draft.waitFor({ state: 'detached' })
+    const [node] = (await query(page, ticket, { q: '排队与结果定位验收' })).nodes
+    assert.equal(node.content.params.duration, 8)
+    assert.deepEqual(node.content.mixedListOrder, [])
+    assert.equal(node.content.textList, undefined)
+    const nodeId = node.id
     const source = card(page, nodeId)
     await source.getByRole('button', { name: '生成…', exact: true }).click()
     const confirm = source.getByRole('dialog', { name: '确认生成', exact: true })
@@ -803,7 +904,7 @@ test('U4 native task drawer follows real Go worker in isolated provider fixture'
     await submit.click()
     const running = await poll(async () => {
       const { tasks } = await operate(page, ticket, 'tasks', {})
-      return tasks.find(task => task.nodeId === nodeId && task.status === 'polling')
+      return tasks.find(task => task.nodeId === nodeId && task.status === 'processing' && task.phase === 'polling')
     }, 'actual task did not reach polling')
     assert.equal(running.providerTaskId, 'uiux-fixture-task')
     await source.getByText('生成中', { exact: true }).first().waitFor()
@@ -821,11 +922,21 @@ test('U4 native task drawer follows real Go worker in isolated provider fixture'
     await writeFile(join(home, 'allow-fixture-result'), '')
     const completed = await poll(async () => {
       const { tasks } = await operate(page, ticket, 'tasks', {})
-      return tasks.find(task => task.id === running.id && task.status === 'succeeded')
+      return tasks.find(task => task.id === running.id && task.status === 'completed')
     }, 'Go worker did not finish while the native panel was closed', 20_000)
     assert.ok(completed.resultNodeId)
     const [result] = (await query(page, ticket, { id: completed.resultNodeId })).nodes
     assert.equal(result.basedOn, nodeId)
+    assert.ok(completed.completedAt)
+    assert.match(completed.outputPath, /^assets\/native-results\/[^/]+\.mp4$/u)
+    assert.equal(result.content.path, completed.outputPath)
+    assert.equal((await settings('provider_settings', {})).profiles[0].defaults.duration, 4)
+    await poll(async () => {
+      const current = (await settings('provider_settings', {})).channels
+        .find(channel => channel.id === configured.channels[0].id)
+      return current?.verification?.modelCallable === 'verified' &&
+        current.verification.taskSucceeded === 'verified'
+    }, 'completed video did not verify the channel and model')
     await open(page, a)
     await panel(page).getByRole('button', { name: '任务', exact: true }).click()
     await drawer.getByText('完成', { exact: true }).waitFor()
@@ -838,4 +949,62 @@ test('U4 native task drawer follows real Go worker in isolated provider fixture'
     await screenshot(page, '41-after-task-result-fixture.png')
     console.info('U4 real persisted queue PASS: fixture-only provider, polling with node/drawer, native panel closed, worker completed, persisted result located and played; no external requests')
   }, { providerFixture: true })
+})
+
+test('U5 native video editors retain ordered media and inline prompts', { timeout: 100_000 }, async () => {
+  await withWeb(async ({ page, records }) => {
+    const [record] = records
+    const settings = (action, data) => ok(page, 'providers', { action, data })
+    const configured = await settings('channel_save', { channel: {
+      name: '媒体模式夹具', protocol: 'custom-rest', baseUrl: 'https://video.example.com',
+      advanced: {
+        submitUrl: '/jobs', submitMethod: 'POST', auth: 'none',
+        fields: { firstFrame: 'first_frame', lastFrame: 'last_frame', references: 'references', sourceVideo: 'source_video' },
+        taskIdPath: 'id', queryUrl: '/jobs/{taskId}', statusPath: 'status',
+        statusMap: { running: 'processing', done: 'completed', error: 'failed' }, outputUrlPath: 'url',
+      },
+    } })
+    await settings('provider_save', {
+      revision: configured.revision,
+      profile: {
+        name: '四种模式夹具', channelId: configured.channels[0].id, model: 'fixture-modes',
+        modes: ['t2v', 'i2v', 'r2v', 'v2v'], limits: { lastFrame: true, references: { image: 1, video: 1, audio: 1 } },
+      },
+    })
+    await select(page, record)
+    await open(page, record)
+    const ticket = await ticketFor(page, record.sessionId)
+    const source = (type, title, path) => ({ id: randomUUID(), type, content: { title, path } })
+    const head = source('image', '夹具首帧', 'assets/images/head.png')
+    const tail = source('image', '夹具尾帧', 'assets/images/tail.png')
+    const video = source('video', '夹具源视频', 'assets/videos/source.mp4')
+    const audio = source('audio', '夹具参考音频', 'assets/audio/reference.wav')
+    await append(page, ticket, [head, tail, video, audio])
+    const cases = [
+      ['i2v', '首尾帧验收', '保留 @图片1 的初始构图并自然过渡到 @图片2。', '添加图片素材', [head, tail]],
+      ['r2v', '多媒体参考验收', '根据 @图片1 定造型，沿用 @视频1 动作，参考 @音频1 节奏。', '添加参考素材', [head, video, audio]],
+      ['v2v', '源视频验收', '保留 @视频1 的表演节奏，调整画面亮度。', '添加视频素材', [video]],
+    ]
+    for (const [mode, title, prompt, picker, references] of cases) {
+      const draft = await pick(page, mode)
+      await draft.getByLabel('节点名称', { exact: true }).fill(title)
+      await draft.getByLabel('完整视频提示词', { exact: true }).fill(prompt)
+      for (const ref of references) {
+        await draft.getByRole('button', { name: picker, exact: true }).click()
+        await page.getByRole('menuitem').filter({ hasText: ref.content.title }).click()
+      }
+      await draft.getByRole('button', { name: '创建节点', exact: true }).click()
+      await draft.waitFor({ state: 'detached' })
+      const { nodes, edges } = await query(page, ticket)
+      const node = nodes.find(item => item.content.title === title)
+      assert.equal(node.content.mode, mode)
+      assert.equal(node.content.prompt, prompt)
+      assert.equal(node.content.textList, undefined)
+      assert.deepEqual(node.content.mixedListOrder, references.map(ref => ref.id))
+      assert.deepEqual(new Set(edges.filter(edge => edge.target === node.id).map(edge => edge.source)),
+        new Set(node.content.mixedListOrder))
+    }
+    assert.equal((await operate(page, ticket, 'tasks', {})).tasks.length, 0)
+    console.info('U5 native video editors PASS: I2V first/tail, ordered R2V image/video/audio, V2V source, inline prompts and no generation')
+  })
 })

@@ -79,6 +79,7 @@
   object-fit: contain;
 }
 .drama-node-media-frame > img { position: absolute; inset: 0; }
+.drama-node-media > audio { width: 100%; }
 .drama-node-media-loading { z-index: 1; color: var(--dsw-alias-label-secondary); font-size: 11px; }
 .drama-node-media-overlay { position: absolute; z-index: 2; top: 6px; right: 6px; }
 .drama-node-media-meta {

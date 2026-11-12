@@ -8,8 +8,7 @@ import {
 import { groupFields, nodeLabels } from './canvas-node.jsx'
 
 const statuses = {
-  pending: '排队中', submitting: '提交中', polling: '生成中',
-  succeeded: '已完成', failed: '失败', uncertain: '结果待确认',
+  queued: '排队中', processing: '处理中', completed: '已完成', failed: '失败', cancelled: '已取消',
 }
 
 export function IconButton({ icon: Icon, label, children, ...props }) {

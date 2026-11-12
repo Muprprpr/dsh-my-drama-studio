@@ -44,6 +44,11 @@ export async function operation(ticket, action, data = {}, signal) {
   return json(response)
 }
 
+export const generateT2V = (ticket, request, signal) => operation(ticket, 'generateT2V', request, signal)
+export const generateI2V = (ticket, request, signal) => operation(ticket, 'generateI2V', request, signal)
+export const generateR2V = (ticket, request, signal) => operation(ticket, 'generateR2V', request, signal)
+export const generateV2V = (ticket, request, signal) => operation(ticket, 'generateV2V', request, signal)
+
 export async function subscribe(ticket, after, signal, onBatch, onError) {
   while (!signal.aborted) {
     try {

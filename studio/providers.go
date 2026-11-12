@@ -26,6 +26,12 @@ type ProviderProfile struct {
 	AspectRatio string         `json:"aspectRatio,omitempty"`
 	Duration    int            `json:"duration,omitempty"`
 	Options     map[string]any `json:"options,omitempty"`
+	ChannelID   string         `json:"channelId,omitempty"`
+	ArkFamily   string         `json:"arkFamily,omitempty"`
+	Modes       []string       `json:"modes,omitempty"`
+	Defaults    VideoParams    `json:"defaults,omitzero"`
+	Limits      VideoLimits    `json:"limits,omitzero"`
+	Channel     *VideoChannel  `json:"channel,omitempty"`
 }
 
 type providerRegistry interface {
@@ -33,47 +39,53 @@ type providerRegistry interface {
 	Resolve(ProviderProfile) (Provider, error)
 }
 
+type resolvedChannelProvider struct {
+	Provider
+	onCompleted func()
+}
+
 type providerData struct {
-	Profiles []ProviderProfile `json:"profiles"`
-	Keys     map[string]string `json:"keys"`
-	Defaults map[string]string `json:"defaults"`
+	Profiles   []ProviderProfile  `json:"profiles"`
+	Keys       map[string]string  `json:"keys,omitempty"`
+	Defaults   map[string]string  `json:"defaults,omitempty"`
+	Channels   []VideoChannel     `json:"channels"`
+	Retired    []string           `json:"retired,omitempty"`
+	Generation GenerationSettings `json:"generation"`
 }
 
 type providerView struct {
 	ProviderProfile
-	Configured bool `json:"configured"`
-	Default    bool `json:"default"`
+	Configured bool     `json:"configured"`
+	Default    bool     `json:"default"`
+	Parameters []string `json:"parameters"`
 }
 
 type ProviderSettings struct {
-	mu     sync.RWMutex
-	path   string
-	data   providerData
-	client *http.Client
+	mu           sync.RWMutex
+	data         providerData
+	client       *http.Client
+	legacyPath   string
+	verification map[string]VideoProbe
+	completed    map[string]map[string]bool
 }
 
 var providerNames = []string{"ark", "byteplus", "replicate"}
 var modeNames = []string{"t2i", "t2v", "i2v", "r2v"}
 
-func OpenProviderSettings(path string) (*ProviderSettings, error) {
-	settings := &ProviderSettings{
-		path: path, data: providerData{Keys: make(map[string]string), Defaults: make(map[string]string)},
-		client: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		}},
-	}
+func readLegacyProviderSettings(path string) (providerData, error) {
+	var data providerData
 	encrypted, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return settings, nil
+		return data, nil
 	}
 	if err != nil {
-		return nil, errors.New("Could not read provider settings")
+		return data, errors.New("Could not read provider settings")
 	}
 	cleartext, err := providerSecret(encrypted, false)
-	if err != nil || json.Unmarshal(cleartext, &settings.data) != nil {
-		return nil, errors.New("Could not decrypt provider settings for this Windows user")
+	if err != nil || json.Unmarshal(cleartext, &data) != nil {
+		return providerData{}, errors.New("Could not decrypt provider settings for this Windows user")
 	}
-	return settings, nil
+	return data, nil
 }
 
 func (s *ProviderSettings) view() map[string]any {
@@ -81,9 +93,48 @@ func (s *ProviderSettings) view() map[string]any {
 	defer s.mu.RUnlock()
 	profiles := make([]providerView, 0, len(s.data.Profiles))
 	for _, p := range s.data.Profiles {
-		profiles = append(profiles, providerView{p, s.data.Keys[p.Provider] != "", s.data.Defaults[p.Mode] == p.ID})
+		key := p.ChannelID
+		if key == "" {
+			key = p.Provider
+		}
+		configured := s.data.Keys[key] != ""
+		var channel *VideoChannel
+		if c, ok := s.channel(key); ok {
+			configured = configured || c.withoutKey()
+			channel = &c
+		}
+		if slices.Contains(providerNames, p.Provider) && len(p.Limits.References) == 0 &&
+			(p.Mode == "r2v" || slices.Contains(p.Modes, "r2v")) {
+			p.Limits.References = map[string]int{"image": 32}
+		}
+		profiles = append(profiles, providerView{
+			ProviderProfile: p, Configured: configured,
+			Default:    s.data.Generation.DefaultModelID == p.ID || s.data.Defaults[p.Mode] == p.ID,
+			Parameters: supportedVideoParams(p, channel),
+		})
 	}
-	return map[string]any{"profiles": profiles, "templates": providerTemplates()}
+	channels := make([]channelView, 0, len(s.data.Channels))
+	for _, c := range s.data.Channels {
+		probe := s.verification[c.ID]
+		if len(s.completed[c.ID]) > 0 {
+			probe = successfulProbe(probe, c)
+		}
+		channels = append(channels, channelView{
+			VideoChannel: c, Configured: s.data.Keys[c.ID] != "", Verification: probe,
+			Modes: videoChannelModes(c),
+		})
+	}
+	return map[string]any{"profiles": profiles, "templates": modelTemplates(), "channels": channels, "generation": s.data.Generation}
+}
+
+func modelTemplates() []ProviderProfile {
+	return append(providerTemplates(), ProviderProfile{
+		Name: "MiniMax H3", Provider: minimaxH3Protocol, Model: minimaxH3Model,
+		Modes: []string{"t2v", "i2v", "r2v"}, Defaults: VideoParams{Duration: 4, Resolution: "768P", AspectRatio: "16:9"},
+		Limits: VideoLimits{DurationMin: 4, DurationMax: 15, Resolutions: []string{"768P", "2K"}, LastFrame: true,
+			AspectRatios: []string{"16:9", "9:16", "1:1", "4:3", "3:4", "21:9"},
+			References:   map[string]int{"image": 9, "video": 3, "audio": 3}},
+	})
 }
 
 func providerTemplates() []ProviderProfile {
@@ -194,148 +245,10 @@ func validateProfile(profile ProviderProfile) error {
 	return nil
 }
 
-func (s *ProviderSettings) save(profile ProviderProfile, apiKey *string, makeDefault bool) error {
-	profile.Name = strings.TrimSpace(profile.Name)
-	profile.Model = strings.TrimSpace(profile.Model)
-	profile.InputField = strings.TrimSpace(profile.InputField)
-	profile.AspectRatio = strings.TrimSpace(profile.AspectRatio)
-	if err := validateProfile(profile); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	next := cloneProviderData(s.data)
-	if apiKey != nil {
-		key := strings.TrimSpace(*apiKey)
-		if len(key) > 512 || strings.ContainsAny(key, "\r\n\t ") {
-			return invalid("API 密钥格式无效")
-		}
-		if key == "" {
-			delete(next.Keys, profile.Provider)
-		} else {
-			next.Keys[profile.Provider] = key
-		}
-	}
-	if profile.ID == "" {
-		if len(next.Profiles) >= 64 {
-			return invalid("最多保存 64 个生成预设")
-		}
-		profile.ID = uuid.NewString()
-		next.Profiles = append(next.Profiles, profile)
-	} else {
-		index := slices.IndexFunc(next.Profiles, func(p ProviderProfile) bool { return p.ID == profile.ID })
-		if index < 0 {
-			return invalid("预设不存在，请刷新设置")
-		}
-		old := next.Profiles[index]
-		if old.Provider != profile.Provider || old.Mode != profile.Mode {
-			return invalid("更换供应商或生成方式时请新建预设")
-		}
-		next.Profiles[index] = profile
-	}
-	if makeDefault {
-		next.Defaults[profile.Mode] = profile.ID
-	} else if next.Defaults[profile.Mode] == profile.ID {
-		delete(next.Defaults, profile.Mode)
-	}
-	return s.persist(next)
-}
-
-func (s *ProviderSettings) remove(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	next := cloneProviderData(s.data)
-	index := slices.IndexFunc(next.Profiles, func(p ProviderProfile) bool { return p.ID == id })
-	if index < 0 {
-		return invalid("预设不存在，请刷新设置")
-	}
-	mode := next.Profiles[index].Mode
-	next.Profiles = slices.Delete(next.Profiles, index, index+1)
-	if next.Defaults[mode] == id {
-		delete(next.Defaults, mode)
-	}
-	return s.persist(next)
-}
-
-func cloneProviderData(data providerData) providerData {
-	next := providerData{Profiles: slices.Clone(data.Profiles), Keys: make(map[string]string), Defaults: make(map[string]string)}
-	for key, value := range data.Keys {
-		next.Keys[key] = value
-	}
-	for key, value := range data.Defaults {
-		next.Defaults[key] = value
-	}
-	return next
-}
-
-func (s *ProviderSettings) persist(next providerData) error {
-	raw, err := json.Marshal(next)
-	if err != nil {
-		return err
-	}
-	protected, err := providerSecret(raw, true)
-	if err != nil {
-		return errors.New("Could not protect provider settings")
-	}
-	dir := filepath.Dir(s.path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return errors.New("Could not create provider settings directory")
-	}
-	file, err := os.CreateTemp(dir, ".providers-*")
-	if err != nil {
-		return errors.New("Could not write provider settings")
-	}
-	defer os.Remove(file.Name())
-	_, writeErr := file.Write(protected)
-	if err := errors.Join(writeErr, file.Sync(), file.Close()); err != nil {
-		return errors.New("Could not write provider settings")
-	}
-	if err := os.Rename(file.Name(), s.path); err != nil {
-		return errors.New("Could not replace provider settings")
-	}
-	s.data = next
-	return nil
-}
-
 func (s *ProviderSettings) Prepare(input *GenerationInput, id string) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if id == "" {
-		id = s.data.Defaults[input.Mode]
-	}
-	var selected ProviderProfile
-	if id != "" {
-		for _, profile := range s.data.Profiles {
-			if profile.ID == id {
-				selected = profile
-				break
-			}
-		}
-		if selected.ID == "" || selected.Mode != input.Mode {
-			return invalid("所选预设不存在或与生成方式不匹配")
-		}
-	} else {
-		for _, profile := range s.data.Profiles {
-			if profile.Mode != input.Mode || s.data.Keys[profile.Provider] == "" {
-				continue
-			}
-			if selected.ID != "" {
-				return invalid("请指定该生成方式的默认预设或选择一个预设")
-			}
-			selected = profile
-		}
-	}
-	if selected.ID == "" || s.data.Keys[selected.Provider] == "" {
-		return providerUnavailable
-	}
-	input.Profile = selected
-	provider := s.adapter(selected, s.data.Keys[selected.Provider])
-	if validator, ok := provider.(interface{ Validate(GenerationInput) error }); ok {
-		if err := validator.Validate(*input); err != nil {
-			return invalid("%s", err)
-		}
-	}
-	return nil
+	return s.prepareChannel(input, id)
 }
 
 func (s *ProviderSettings) Resolve(profile ProviderProfile) (Provider, error) {
@@ -344,13 +257,22 @@ func (s *ProviderSettings) Resolve(profile ProviderProfile) (Provider, error) {
 	if profile.ID == "" {
 		return nil, errors.New("Task has no provider preset")
 	}
-	key := s.data.Keys[profile.Provider]
-	if key == "" {
+	keyID := profile.ChannelID
+	if keyID == "" {
+		keyID = profile.Provider
+	}
+	key := s.data.Keys[keyID]
+	if key == "" && (profile.Channel == nil || !profile.Channel.withoutKey()) {
 		return nil, providerUnavailable
 	}
 	provider := s.adapter(profile, key)
 	if provider == nil {
 		return nil, providerUnavailable
+	}
+	if profile.Channel != nil && profile.Mode != "t2i" {
+		return &resolvedChannelProvider{Provider: provider, onCompleted: func() {
+			s.recordCompleted(profile, key)
+		}}, nil
 	}
 	return provider, nil
 }
@@ -361,62 +283,20 @@ func (s *ProviderSettings) adapter(profile ProviderProfile, key string) Provider
 		return newArkProvider(profile, key, s.client)
 	case "replicate":
 		return newReplicateProvider(profile, key, s.client)
+	case "new-api", "openai-video", "custom-rest":
+		return newVideoProvider(profile, key, s.client)
+	case minimaxH3Protocol:
+		return newMinimaxProvider(profile, key, s.client)
 	}
 	return nil
 }
 
 func (s *ProviderSettings) execute(ctx context.Context, action string, raw json.RawMessage) (any, error) {
-	switch action {
-	case "provider_settings":
-		if err := decodeData(raw, &struct{}{}); err != nil {
-			return nil, err
-		}
-	case "provider_save":
-		var args struct {
-			Profile     ProviderProfile `json:"profile"`
-			APIKey      *string         `json:"apiKey"`
-			MakeDefault bool            `json:"makeDefault"`
-		}
-		if err := decodeData(raw, &args); err != nil {
-			return nil, err
-		}
-		if err := s.save(args.Profile, args.APIKey, args.MakeDefault); err != nil {
-			return nil, err
-		}
-	case "provider_remove":
-		var args struct {
-			ID string `json:"id"`
-		}
-		if err := decodeData(raw, &args); err != nil {
-			return nil, err
-		}
-		if err := s.remove(args.ID); err != nil {
-			return nil, err
-		}
-	case "provider_test":
-		var args struct {
-			Provider string `json:"provider"`
-		}
-		if err := decodeData(raw, &args); err != nil {
-			return nil, err
-		}
-		s.mu.RLock()
-		key := s.data.Keys[args.Provider]
-		s.mu.RUnlock()
-		if key == "" {
-			return nil, invalid("请先保存该供应商的密钥")
-		}
-		provider := s.adapter(ProviderProfile{Provider: args.Provider}, key)
-		verifier, ok := provider.(interface{ Verify(context.Context) error })
-		if !ok {
-			return nil, invalid("该供应商没有可用的只读检查")
-		}
-		if err := verifier.Verify(ctx); err != nil {
-			return nil, &requestError{http.StatusBadGateway, err.Error()}
-		}
-		return map[string]bool{"verified": true}, nil
-	default:
-		return nil, invalid("未知供应商设置操作")
+	if action != "provider_settings" {
+		return s.executeProfileSettings(ctx, action, raw)
+	}
+	if err := decodeData(raw, &struct{}{}); err != nil {
+		return nil, err
 	}
 	return s.view(), nil
 }

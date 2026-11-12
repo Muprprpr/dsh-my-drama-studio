@@ -8,14 +8,16 @@ const formats = {
   image: { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp',
     '.gif': 'image/gif', '.avif': 'image/avif', '.bmp': 'image/bmp' },
   video: { '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime', '.m4v': 'video/mp4' },
+  audio: { '.wav': 'audio/wav', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.ogg': 'audio/ogg' },
 }
+const assetPrefixes = { image: ['assets', 'images'], video: ['assets'], audio: ['assets', 'audio'] }
 
 export async function streamMedia(req, res, workspacePath, node) {
   const path = node?.content.path
   const contentType = typeof path === 'string' && formats[node.type]?.[extname(path).toLowerCase()]
   if (!contentType || isAbsolute(path)) throw new StudioError(404, 'Media unavailable')
-  const folder = node.type === 'image' ? 'images' : 'videos'
-  const expected = `assets/${folder}/`
+  const folders = assetPrefixes[node.type]
+  const expected = folders.join('/') + '/'
   if (!path.startsWith(expected)) throw new StudioError(404, 'Media unavailable')
 
   let file, size
@@ -23,7 +25,7 @@ export async function streamMedia(req, res, workspacePath, node) {
     const base = await realpath(workspacePath)
     file = await realpath(resolve(base, path))
     const underBase = relative(base, file)
-    if (!underBase.toLowerCase().startsWith(`assets${sep}${folder}${sep}`)) {
+    if (!underBase.toLowerCase().startsWith(folders.join(sep) + sep)) {
       throw new StudioError(404, 'Media is outside the workspace asset directory')
     }
     const info = await stat(file)

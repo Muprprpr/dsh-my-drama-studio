@@ -15,7 +15,7 @@ export async function startKernel(ctx) {
   const executable = fileURLToPath(new URL('./studio.exe', import.meta.url))
   const child = spawn(executable, [], {
     windowsHide: true,
-    env: { ...process.env, DRAMA_STUDIO_TOKEN: token },
+    env: { ...process.env, DSH_HOME: ctx.profileContext.home, DRAMA_STUDIO_TOKEN: token },
     stdio: ['pipe', 'pipe', 'inherit'],
   })
   child.stdin.on('error', error => {

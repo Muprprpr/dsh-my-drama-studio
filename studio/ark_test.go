@@ -149,6 +149,79 @@ func TestArkCreatePollDownloadAndVerify(t *testing.T) {
 	}
 }
 
+func TestArkOpaqueEndpointUsesDeploymentContract(t *testing.T) {
+	const snapshot = `{"provider":"ark","model":"ep-fixture","mode":"r2v"}`
+	var legacy ProviderProfile
+	if err := json.Unmarshal([]byte(snapshot), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	explicit := legacy
+	explicit.ArkFamily = arkSeedance25
+	unrelated := legacy
+	unrelated.Model = "private-seedance-2-5-260628"
+
+	input := GenerationInput{Type: "video", Mode: "r2v", Prompt: "A forest in the wind."}
+	for i := range 10 {
+		input.References = append(input.References, GenerationReference{
+			Type: "image", URL: fmt.Sprintf("https://assets.example.test/ref-%d.png", i),
+		})
+	}
+	for _, fixture := range []struct {
+		name    string
+		profile ProviderProfile
+		omni    bool
+	}{
+		{"legacy opaque ID", legacy, false},
+		{"unrelated ID with similar suffix", unrelated, false},
+		{"opaque ID with explicit deployment family", explicit, true},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			p := newArkProvider(fixture.profile, "fixture", nil).(*arkProvider)
+			oneImage := input
+			oneImage.References = input.References[:1]
+			wire, err := p.payload(oneImage)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var body map[string]any
+			if err := json.Unmarshal(wire, &body); err != nil {
+				t.Fatal(err)
+			}
+			flag, exists := body["omni_reference_task_type"]
+			if body["model"] != fixture.profile.Model || exists != fixture.omni || exists && flag != "reference" {
+				t.Fatalf("unexpected payload: %s", wire)
+			}
+			if err := p.Validate(input); (err == nil) != fixture.omni {
+				t.Fatalf("validate ten reference images = %v", err)
+			}
+		})
+	}
+}
+
+func TestArkResolutionUsesExactIDOrExplicitDeploymentFamily(t *testing.T) {
+	for _, fixture := range []struct {
+		name, provider, model, family, resolution string
+		valid                                     bool
+	}{
+		{"known Ark fast", "ark", "doubao-seedance-2-0-fast-260128", "", "1080p", false},
+		{"known BytePlus mini", "byteplus", "dreamina-seedance-2-0-mini-260615", "", "4K", false},
+		{"opaque suffix", "byteplus", "private-fast-260128", arkSeedance20, "1080p", true},
+		{"opaque deployment", "ark", "deployment-id", arkSeedance25, "4K", false},
+		{"conflicting family", "ark", "doubao-seedance-2-5-260628", arkSeedance20, "720p", false},
+		{"unsupported family", "ark", "deployment-id", "other", "720p", false},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			profile := ProviderProfile{
+				Provider: fixture.provider, Model: fixture.model, ArkFamily: fixture.family, Mode: "t2v",
+				Options: map[string]any{"resolution": fixture.resolution},
+			}
+			if err := validateArkProfile(profile); (err == nil) != fixture.valid {
+				t.Fatalf("validateArkProfile = %v", err)
+			}
+		})
+	}
+}
+
 func TestArkLocalImageUsesDocumentedDataURI(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "assets", "images"), 0700); err != nil {
