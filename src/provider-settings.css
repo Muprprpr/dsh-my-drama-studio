@@ -1,0 +1,119 @@
+.drama-provider-dialog[role='dialog'] {
+  width: min(480px, 100%);
+  max-height: 100%;
+  min-height: 0;
+}
+.drama-provider-dialog .drama-provider-scroll {
+  min-height: 0;
+  overflow: auto;
+}
+.drama-provider-panel {
+  min-width: 0;
+  font-size: 13px;
+  line-height: 20px;
+}
+.drama-provider-panel p {
+  margin: 6px 0 10px;
+  color: var(--dsw-alias-label-secondary);
+}
+.drama-provider-panel .drama-provider-error { color: var(--dsw-alias-state-error-primary); }
+.drama-provider-panel [role='status'] { color: var(--dsw-alias-state-success-primary); }
+.drama-provider-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.drama-provider-list {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.drama-provider-list li {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 0;
+}
+.drama-provider-list li + li {
+  border-top: 0.5px solid var(--dsw-alias-border-l2);
+}
+.drama-provider-list li > div:first-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.drama-provider-list li > .drama-provider-actions {
+  justify-content: flex-end;
+  flex: none;
+}
+.drama-provider-list strong {
+  font-weight: 600;
+}
+.drama-provider-default {
+  margin-inline-start: 6px;
+}
+.drama-provider-list small, .drama-provider-form small {
+  display: block;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+  line-height: 17px;
+}
+.drama-provider-form {
+  display: grid;
+  min-width: 0;
+  gap: 9px;
+}
+.drama-provider-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(145px, 100%), 1fr));
+  gap: 8px;
+}
+.drama-provider-form label, .drama-provider-field {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.drama-provider-field .drama-provider-choice {
+  width: 100%;
+}
+.drama-provider-choice {
+  min-width: 0;
+  justify-content: space-between;
+}
+.drama-provider-choice > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.drama-provider-form details label {
+  margin-top: 7px;
+}
+.drama-provider-form summary {
+  cursor: pointer;
+  color: var(--dsw-alias-label-secondary);
+}
+.drama-provider-form .drama-provider-checkbox {
+  display: flex;
+  align-items: center;
+}
+.drama-provider-form textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 60px;
+  resize: vertical;
+  padding: 7px 8px;
+  border: 0.5px solid var(--dsw-alias-border-l4);
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+}
+.drama-provider-form textarea:focus-visible {
+  border-color: var(--dsw-alias-state-business-primary);
+}
+.drama-provider-remove {
+  padding: 7px 8px;
+  border: 0.5px solid var(--dsw-alias-border-l3);
+  border-radius: var(--dsw-radius-md);
+}

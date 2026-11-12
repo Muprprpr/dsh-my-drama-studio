@@ -1,0 +1,37 @@
+{
+  "name": "dsh-my-drama-studio",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./dist/host.js",
+    "./client": "./dist/client.js"
+  },
+  "files": [
+    "dist/client.js",
+    "dist/host.js",
+    "dist/studio.exe",
+    "dsh.bundle.patch"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./dsh.bundle.patch"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12",
+    "playwright-core": "1.62.1"
+  },
+  "dependencies": {
+    "@xyflow/react": "12.11.0"
+  }
+}
