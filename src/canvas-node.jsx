@@ -27,7 +27,7 @@ export function shotLabel(node) {
 }
 
 export function nodeTitle(node) {
-  return typeof node.content.title === 'string' ? node.content.title : ''
+  return typeof node?.content.title === 'string' ? node.content.title : ''
 }
 
 export function isMedia(node) {

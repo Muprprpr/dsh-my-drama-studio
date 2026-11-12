@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 // Load only as an explicit --patch row in an isolated DSH Web test profile.
 export const name = 'drama-agent-fixture'
-export const inject = ['connection', 'llm', 'sessionController', 'webServer', 'workspaceRegistry']
+export const inject = ['agents', 'connection', 'llm', 'sessionController', 'tools', 'webServer', 'workspaceRegistry']
 
 const provider = 'drama-fixture'
 const model = 'scripted'
@@ -70,7 +70,7 @@ async function verify(ctx, signal) {
   )
 
   const lib = join(dirname(process.execPath), 'resources', 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-llm', 'lib', 'index.js')
-  const { LlmAdapter } = await import(pathToFileURL(lib).href)
+  const { createUserMessage, LlmAdapter, LlmError } = await import(pathToFileURL(lib).href)
   const script = []
   let offered = []
   ctx.llm.registerAdapter([provider], new class extends LlmAdapter {
@@ -81,6 +81,11 @@ async function verify(ctx, signal) {
     async * stream(options) {
       const step = script.shift()
       assert.ok(step, 'Unexpected fixture model request')
+      if (step.hold) {
+        step.hold.entered = true
+        await once(step.hold.release, 'release', { signal: options.signal })
+        if (step.fail) throw new LlmError('Deliberate native fixture request error', 'AUTH')
+      }
       if (step.call) {
         const { id, name, args } = step.call
         offered = options.tools?.map(tool => tool.name) ?? []
@@ -101,6 +106,29 @@ async function verify(ctx, signal) {
   })
 
   const sessions = ctx.sessionController
+  async function holdTurn(sessionId, { fail = false, owner } = {}) {
+    const agent = owner ?? (await sessions.resolveAgent(sessionId)).agent
+    assert.equal(agent?.status, 'idle')
+    const startSeq = agent.session.snapshotEvents().at(-1)?.seq ?? -1
+    const hold = { release: new EventTarget(), entered: false }
+    script.push({ hold, fail })
+    const content = [{ type: 'text', text: 'Hold this native turn for the Workspace edit check.' }]
+    if (owner) {
+      agent.followup(createUserMessage({ content, source: { kind: 'user' } }))
+    } else {
+      const admission = await sessions.prompt({ sessionId, requestId: randomUUID(), mode: 'queue', content }, signal)
+      assert.equal(admission.accepted, true)
+    }
+    await until(() => hold.entered && agent.status === 'running', signal, 'held native turn')
+    return {
+      agent,
+      finish: () => hold.release.dispatchEvent(new Event('release')),
+      ending: () => until(() => {
+        if (agent.status !== 'idle') return undefined
+        return agent.session.snapshotEvents().find(event => event.seq > startSeq && event.type === 'turn/end')?.data.reason
+      }, signal, 'native turn settlement'),
+    }
+  }
   let nativeCalls = 0
   async function call(sessionId, toolName, args) {
     const resolved = await sessions.resolveAgent(sessionId)
@@ -147,6 +175,11 @@ async function verify(ctx, signal) {
     assert.equal(restored.status.canvasId, state.canvasId)
     assert.equal(restored.status.connected, true)
     assert.equal(restored.status.autoGenerate, false)
+    assert.equal(restored.status.aiRunning, false, 'An interrupted native turn was treated as a persistent lock')
+    const [note] = (await ok(await request('operation', {
+      ticket: restored.ticket, action: 'query', data: { id: state.noteId },
+    }), 'read note after restart')).nodes
+    await op(restored.ticket, 'update_node', { id: note.id, revision: note.revision, content: { description: 'Editable after Harness restart' } })
     const staleTicket = await request('operation', {
       ticket: state.ticket, action: 'permission', data: { operationId: randomUUID(), enabled: true },
     })
@@ -154,7 +187,7 @@ async function verify(ctx, signal) {
     await sessions.selectModel({ sessionId: state.sessionId, provider, model })
     await reject(state.sessionId, 'drama_submit', { operationId: randomUUID(), nodeId: state.videoId }, /automatic generation is disabled/i)
     assert.equal((await succeed(state.sessionId, 'drama_query', { type: 'shot' })).nodes.length, 2)
-    console.info(`[drama-agent-fixture] PASS restart: binding and Canvas persisted, stale ticket and Agent submit rejected (${nativeCalls} native tool calls)`)
+    console.info(`[drama-agent-fixture] PASS restart: live turn interrupted, Canvas persisted, human edit restored, stale ticket and Agent submit rejected (${nativeCalls} native tool calls)`)
     return
   }
 
@@ -222,6 +255,17 @@ async function verify(ctx, signal) {
   await succeed(b, 'drama_append', shot('Native fixture B'))
   const query = await succeed(a, 'drama_query', { type: 'shot' })
   assert.deepEqual(new Set(query.nodes.map(node => node.createdBySession)), new Set([a, b]))
+  assert.ok(!offered.some(name => /^drama_(?:update|delete)/.test(name)), 'A native Agent was offered human mutation tools')
+  for (const name of ['drama_update_node', 'drama_delete_node', 'drama_update_edge', 'drama_delete_edge']) {
+    const result = await ctx.tools.execute({
+      agent: (await sessions.resolveAgent(a)).agent, callId: randomUUID(), name,
+      arguments: { id: query.nodes[0].id, revision: query.nodes[0].revision }, signal,
+    })
+    assert.equal(result.isError, true, `Unregistered human operation resolved through tools: ${name}`)
+  }
+  await reject(a, 'drama_append', {
+    operationId: randomUUID(), nodes: [{ id: query.nodes[0].id, type: 'shot', content: { description: 'Attempted overwrite' } }],
+  }, /节点 ID 已存在/u)
   await reject(a, 'drama_append', { ...shot('forged Session'), sessionId: b })
   await reject(a, 'drama_append', { ...shot('forged Canvas'), canvasId: cBound.status.canvasId })
   await reject(a, 'drama_append', { ...shot('forged Workspace'), workspacePath: otherPath })
@@ -249,8 +293,74 @@ async function verify(ctx, signal) {
   const rebound = await init(b)
   assert.equal(rebound.status.autoGenerate, false)
   await op(rebound.ticket, 'permission', { enabled: true })
-  await writeFile(statePath, JSON.stringify({ sessionId: b, canvasId: rebound.status.canvasId, ticket: rebound.ticket, videoId: video.id }))
-  console.info(`[drama-agent-fixture] PASS native Agent: shared append and query, identity forgery rejected, authorization isolated and enforced, disconnect preserves nodes (${nativeCalls} native tool calls)`)
+  assert.equal((await init(b)).status.aiRunning, false, 'Generation permission was mistaken for live AI activity')
+
+  const noteId = randomUUID()
+  const otherId = randomUUID()
+  const note = (id, description) => ({ id, type: 'note', content: { description } })
+  await op(rebound.ticket, 'append', { nodes: [note(noteId, 'Original manual note')] })
+  await op(cBound.ticket, 'append', { nodes: [note(otherId, 'Isolated Workspace note')] })
+  const edit = (id, revision, description) => ({ id, revision, content: { description } })
+  const change = (ticket, action, data) => request('operation', { ticket, action, data: { operationId: randomUUID(), ...data } })
+  async function locked(ticket, action, data) {
+    const response = await change(ticket, action, data)
+    assert.equal(response.status, 423, JSON.stringify(await response.json()))
+  }
+  await op(rebound.ticket, 'update_node', edit(noteId, 1, 'Manual edit while idle'))
+  const turnA = await holdTurn(a)
+  assert.equal((await init(b)).status.aiRunning, true)
+  assert.equal((await init(c)).status.aiRunning, false)
+  await locked(rebound.ticket, 'update_node', edit(noteId, 2, 'Blocked from Session B'))
+  const duringId = randomUUID()
+  await op(rebound.ticket, 'append', { nodes: [note(duringId, 'Manual append while AI is active')] })
+  await op(cBound.ticket, 'update_node', edit(otherId, 1, 'Other Workspace still editable'))
+  const turnB = await holdTurn(b)
+  turnA.finish()
+  assert.equal((await turnA.ending()).kind, 'completed')
+  assert.equal(turnB.agent.status, 'running')
+  await locked(aBound.ticket, 'delete_node', { id: duringId, revision: 1 })
+  assert.equal(sessions.cancel({ sessionId: b }).accepted, true)
+  assert.deepEqual(await turnB.ending(), { kind: 'aborted', reason: { kind: 'user' } })
+  assert.equal((await init(a)).status.aiRunning, false)
+  await op(aBound.ticket, 'delete_node', { id: duringId, revision: 1 })
+
+  const binding = await holdTurn(a)
+  await op(aBound.ticket, 'disconnect')
+  assert.equal((await init(b)).status.aiRunning, false, 'An unbound Agent held the Workspace lock')
+  await op(aBound.ticket, 'bind')
+  assert.equal((await init(b)).status.aiRunning, true, 'A newly connected active Agent was ignored')
+  binding.finish()
+  assert.equal((await binding.ending()).kind, 'completed')
+
+  const failed = await holdTurn(a, { fail: true })
+  await locked(rebound.ticket, 'update_node', edit(noteId, 2, 'Still blocked before failure'))
+  failed.finish()
+  assert.equal((await failed.ending()).kind, 'error')
+  assert.equal((await init(b)).status.aiRunning, false)
+  await op(rebound.ticket, 'update_node', edit(noteId, 2, 'Editable after failed turn'))
+
+  const disposableId = randomUUID()
+  const handle = await ctx.agents.create({
+    sessionId: disposableId, meta: { cwd: workspace.path }, agentOptions: { provider, model },
+  })
+  try {
+    await workspace.attachSession(disposableId)
+    await op((await init(disposableId)).ticket, 'bind')
+    await holdTurn(disposableId, { owner: handle.agent })
+    await locked(rebound.ticket, 'delete_node', { id: noteId, revision: 3 })
+  } finally {
+    await handle.dispose()
+  }
+  assert.equal(ctx.agents.get(disposableId), undefined)
+  assert.equal((await init(b)).status.aiRunning, false)
+  await op(rebound.ticket, 'update_node', edit(noteId, 3, 'Editable after Agent disposal'))
+
+  await writeFile(statePath, JSON.stringify({
+    sessionId: b, canvasId: rebound.status.canvasId, ticket: rebound.ticket, videoId: video.id, noteId,
+  }))
+  await holdTurn(a)
+  await locked(rebound.ticket, 'delete_node', { id: noteId, revision: 4 })
+  console.info(`[drama-agent-fixture] PASS native Agent: overlapping turns, other Workspace isolation, cancel/error/dispose unlock, Agent update/delete rejected, held turn at restart (${nativeCalls} native tool calls)`)
 }
 
 async function until(check, signal, label, timeout = 15_000) {

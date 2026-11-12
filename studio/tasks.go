@@ -100,7 +100,11 @@ func (p *project) submit(ctx context.Context, r Request, providers providerRegis
 		if err := providers.Prepare(&input, args.ProfileID); err != nil {
 			return nil, err
 		}
-		encoded, err := json.Marshal(input)
+		group, err := readSourceGroup(ctx, tx, args.NodeID)
+		if err != nil {
+			return nil, err
+		}
+		encoded, err := json.Marshal(generationRequest{GenerationInput: input, SourceGroup: &group})
 		if err != nil {
 			return nil, err
 		}
@@ -122,7 +126,7 @@ func (p *project) submit(ctx context.Context, r Request, providers providerRegis
 }
 
 func submissionNode(ctx context.Context, tx *sql.Tx, id string) (kind, snapshot string, err error) {
-	err = tx.QueryRowContext(ctx, "SELECT type,content FROM nodes WHERE id=?", id).Scan(&kind, &snapshot)
+	err = tx.QueryRowContext(ctx, "SELECT type,content FROM nodes WHERE id=? AND deleted=0", id).Scan(&kind, &snapshot)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", "", invalid("待生成节点不存在于当前 Canvas")
 	}

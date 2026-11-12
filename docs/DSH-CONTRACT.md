@@ -30,3 +30,9 @@
 - [NINKCH/dsh-infinite_canvas](https://github.com/NINKCH/dsh-infinite_canvas) 用作比较 Browser 工件注册机制的参考。
 
 Browser manifest 的 `dsh.client.inject` 填 Web 模块包名 `@deepseek-ai/dsh-client-ui-conversation`、`@deepseek-ai/dsh-client-ui-sidebar-right`。Browser `export const inject` 填 Cordis 服务名 `slots`、`sidebarRight`、`sidebarRightTabs` 和 `locale`。Owner API Peer 的 kind 也可能为 owner，所以 Studio 的 Browser 路由还要求 Peer ID 与原生 `ctx.connection.browserPeer.id` 相同。安装版已验证 API Owner Peer 收到 403。
+
+## Workspace Agent 活动
+
+- 安装版仍为 `0.2.1-rc.3`，Desktop 内置 Node.js 为 `24.21.0`、Windows x64，Cordis 为 `4.0.5`。同版本 `packages/core/agent/src/index.ts` 提供注入服务 `ctx.agents` 和同步 `get(sessionId)`，只读取当前已加载的 Agent。已存在但未加载的 Session 无运行实例。
+- `packages/core/agent-loop/src/agent.ts` 定义 `agent.status` 的 `idle` / `running`，切换时发送 `agent/status`，事件参数为 `{agent,status}`。`packages/core/agent/src/runtime-types.ts` 声明 `agent/disposed` 参数为 `{agent}`。释放时注册表先移除该 Agent，再通知观察者。
+- Host 在浏览器初次读取、SSE 更新及 Go 事务准入时，用 DSH Workspace 成员与 SQLite 已连接会话取交集，再读取实时状态。事件用于刷新界面，准入直接读取原生注册表。新 Host 从实际注册表读取状态，无需恢复活动锁。

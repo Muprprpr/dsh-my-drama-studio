@@ -116,9 +116,9 @@ func TestWorkspaceIdentityConcurrencyAndRestart(t *testing.T) {
 	if err := p.db.QueryRow("PRAGMA journal_mode").Scan(&journal); err != nil || journal != "wal" {
 		t.Fatalf("journal=%q: %v", journal, err)
 	}
-	for _, statement := range []string{"UPDATE nodes SET content='{}'", "DELETE FROM nodes"} {
-		if _, err := p.db.Exec(statement); err == nil || !strings.Contains(err.Error(), "append-only") {
-			t.Fatalf("SQLite accepted %s: %v", statement, err)
+	for _, node := range result.Nodes {
+		if node.Revision != 1 || node.Deleted {
+			t.Fatalf("new row initialized incorrectly: %+v", node)
 		}
 	}
 	if err := s.Close(); err != nil {
@@ -154,7 +154,7 @@ func TestWorkspaceIdentityConcurrencyAndRestart(t *testing.T) {
 	if result := mustCall(t, s, dir, "b", "query", nil).(queryResult); len(result.Nodes) != 100 {
 		t.Fatalf("disconnect modified shared history: %d nodes", len(result.Nodes))
 	}
-	t.Log("three native identities share one Canvas, separate Workspace isolated, 2×50 retained, retry idempotent, WAL and immutable rows verified, restart and project copy preserved Canvas")
+	t.Log("three native identities share one Canvas, separate Workspace isolated, 2×50 retained, retry idempotent, WAL and initial revisions verified, restart and project copy preserved Canvas")
 }
 
 func TestAtomicReferencesAndVideoPrompt(t *testing.T) {

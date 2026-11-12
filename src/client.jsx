@@ -172,6 +172,7 @@ function DramaCanvasTab({ sessionId, useTabInfo, useWorkspaces, t }) {
 function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
   const { session, error: sessionError } = useStudioSession(sessionId, visible)
   const [view, setView] = useState(null)
+  const [activity, setActivity] = useState(null)
   const [filters, setFilters] = useState({})
   const [providerData, setProviderData] = useState(null)
   const [providerError, setProviderError] = useState('')
@@ -205,6 +206,10 @@ function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
     if (!visible || !connected) return
     const controller = new AbortController()
     subscribe(ticket, session.status.eventSeq, controller.signal, batch => {
+      if (typeof batch.aiRunning === 'boolean') {
+        setActivity({ ticket, running: batch.aiRunning })
+        return
+      }
       if (!batch.events.length || batch.events.some(event => event.type === 'binding' || event.type === 'permission')) {
         notify(sessionId)
       }
@@ -233,6 +238,21 @@ function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
     return result
   }
 
+  async function mutate(action, data) {
+    try {
+      const result = await operation(ticket, action, { ...data, operationId: crypto.randomUUID() })
+      setRevision(value => value + 1)
+      return result
+    } catch (failure) {
+      if (failure.status === 423) throw new Error('AI 工作期间提交的操作已被拒绝。', { cause: failure })
+      if (failure.status === 409) {
+        setRevision(value => value + 1)
+        throw new Error('画布内容已变化。请先查看最新内容，再决定如何保存。', { cause: failure })
+      }
+      throw failure
+    }
+  }
+
   async function submitGeneration(node, profileId) {
     const request = {
       operationId: crypto.randomUUID(), nodeId: node.id, profileId, confirmed: true,
@@ -252,6 +272,9 @@ function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
   const snapshot = view?.ticket === ticket && view?.result.status.canvasId === session?.status.canvasId
     ? view?.result : null
   const status = snapshot?.status ?? session?.status
+  const aiRunning = activity?.ticket === ticket ? activity?.running : status?.aiRunning
+  const mutationReason = aiRunning === false ? '' : aiRunning === true
+    ? 'AI 工作中，暂不能修改或删除已有内容。' : '正在检查 AI 活动状态。'
   const issue = error || sessionError
   return <section className="drama-shell" data-testid="drama-canvas" data-session-id={sessionId}
     data-workspace-id={session?.status.workspaceId} data-canvas-id={session?.status.canvasId ?? undefined}>
@@ -263,10 +286,13 @@ function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
       {connected && <span className="drama-shell-connected" title={`${status.connectedSessions} 个会话已连接`}>
         <StateDot state="done" size={7} />{status.connectedSessions} 个会话
       </span>}
+      {connected && aiRunning === true && <span className="drama-shell-connected drama-shell-activity"
+        role="status" title={mutationReason}>AI 工作中</span>}
     </header>
     <div className="drama-shell-body">
       {connected && snapshot ? <CanvasViewport snapshot={snapshot} filters={filters}
-        setFilters={setFilters} append={append} mediaURL={node => mediaURL(ticket, node)}
+        setFilters={setFilters} append={append} mutate={mutate} mutationReason={mutationReason}
+        mediaURL={node => mediaURL(ticket, node)}
         generationProfiles={providerData?.profiles ?? []} generationDefaults={providerData?.generation}
         queryCanvas={queryCanvas} submitGeneration={submitGeneration} changeTask={changeTask} />
         : !issue && <p className="drama-shell-empty">{session && !connected ? '从输入栏连接项目画布' : '正在读取画布…'}</p>}

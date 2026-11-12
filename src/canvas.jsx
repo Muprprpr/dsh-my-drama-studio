@@ -53,7 +53,8 @@ function usePositions(key) {
 }
 
 export function CanvasViewport({
-  snapshot, filters, setFilters, append, mediaURL, submitGeneration, changeTask, queryCanvas, generationProfiles = [], generationDefaults,
+  snapshot, filters, setFilters, append, mutate, mutationReason, mediaURL,
+  submitGeneration, changeTask, queryCanvas, generationProfiles = [], generationDefaults,
 }) {
   const { nodes, edges, hasMore, status, tasks = [] } = snapshot
   const [positions, setPositions] = usePositions(`drama-layout:${status.canvasId}:${status.sessionId}`)
@@ -68,11 +69,16 @@ export function CanvasViewport({
   const [selectedResults, setSelectedResults] = usePositions(`drama-results:${status.canvasId}:${status.sessionId}`)
   const [picker, setPicker] = useState(null)
   const [contextNode, setContextNode] = useState(null)
+  const [contextEdge, setContextEdge] = useState(null)
+  const [removal, setRemoval] = useState(null)
+  const [removing, setRemoving] = useState(false)
+  const [removalError, setRemovalError] = useState('')
   const [focusId, setFocusId] = useState(null)
   const [edgeError, setEdgeError] = useState('')
   const flow = useRef(null)
   const addAnchor = useRef(null)
   const surface = useRef(null)
+  const reconnecting = useRef(null)
 
   const index = useMemo(() => new Map(nodes.map(node => [node.id, node])), [nodes])
   const taskIndex = useMemo(() => {
@@ -91,7 +97,8 @@ export function CanvasViewport({
   const pageSize = filters.limit || 100
   const offset = filters.offset || 0
   const selectedResultIds = new Set(Object.values(selectedResults))
-  const media = useMemo(() => nodes.filter(isMedia), [nodes])
+  const media = useMemo(() => nodes.filter(node => !node.deleted && isMedia(node)), [nodes])
+  const editingIds = new Set(drafts.filter(draft => draft.edit).map(draft => draft.id))
 
   const visibleReferences = edges.filter(edge => visibleIds.has(edge.source) && visibleIds.has(edge.target) &&
     (index.get(edge.target).type !== 'video' || isMedia(index.get(edge.source))))
@@ -113,6 +120,11 @@ export function CanvasViewport({
   }
 
   const actions = {
+    edit: node => openEditor({ base: node, edit: true }),
+    delete: node => openRemoval({ kind: 'node', node }),
+    removeReference: (source, target) => openRemoval({
+      kind: 'edge', edge: { source, target: target.id, data: { revision: target.revision } },
+    }),
     revise: node => openEditor({ base: node }),
     duplicate: node => openEditor({ base: node, duplicate: true }),
     collapse: node => toggleCompact([node.id]),
@@ -121,8 +133,9 @@ export function CanvasViewport({
     locate,
     selectResult: node => setSelectedResults(current => ({ ...current, [node.basedOn || node.id]: node.id })),
     submitGeneration,
+    mutationReason,
   }
-  const graphNodes = visible.map(node => ({
+  const graphNodes = visible.filter(node => !editingIds.has(node.id)).map(node => ({
     id: node.id,
     type: 'drama',
     position: positions[node.id] ?? defaultPositions[node.id],
@@ -130,7 +143,8 @@ export function CanvasViewport({
     className: 'drama-flow-node',
     dragHandle: '.drama-node-titlebar',
     ariaLabel: nodeTitle(node) || nodeLabels[node.type],
-    data: { node, compact: compact.includes(node.id), actions, index, edges, mediaURL, generationProfiles, generationDefaults,
+    data: { node, compact: compact.includes(node.id), actions: node.deleted ? { preview: setPreview, locate } : actions,
+      index, edges, mediaURL, generationProfiles, generationDefaults,
       tasks: taskIndex.get(node.id), selectedResult: selectedResultIds.has(node.id) },
   }))
   for (const draft of drafts) {
@@ -138,12 +152,13 @@ export function CanvasViewport({
     const node = { ...draft.group, ...draft.base, id: draft.id, type,
       content: draft.base?.type === type ? draft.base.content : {} }
     const editor = {
-      append, media, queryCanvas,
+      append, mutate, mutationReason, media, queryCanvas,
       finish: id => finishEdit(draft.id, id),
       close: () => closeDraft(draft.id),
     }
     graphNodes.push({ id: draft.id, type: 'drama', position: positions[draft.id] ?? draft.at, selected: selected.includes(draft.id),
-      className: 'drama-flow-node', dragHandle: '.drama-node-titlebar', ariaLabel: '未保存 ' + nodeLabels[type],
+      className: 'drama-flow-node', dragHandle: '.drama-node-titlebar',
+      ariaLabel: (draft.edit ? '编辑 ' : '未保存 ') + nodeLabels[type],
       data: { node, draft, editor, mediaURL, generationProfiles, generationDefaults } })
   }
 
@@ -151,10 +166,13 @@ export function CanvasViewport({
     .map(edge => ({
       ...edge, id: `${edge.source}:${edge.target}`, sourceHandle: 'out', targetHandle: 'in', type: 'smoothstep',
       className: isMedia(index.get(edge.source)) ? 'drama-edge-media' : 'drama-edge-reference',
+      reconnectable: canChangeEdge(edge) ? 'source' : false,
+      data: { revision: index.get(edge.target).revision },
     }))
   for (const { source, target } of visibleVersions) {
     graphEdges.push({ id: `version:${target}`, source, target,
-      sourceHandle: 'out', targetHandle: 'lineage', label: '派生', type: 'smoothstep', className: 'drama-edge-version' })
+      sourceHandle: 'out', targetHandle: 'lineage', label: '派生', type: 'smoothstep',
+      className: 'drama-edge-version', reconnectable: false })
   }
 
   useEffect(() => {
@@ -189,9 +207,16 @@ export function CanvasViewport({
   }
 
   function openEditor(options = {}) {
+    if (options.base?.deleted || options.seed?.deleted || options.edit && mutationReason) return
     setContextNode(null)
+    setContextEdge(null)
     setPicker(null)
-    const id = 'draft-' + crypto.randomUUID()
+    const id = options.edit ? options.base.id : 'draft-' + crypto.randomUUID()
+    if (options.edit && editingIds.has(id)) {
+      setSelected([id])
+      setFocusId(id)
+      return
+    }
     const source = options.base ?? options.seed
     const sourcePosition = source && graphNodes.find(node => node.id === source.id)?.position
     const bounds = surface.current?.getBoundingClientRect()
@@ -201,13 +226,13 @@ export function CanvasViewport({
     })
     const point = options.at ?? (sourcePosition ? { x: sourcePosition.x + gapX, y: sourcePosition.y } : centered)
       ?? { x: 34, y: 92 }
-    const at = availablePosition(point, { width: 320, height: 470 }, graphNodes.map(graph => {
+    const at = options.edit && sourcePosition ? sourcePosition : availablePosition(point, { width: 320, height: 470 }, graphNodes.map(graph => {
       const measured = flow.current?.getNode(graph.id)?.measured
       return { ...graph.position, width: measured?.width ?? 320,
         height: measured?.height ?? (graph.data.draft ? 470 : dimensions(graph.data.node).height) }
     }))
     const group = options.group ?? { episodeId: filters.episodeId, sceneId: filters.sceneId, shotId: filters.shotId }
-    setDrafts(current => [...current, { ...options, id, key: id, at, group }])
+    setDrafts(current => current.some(draft => draft.id === id) ? current : [...current, { ...options, id, at, group }])
     setSelected([id])
     setFocusId(id)
   }
@@ -215,7 +240,7 @@ export function CanvasViewport({
   function closeDraft(draftId) {
     setDrafts(current => current.filter(item => item.id !== draftId))
     setSelected(current => current.filter(id => id !== draftId))
-    setPositions(current => {
+    if (!editingIds.has(draftId)) setPositions(current => {
       const { [draftId]: _local, ...rest } = current
       return rest
     })
@@ -235,7 +260,9 @@ export function CanvasViewport({
   }
 
   function openPicker(event, seed, rect) {
+    if (seed?.deleted) return
     setContextNode(null)
+    setContextEdge(null)
     const point = event && ('clientX' in event ? event : event.changedTouches[0])
     const at = point && flow.current?.screenToFlowPosition({ x: point.clientX, y: point.clientY })
     setPicker({ at, seed, anchor: point || rect ? null : addAnchor.current,
@@ -251,12 +278,16 @@ export function CanvasViewport({
     if (targetHandle && targetHandle !== 'in') return false
     const from = index.get(source)
     const to = index.get(target)
-    if (!from || !to || source === target || edges.some(edge => edge.source === source && edge.target === target)
+    if (!from || !to || from.deleted || to.deleted || source === target || editingIds.has(target)
+        || edges.some(edge => edge.source === source && edge.target === target)
         || referenceIds(to).includes(source)) return false
+    const original = reconnecting.current
+    if (original && (original.target !== target || !canChangeEdge(original))) return false
     if (to.type !== 'video') return true
     const mode = videoMode(to)
-    return mode !== 'asset' && isMedia(from) &&
-      (mode !== 'v2v' || from.type === 'video' && referenceIds(to).length === 0)
+    if (mutationReason || mode === 'asset' || !isMedia(from)) return false
+    if (original) return mode !== 'i2v' && mode !== 'v2v' || from.type === index.get(original.source)?.type
+    return mode !== 'v2v' || from.type === 'video' && referenceIds(to).length === 0
   }
 
   async function connect({ source, target, targetHandle }) {
@@ -270,7 +301,7 @@ export function CanvasViewport({
       if (mode === 't2v') nextMode = seed.type === 'video' ? 'v2v' : 'r2v'
       if (mode === 'i2v' && referenceIds(to).length >= referenceLimit(mode, seed.type, profile)) nextMode = 'r2v'
       const preset = nextMode === mode ? undefined : presets.find(item => item.mode === nextMode)
-      openEditor({ base: to, seed, preset })
+      openEditor({ base: to, seed, preset, edit: true })
       return
     }
     setEdgeError('')
@@ -282,11 +313,61 @@ export function CanvasViewport({
   }
 
   function connectEnd(event, connection) {
+    if (reconnecting.current) return
     if (connection.isValid || connection.toNode || connection.fromHandle?.type !== 'source') return
     const element = event.target instanceof Element ? event.target : null
     if (!element?.classList.contains('react-flow__pane')) return
     const node = index.get(connection.fromNode?.id)
     if (node) openPicker(event, node)
+  }
+
+  function canChangeEdge(edge) {
+    const source = index.get(edge.source)
+    const target = index.get(edge.target)
+    return !mutationReason && !editingIds.has(edge.target) && source && target && !source.deleted && !target.deleted
+  }
+
+  async function reconnect(edge, connection) {
+    if (edge.target !== connection.target || !canChangeEdge(edge) || !canLink(connection)) return
+    setEdgeError('')
+    try {
+      await mutate('update_edge', {
+        source: edge.source, target: edge.target, newSource: connection.source,
+        revision: reconnecting.current?.data?.revision ?? edge.data.revision,
+      })
+    } catch (failure) {
+      setEdgeError(failure.message)
+    }
+  }
+
+  function openRemoval(item) {
+    if (mutationReason) return
+    setContextNode(null)
+    setContextEdge(null)
+    setRemovalError('')
+    setRemoval(item)
+  }
+
+  async function confirmRemoval() {
+    if (mutationReason || removing) return
+    setRemoving(true)
+    setRemovalError('')
+    try {
+      if (removal.kind === 'node') {
+        const { id, revision } = removal.node
+        await mutate('delete_node', { id, revision })
+        setSelected(current => current.filter(selectedId => selectedId !== id))
+        if (filters.id === id) setFilters({})
+      } else {
+        const { source, target, data } = removal.edge
+        await mutate('delete_edge', { source, target, revision: data.revision })
+      }
+      setRemoval(null)
+    } catch (failure) {
+      setRemovalError(failure.message)
+    } finally {
+      setRemoving(false)
+    }
   }
 
   function locate(id) {
@@ -338,6 +419,7 @@ export function CanvasViewport({
     } else if (event.key === 'Escape') {
       setPicker(null)
       setContextNode(null)
+      setContextEdge(null)
     }
   }
 
@@ -350,21 +432,38 @@ export function CanvasViewport({
       <ReactFlow nodes={graphNodes} edges={graphEdges} nodeTypes={nodeTypes}
         onInit={instance => { flow.current = instance }}
         onNodesChange={applyNodeChanges} onConnect={connect} onConnectEnd={connectEnd} isValidConnection={canLink}
-        onPaneClick={() => { setPicker(null); setContextNode(null) }}
+        onPaneClick={() => { setPicker(null); setContextNode(null); setContextEdge(null) }}
         onPaneContextMenu={event => { event.preventDefault(); openPicker(event) }}
         onNodeDoubleClick={(_event, node) => {
           if (node.data.draft) return
           if (isMedia(node.data.node)) setPreview(node.data.node)
-          else openEditor({ base: node.data.node })
+          else openEditor({ base: node.data.node, edit: true })
         }}
         onNodeContextMenu={(event, node) => {
           event.preventDefault()
           setPicker(null)
+          setContextEdge(null)
           setSelected([node.id])
-          if (node.data.draft) return
+          if (node.data.draft || node.data.node.deleted) {
+            setContextNode(null)
+            return
+          }
           setContextNode({ id: node.id, rect: new DOMRect(event.clientX, event.clientY, 1, 1) })
         }}
-        deleteKeyCode={null} edgesReconnectable={false} minZoom={0.15} maxZoom={2} zoomOnDoubleClick={false}
+        onEdgeContextMenu={(event, edge) => {
+          event.preventDefault()
+          setPicker(null)
+          setContextNode(null)
+          if (!edge.data) {
+            setContextEdge(null)
+            return
+          }
+          setContextEdge({ edge, rect: new DOMRect(event.clientX, event.clientY, 1, 1) })
+        }}
+        onReconnectStart={(_event, edge) => { reconnecting.current = edge }}
+        onReconnect={reconnect}
+        onReconnectEnd={() => { reconnecting.current = null }}
+        deleteKeyCode={null} edgesReconnectable={!mutationReason} minZoom={0.15} maxZoom={2} zoomOnDoubleClick={false}
         snapToGrid snapGrid={grid} multiSelectionKeyCode="Shift" selectionOnDrag={boxSelect} selectionMode={SelectionMode.Partial}
         panOnDrag={!boxSelect} onlyRenderVisibleElements={drafts.length === 0}>
         <Background color="var(--dsw-alias-border-l2)" gap={20} size={1} />
@@ -406,18 +505,49 @@ export function CanvasViewport({
       {contextNode && index.has(contextNode.id) && <Menu open portal compact
         anchor={<span className="drama-v2-picker-anchor" />} getAnchorRect={() => contextNode.rect} onClose={() => setContextNode(null)}
         items={[
-          { id: 'revise', label: '编辑为新版本' }, { id: 'copy', label: '复制为新节点' },
+          ...(mutationReason ? [{ id: 'activity', type: 'label', text: mutationReason }] : []),
+          { id: 'edit', label: '编辑节点', disabled: Boolean(mutationReason) },
+          { id: 'delete', label: '删除节点', disabled: Boolean(mutationReason), danger: true },
+          { id: 'revise', label: '派生版本' }, { id: 'copy', label: '复制为新节点' },
           { id: 'compact', label: '折叠或展开' }, { id: 'next', label: '新增后继节点' },
         ]} onSelect={id => {
           const node = index.get(contextNode.id)
           if (id === 'compact') { toggleCompact([node.id]); setContextNode(null) }
           else if (id === 'next') openPicker(undefined, node, contextNode.rect)
-          else openEditor({ base: node, duplicate: id === 'copy' })
+          else if (id === 'delete') openRemoval({ kind: 'node', node })
+          else openEditor({ base: node, edit: id === 'edit', duplicate: id === 'copy' })
         }} />}
+      {contextEdge && <Menu open portal compact
+        anchor={<span className="drama-v2-picker-anchor" />} getAnchorRect={() => contextEdge.rect}
+        onClose={() => setContextEdge(null)}
+        items={[
+          { id: 'hint', type: 'label', text: mutationReason || (editingIds.has(contextEdge.edge.target)
+            ? '先保存或取消目标节点的编辑' : '拖动连线起点可更换来源') },
+          { id: 'delete', label: '删除连线', danger: true, disabled: !canChangeEdge(contextEdge.edge) },
+        ]}
+        onSelect={() => openRemoval({ kind: 'edge', edge: contextEdge.edge })} />}
       {tasksOpen && <TaskDrawer tasks={tasks} nodes={nodes} onLocate={id => { locate(id); setTasksOpen(false) }}
         changeTask={changeTask}
         onClose={() => setTasksOpen(false)} />}
     </div>
+    {removal && <Modal open onClose={() => { if (!removing) setRemoval(null) }}
+      title={removal.kind === 'node' ? '删除节点' : '删除连线'} closeLabel="关闭删除确认"
+      footer={<>
+        <Button size="sm" disabled={removing} onClick={() => setRemoval(null)}>取消</Button>
+        <Button size="sm" variant="primary" disabled={removing || Boolean(mutationReason)}
+          onClick={confirmRemoval}>{removing ? '正在删除' : '确认删除'}</Button>
+      </>}>
+      <div className="drama-v2-delete-content">
+        {removal.kind === 'node' ? <>
+          <strong>{nodeTitle(removal.node) || nodeLabels[removal.node.type]}</strong>
+          <p>节点会从画布移除。若其他节点或生成任务引用了它，来源关系和任务记录会保留。</p>
+        </> : <>
+          <strong>{nodeTitle(index.get(removal.edge.source)) || '来源节点'} → {nodeTitle(index.get(removal.edge.target)) || '目标节点'}</strong>
+          <p>删除此引用连线。生成节点的输入仍须满足当前生成方式的素材要求。</p>
+        </>}
+        {(mutationReason || removalError) && <p role="alert">{removalError || mutationReason}</p>}
+      </div>
+    </Modal>}
     {preview && <Modal open onClose={() => setPreview(null)} title={nodeTitle(preview) || nodeLabels[preview.type]}
       closeLabel="关闭预览" contentClassName="drama-v2-preview-modal">
       <div className="drama-v2-preview">

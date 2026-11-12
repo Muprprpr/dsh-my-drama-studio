@@ -1,7 +1,7 @@
 param(
     [string]$Launcher,
     [string]$Profile = 'web',
-    [int]$Port = 3080,
+    [ValidateRange(0, 65535)][int]$Port = 3080,
     [switch]$NoOpen,
     [switch]$Install
 )
@@ -16,6 +16,12 @@ if (!(Test-Path -LiteralPath $Launcher)) { throw 'Install DeepSeek Harness or su
 $hostEntry = Join-Path $root 'dist/host.js'
 foreach ($artifact in @($hostEntry, (Join-Path $root 'dist/client.js'), (Join-Path $root 'dist/studio.exe'))) {
     if (!(Test-Path -LiteralPath $artifact)) { throw 'Run scripts/build.ps1 first.' }
+}
+if ($Port -ne 0) {
+    $listeners = [Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+    if ($listeners | Where-Object { $_.Port -eq $Port -and $_.Address.ToString() -in @('127.0.0.1', '0.0.0.0') }) {
+        throw "Port 127.0.0.1:${Port} is already in use. To restart DSH Web on this port, stop the existing instance from its original terminal and retry."
+    }
 }
 if ([string]::IsNullOrWhiteSpace($Profile) -or $Profile -match '[\\/:]' -or $Profile -in @('.', '..', 'node_modules')) {
     throw "Invalid DSH Profile name: $Profile"
@@ -49,10 +55,13 @@ if ($Install -or !$hasBundle) {
     if ($LASTEXITCODE -ne 0) { throw "DSH profile install exited with code $LASTEXITCODE" }
 }
 $installedRoot = Join-Path $profileRoot "node_modules/$pluginName"
-node -e 'const fs = require("node:fs"); const paths = process.argv.slice(1); process.exit(paths.every(path => fs.existsSync(path)) && fs.realpathSync(paths[0]).toLowerCase() === fs.realpathSync(paths[1]).toLowerCase() ? 0 : 1)' $installedRoot $root
-if ($LASTEXITCODE -ne 0) {
+# Windows PowerShell strips embedded double quotes from native arguments.
+node -e 'const fs = require(''node:fs''); const paths = process.argv.slice(1); process.exit(paths.every(path => fs.existsSync(path)) && fs.realpathSync(paths[0]).toLowerCase() === fs.realpathSync(paths[1]).toLowerCase() ? 0 : 2)' $installedRoot $root
+$linkStatus = $LASTEXITCODE
+if ($linkStatus -eq 2) {
     throw "Drama Studio is not linked to this checkout in '$Profile'. Run scripts/dev.ps1 -Install to relink it."
 }
+if ($linkStatus -ne 0) { throw "Drama Studio link check exited with code $linkStatus." }
 $flags = @('--profile', $Profile, '--host', '127.0.0.1', '--port', "$Port")
 if ($NoOpen) { $flags += '--no-open' }
 & $Launcher @flags

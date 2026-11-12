@@ -35,6 +35,24 @@ type GenerationInput struct {
 	OutputDirectory string                `json:"outputDirectory,omitempty"`
 }
 
+type sourceGroup struct {
+	EpisodeID string `json:"episodeId"`
+	SceneID   string `json:"sceneId"`
+	ShotID    string `json:"shotId"`
+}
+
+type generationRequest struct {
+	GenerationInput
+	SourceGroup *sourceGroup `json:"sourceGroup,omitempty"`
+}
+
+func readSourceGroup(ctx context.Context, tx *sql.Tx, id string) (sourceGroup, error) {
+	var group sourceGroup
+	err := tx.QueryRowContext(ctx, "SELECT episode_id,scene_id,shot_id FROM nodes WHERE id=?", id).
+		Scan(&group.EpisodeID, &group.SceneID, &group.ShotID)
+	return group, err
+}
+
 type GenerationReference struct {
 	Type string `json:"type"`
 	URL  string `json:"url,omitempty"`
@@ -219,7 +237,7 @@ func (p *project) advance(ctx context.Context, registry providerRegistry) error 
 }
 
 func (p *project) advanceTask(ctx context.Context, registry providerRegistry, task Task, input string, deadline time.Time, onCompleted *func()) error {
-	var request GenerationInput
+	var request generationRequest
 	var provider Provider
 	if task.Status != "submitting" {
 		if err := json.Unmarshal([]byte(input), &request); err != nil {
@@ -243,7 +261,7 @@ func (p *project) advanceTask(ctx context.Context, registry providerRegistry, ta
 		}
 		task.Status = "submitting"
 		call, cancelCall := context.WithTimeout(ctx, 60*time.Second)
-		reply, submitErr := provider.Submit(call, request)
+		reply, submitErr := provider.Submit(call, request.GenerationInput)
 		cancelCall()
 		persist, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
@@ -307,7 +325,7 @@ func (p *project) advanceTask(ctx context.Context, registry providerRegistry, ta
 			if err != nil {
 				return p.providerTaskError(ctx, task, err)
 			}
-			if err := p.complete(ctx, task, file); err != nil {
+			if err := p.complete(ctx, task, file, request.SourceGroup); err != nil {
 				return err
 			}
 			if *onCompleted != nil && task.Type == "video" {
@@ -440,17 +458,21 @@ func (p *project) download(ctx context.Context, task Task, result ProviderResult
 	return dest, nil
 }
 
-func (p *project) complete(ctx context.Context, task Task, file string) error {
+func (p *project) complete(ctx context.Context, task Task, file string, group *sourceGroup) error {
 	tx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	node := NodeInput{Type: task.Type, BasedOn: task.NodeID}
-	if err := tx.QueryRowContext(ctx, "SELECT episode_id,scene_id,shot_id FROM nodes WHERE id=?", task.NodeID).
-		Scan(&node.EpisodeID, &node.SceneID, &node.ShotID); err != nil {
-		return err
+	if group == nil {
+		stored, err := readSourceGroup(ctx, tx, task.NodeID)
+		if err != nil {
+			return err
+		}
+		group = &stored
 	}
+	node := NodeInput{Type: task.Type, BasedOn: task.NodeID,
+		EpisodeID: group.EpisodeID, SceneID: group.SceneID, ShotID: group.ShotID}
 	node.Content, err = json.Marshal(map[string]string{"path": file, "providerTaskId": task.ProviderTaskID})
 	if err != nil {
 		return err

@@ -114,6 +114,9 @@
   font-size: 12px;
   line-height: 18px;
 }
+.drama-shell-activity {
+  color: var(--dsw-alias-state-warn-label);
+}
 .drama-shell-body {
   display: grid;
   grid-template-rows: minmax(0, 1fr);

@@ -4,7 +4,7 @@ import {
   Button, FileTypeIcon, IconBranchOutlineRegular, IconChevronDownOutlineRegular,
   IconCopyOutlineRegular, IconEditOutlineRegular, IconEllipsisOutlineRegular, IconFullscreenOutlineRegular,
   IconLinkOutlineRegular, IconListPenOutlineRegular, IconPlanOutlineRegular, IconPlayOutlineRegular,
-  IconPlusOutlineRegular, IconSparkleRegular, Input, Menu, Tag, Tooltip,
+  IconPlusOutlineRegular, IconSparkleRegular, IconTrashOutlineRegular, Input, Menu, Tag, Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import {
   assetFolders, groupFields, isMedia, mediaTypes, modeLabels, nodeLabels, nodeTitle,
@@ -154,10 +154,11 @@ function ReadableText({ text, label }) {
 function NodeReferences({ node, index, edges = [], mediaURL, actions }) {
   const ids = [...new Set(referenceIds(node))]
   const mode = videoMode(node)
-  const other = mode ? [] : edges.filter(edge => edge.target === node.id && !ids.includes(edge.source))
+  const incoming = new Set(edges.filter(edge => edge.target === node.id).map(edge => edge.source))
+  const other = mode ? [] : [...incoming].filter(source => !ids.includes(source))
   const entries = [
     ...ids.map((id, position) => [id, referenceLabel(mode, ids, position, index)]),
-    ...other.map(({ source }) => [source, '引用']),
+    ...other.map(source => [source, '引用']),
   ]
   if (!entries.length) return null
   return <div className="drama-node-reference-strip">
@@ -165,15 +166,24 @@ function NodeReferences({ node, index, edges = [], mediaURL, actions }) {
     <div className={'drama-node-reference-scroll ' + interactions}>
       {entries.map(([id, label]) => {
         const related = index?.get(id)
-        const title = related ? nodeName(related) : id
+        const title = related ? nodeName(related) : '画布外来源 ' + id
         const url = related?.type === 'image' ? mediaURL?.(related) : undefined
-        return <Tooltip key={id} label={label + ' · ' + title} portal>
-          <Button size="sm" variant="outline" className="drama-node-reference-button" aria-label={label + ' · ' + title}
-            onClick={() => actions.locate?.(id)}>
-            {url && <img src={url} loading="lazy" decoding="async" alt="" />}
-            <span>{label}</span>
-          </Button>
-        </Tooltip>
+        return <div key={id} className="drama-node-reference-entry">
+          <Tooltip label={label + ' · ' + title} portal>
+            <Button size="sm" variant="outline" className="drama-node-reference-button" aria-label={label + ' · ' + title}
+              onClick={() => actions.locate?.(id)}>
+              {url && <img src={url} loading="lazy" decoding="async" alt="" />}
+              <span>{label}{!related && ' · 画布外来源'}</span>
+            </Button>
+          </Tooltip>
+          {!related && incoming.has(id) && actions.removeReference &&
+            <Tooltip label={actions.mutationReason || '删除引用连线'} portal>
+              <span>
+                <Button size="sm" aria-label={'删除引用连线 · ' + title} disabled={Boolean(actions.mutationReason)}
+                  onClick={() => actions.removeReference(id, node)}><IconTrashOutlineRegular size={14} /></Button>
+              </span>
+            </Tooltip>}
+        </div>
       })}
     </div>
   </div>
@@ -308,12 +318,17 @@ export function GraphNode({ data, selected }) {
   const prompt = node.type !== 'prompt' ? textValue(node.content, 'prompt') : ''
   const preview = () => actions.preview?.(node)
   const source = node.basedOn && index?.get(node.basedOn)
+  const saved = !draft || draft.edit
+  const disabled = Boolean(actions.mutationReason)
   return <article className={'drama-node-card' + (selected ? ' is-selected' : '') + (draft ? ' is-draft' : '')
     + (compact && !draft ? ' is-compact' : '')}
-    data-node-kind={node.type} data-drama-node-id={node.id} data-drama-draft={draft ? 'true' : undefined}>
-    {!draft && <Handle className="drama-port drama-port-input" type="target" id="in" position={Position.Left}
-      isConnectable={mode !== 'asset'} aria-label={mode && mode !== 'asset' ? '媒体输入' : '节点引用输入'} />}
-    {!draft && <Handle className="drama-lineage-port" type="target" id="lineage" position={Position.Left}
+    data-node-kind={node.type} data-drama-node-id={node.id}
+    data-drama-draft={draft && !draft.edit ? 'true' : undefined}
+    data-drama-editing={draft?.edit ? 'true' : undefined}>
+    {saved && <Handle className="drama-port drama-port-input" type="target" id="in" position={Position.Left}
+      isConnectable={!node.deleted && !draft && mode !== 'asset' && (!mode || !disabled)}
+      aria-label={mode && mode !== 'asset' ? '媒体输入' : '节点引用输入'} />}
+    {saved && <Handle className="drama-lineage-port" type="target" id="lineage" position={Position.Left}
       isConnectable={false} aria-hidden="true" />}
     <header className="drama-node-titlebar">
       <span className="drama-node-type-icon" title={nodeLabels[node.type]}><NodeIcon type={node.type} /></span>
@@ -322,7 +337,8 @@ export function GraphNode({ data, selected }) {
         <span className="drama-node-caption" title={fieldLabel(node)}>{mode ? modeLabels[mode] : nodeLabels[node.type]}
           {fieldLabel(node) && ' · ' + fieldLabel(node)}</span>
       </div>
-      {draft ? <Tag tone="warning">未保存</Tag> : <TaskMark task={latest} />}
+      {draft ? <Tag tone="warning">未保存</Tag>
+        : node.deleted ? <Tag tone="neutral">已删除</Tag> : <TaskMark task={latest} />}
     </header>
     {draft ? <NodeEditor draft={draft} {...editor} mediaURL={mediaURL}
       generationProfiles={generationProfiles} generationDefaults={generationDefaults} />
@@ -336,7 +352,8 @@ export function GraphNode({ data, selected }) {
         {mediaTypes.has(node.type) && !url && !prompt && <div className="drama-node-media-placeholder">
           <NodeIcon type={node.type} size={21} />
           <span>{media ? '素材地址不可用' : '尚未添加素材或提示词'}</span>
-          {actions.revise && <Button size="sm" onClick={() => actions.revise(node)}>添加素材或提示词</Button>}
+          {actions.edit && <Button size="sm" disabled={disabled} title={actions.mutationReason}
+            onClick={() => actions.edit(node)}>添加素材或提示词</Button>}
         </div>}
         {!mediaTypes.has(node.type) && !mainText && !prompt && <span className="drama-node-caption">暂无正文</span>}
         <NodeReferences node={node} index={index} edges={edges} mediaURL={mediaURL} actions={actions} />
@@ -353,15 +370,17 @@ export function GraphNode({ data, selected }) {
             <Button size="sm" onClick={() => actions.revise(source)}>从来源重抽</Button>}
         </div>}
         <TaskDetail task={latest} nodeId={node.id} locate={actions.locate} />
-        <footer className={'drama-node-actions ' + interactions} onDoubleClick={preventCanvasDoubleClick}>
+        {!node.deleted && <footer className={'drama-node-actions ' + interactions} onDoubleClick={preventCanvasDoubleClick}>
           {actions.revise && <Button size="sm" icon={<IconBranchOutlineRegular size={15} />}
             onClick={() => actions.revise(node)}>派生版本</Button>}
           <GenerateControl node={node} profiles={generationProfiles} generationDefaults={generationDefaults} actions={actions} />
-        </footer>
+        </footer>}
       </div>}
-    {!draft && <>
+    {saved &&
       <Handle className="drama-port drama-port-output" data-port-kind={media ? node.type : 'reference'}
-        type="source" id="out" position={Position.Right} aria-label={nodeLabels[node.type] + '输出'} />
+        type="source" id="out" position={Position.Right} isConnectable={!draft && !node.deleted}
+        aria-label={nodeLabels[node.type] + '输出'} />}
+    {!draft && !node.deleted && <>
       {actions.addAfter && <div className={'drama-node-add-after ' + interactions}>
         <Tooltip label="新增后继节点" portal>
           <Button size="sm" variant="toolbar" aria-label="新增后继节点"
@@ -372,10 +391,19 @@ export function GraphNode({ data, selected }) {
       </div>}
       <NodeToolbar position={Position.Top} offset={7} isVisible={selected}>
         <div className={'drama-node-floating-tools ' + interactions}>
-          <Tooltip label="编辑为新版本" portal>
-            <Button size="sm" aria-label="编辑为新版本" onClick={() => actions.revise?.(node)}>
-              <IconEditOutlineRegular size={15} />
-            </Button>
+          <Tooltip label={actions.mutationReason || '编辑节点'} portal>
+            <span>
+              <Button size="sm" aria-label="编辑节点" disabled={disabled} onClick={() => actions.edit(node)}>
+                <IconEditOutlineRegular size={15} />
+              </Button>
+            </span>
+          </Tooltip>
+          <Tooltip label={actions.mutationReason || '删除节点'} portal>
+            <span>
+              <Button size="sm" aria-label="删除节点" disabled={disabled} onClick={() => actions.delete(node)}>
+                <IconTrashOutlineRegular size={15} />
+              </Button>
+            </span>
           </Tooltip>
           {url && <Tooltip label="放大预览" portal>
             <Button size="sm" aria-label="放大预览" onClick={preview}><IconFullscreenOutlineRegular size={15} /></Button>
@@ -441,8 +469,9 @@ function VideoParamOverrides({ value, update, profile, generationDefaults, mode 
   })
 }
 
-function NodeEditor({ draft, append, media = [], queryCanvas, finish, close, mediaURL, generationProfiles, generationDefaults }) {
-  const { base, preset, seed, duplicate, group } = draft
+function NodeEditor({ draft, append, mutate, mutationReason, media = [], queryCanvas, finish, close, mediaURL,
+  generationProfiles, generationDefaults }) {
+  const { base, preset, seed, duplicate, edit, group } = draft
   const type = preset?.type ?? base?.type ?? 'shot'
   const inherited = base?.content ?? (type === 'video' && seed && !isMedia(seed) ? seed.content : {})
   const sameKind = base?.type === type
@@ -496,7 +525,7 @@ function NodeEditor({ draft, append, media = [], queryCanvas, finish, close, med
   const hasAssetFields = mediaTypes.has(type) && !videoDraft
   const currentProfiles = profileCandidates(generationProfiles, type === 'image' ? 't2i' : mode)
   const activeProfile = resolveProfile(currentProfiles, profileId)
-  const formLabel = duplicate ? '复制为新节点' : base ? '另存为新版本' : '新建节点'
+  const formLabel = edit ? '编辑节点' : duplicate ? '复制为新节点' : base ? '另存为新版本' : '新建节点'
   const choices = [{ id: '', label: '使用默认预设' },
     ...(profileId && !currentProfiles.some(item => item.id === profileId) ? [{ id: profileId, label: '原预设不可用' }] : []),
     ...currentProfiles.map(item => ({ id: item.id, label: item.name, title: item.model, disabled: item.configured === false }))]
@@ -511,7 +540,7 @@ function NodeEditor({ draft, append, media = [], queryCanvas, finish, close, med
 
   async function save(event) {
     event.preventDefault()
-    if (saving) return
+    if (saving || edit && mutationReason) return
     const form = new FormData(event.currentTarget)
     const next = { ...content }
     if (form.has('description')) next[textField] = String(form.get('description')).trim()
@@ -566,7 +595,7 @@ function NodeEditor({ draft, append, media = [], queryCanvas, finish, close, med
     if (type === 'video') {
       for (const key of Object.keys(next)) if (channelFields.has(key.toLowerCase().replace(/[_-]/gu, ''))) delete next[key]
     }
-    if (mediaTypes.has(type)) delete next.providerTaskId
+    if (!edit && mediaTypes.has(type)) delete next.providerTaskId
     if (videoDraft || type === 'image') {
       if (profileId) next.profileId = profileId
       else delete next.profileId
@@ -574,13 +603,18 @@ function NodeEditor({ draft, append, media = [], queryCanvas, finish, close, med
     setSaving(true)
     setError('')
     try {
-      const id = crypto.randomUUID()
-      const edges = new Set(ordered)
-      if (type !== 'video' && seed?.id && seed.id !== base?.id) edges.add(seed.id)
-      await append({ nodes: [{ id, type, basedOn: base?.id, content: next,
-        ...Object.fromEntries(groupFields.map(([field]) => [field, String(form.get(field) ?? '').trim()])),
-      }], edges: [...edges].map(source => ({ source, target: id })) })
-      finish(id, draft.at)
+      const id = edit ? base.id : crypto.randomUUID()
+      const fields = Object.fromEntries(groupFields.map(([field]) => [field, String(form.get(field) ?? '').trim()]))
+      if (edit) {
+        await mutate('update_node', { id, revision: base.revision, ...fields, content: next,
+          referenceSources: type === 'video' || type === 'shot' ? ordered : undefined })
+      } else {
+        const edges = new Set(ordered)
+        if (type !== 'video' && seed?.id && seed.id !== base?.id) edges.add(seed.id)
+        await append({ nodes: [{ id, type, basedOn: base?.id, content: next, ...fields }],
+          edges: [...edges].map(source => ({ source, target: id })) })
+      }
+      finish(id)
     } catch (failure) {
       setError(failure.message)
     } finally {
@@ -634,11 +668,12 @@ function NodeEditor({ draft, append, media = [], queryCanvas, finish, close, med
           update={(key, value) => setOverrides(current => ({ ...current, [key]: value }))} />}
       </details>}
     </div>
+    {edit && mutationReason && <p className="drama-node-lock-notice" role="status">{mutationReason} 草稿已保留。</p>}
     {error && <p className="drama-node-form-error" role="alert">{error}</p>}
     <div className="drama-node-editor-footer">
       <Button size="sm" disabled={saving} onClick={close}>取消</Button>
-      <Button size="sm" type="submit" variant="primary" disabled={saving}>
-        {saving ? '正在保存' : duplicate ? '保存副本' : base ? '保存新版本' : '创建节点'}
+      <Button size="sm" type="submit" variant="primary" disabled={saving || Boolean(edit && mutationReason)}>
+        {saving ? '正在保存' : edit ? '保存修改' : duplicate ? '保存副本' : base ? '保存新版本' : '创建节点'}
       </Button>
     </div>
   </form>
@@ -682,7 +717,7 @@ function MediaReferences({ mode, profile, media, mediaURL, queryCanvas, referenc
   const known = new Map([...results.map(node => [node.id, node]), ...media])
   const kinds = new Set(allowedKinds.split(','))
   const q = search.trim().toLowerCase()
-  const available = [...known.values()].filter(node => kinds.has(node.type) && isMedia(node) &&
+  const available = [...known.values()].filter(node => !node.deleted && kinds.has(node.type) && isMedia(node) &&
     !references.includes(node.id) && (nodeName(node) + ' ' + savedText(node) + ' ' + shotLabel(node)).toLowerCase().includes(q))
   const labels = {
     i2v: [profile?.limits?.lastFrame ? '首帧与尾帧图片' : '首帧图片', '图片素材'],
@@ -718,7 +753,7 @@ function MediaReferences({ mode, profile, media, mediaURL, queryCanvas, referenc
       return <li key={id}>
         {url && <img src={url} loading="lazy" decoding="async" alt="" />}
         <span title={item ? nodeName(item) : id}>{referenceLabel(mode, references, index, known)}
-          {item && ' · ' + nodeName(item)}</span>
+          {item && ' · ' + nodeName(item)}{item?.deleted && '（已删除）'}</span>
         {references.length > 1 && <>
           <Button size="sm" aria-label={'上移参考 ' + (index + 1)} disabled={index === 0} onClick={() => move(index, -1)}>↑</Button>
           <Button size="sm" aria-label={'下移参考 ' + (index + 1)} disabled={index === references.length - 1}

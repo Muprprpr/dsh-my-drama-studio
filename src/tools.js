@@ -12,7 +12,7 @@ const node = object({
   id: string, type: types, basedOn: string, episodeId: string, sceneId: string, shotId: string,
   content: {
     type: 'object', additionalProperties: true,
-    description: 'Immutable creative content. A video draft must contain its full prompt and receive only actual image, video or audio input edges.',
+    description: 'Creative content to append. A video draft must contain its full prompt and receive only actual image, video or audio input edges.',
   },
 }, ['type', 'content'])
 const edge = object({ source: string, target: string }, ['source', 'target'])
@@ -26,8 +26,8 @@ export function registerTools(ctx, workspaceFor, kernel, keys) {
   for (const [action, description, parameters] of [
     ['context', 'Read the current native Session, its Workspace Canvas binding and generation permission.', object({})],
     ['query', 'Read shared creative nodes and references for this Session’s Canvas. Filter by shot, type or source Session.', object(query)],
-    ['append', 'Append immutable creative nodes and references atomically. Derive a revision with basedOn. Video prompts must be complete and inline, with only real media inputs.', object(append, ['operationId'])],
-    ['submit', 'Submit an immutable image or video draft by node ID. The current Session must already have automatic generation permission. Omit profileId to use the draft preset or the configured mode default.', object({ operationId: string, nodeId: string, profileId: string }, ['operationId', 'nodeId'])],
+    ['append', 'Append creative nodes and references atomically. To revise a node as an Agent, append a new node with basedOn. Video prompts must be complete and inline, with only real media inputs.', object(append, ['operationId'])],
+    ['submit', 'Submit a snapshot of an image or video draft by node ID. The current Session must already have automatic generation permission. Omit profileId to use the draft preset or the configured mode default.', object({ operationId: string, nodeId: string, profileId: string }, ['operationId', 'nodeId'])],
     ['tasks', 'Read generation task states for this Session’s shared Canvas.', object({})],
   ]) {
     ctx.tools.register({

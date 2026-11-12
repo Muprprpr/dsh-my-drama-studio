@@ -79,6 +79,9 @@ func runUIUXWebFixture(video string) error {
 	defer listener.Close()
 	service := New(settings)
 	defer service.Close()
+	if err := service.ConfigureHostActivity(os.Getenv("DRAMA_STUDIO_ACTIVITY_URL"), token); err != nil {
+		return err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})

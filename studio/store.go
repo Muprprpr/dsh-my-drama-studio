@@ -26,7 +26,8 @@ CREATE TEMP TABLE IF NOT EXISTS session_permission (session_id TEXT PRIMARY KEY)
 CREATE TABLE IF NOT EXISTS nodes (
   id TEXT PRIMARY KEY, type TEXT NOT NULL, based_on TEXT REFERENCES nodes(id),
   created_by TEXT NOT NULL, episode_id TEXT NOT NULL, scene_id TEXT NOT NULL,
-  shot_id TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL
+  shot_id TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 1, deleted INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS edges (
   source TEXT NOT NULL REFERENCES nodes(id), target TEXT NOT NULL REFERENCES nodes(id),
@@ -44,10 +45,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   completed_at TEXT NOT NULL DEFAULT '', output_path TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS tasks_status_created ON tasks(status,created_at);
-CREATE TRIGGER IF NOT EXISTS nodes_no_update BEFORE UPDATE ON nodes BEGIN SELECT RAISE(ABORT, 'nodes are append-only'); END;
-CREATE TRIGGER IF NOT EXISTS nodes_no_delete BEFORE DELETE ON nodes BEGIN SELECT RAISE(ABORT, 'nodes are append-only'); END;
-CREATE TRIGGER IF NOT EXISTS edges_no_update BEFORE UPDATE ON edges BEGIN SELECT RAISE(ABORT, 'edges are append-only'); END;
-CREATE TRIGGER IF NOT EXISTS edges_no_delete BEFORE DELETE ON edges BEGIN SELECT RAISE(ABORT, 'edges are append-only'); END;
+DROP TRIGGER IF EXISTS nodes_no_update;
+DROP TRIGGER IF EXISTS nodes_no_delete;
+DROP TRIGGER IF EXISTS edges_no_update;
+DROP TRIGGER IF EXISTS edges_no_delete;
 `
 
 type Status struct {
@@ -61,12 +62,13 @@ type Status struct {
 }
 
 type Service struct {
-	mu           sync.Mutex
-	projects     map[string]*project
-	provider     providerRegistry
-	wake         chan struct{}
-	pollInterval time.Duration
-	pollTimeout  time.Duration
+	mu              sync.Mutex
+	projects        map[string]*project
+	provider        providerRegistry
+	humanWriteCheck func(context.Context, string, string, []string) (bool, error)
+	wake            chan struct{}
+	pollInterval    time.Duration
+	pollTimeout     time.Duration
 }
 
 type project struct {
@@ -167,6 +169,9 @@ func (s *Service) open(ctx context.Context, directory string, create bool) (*pro
 	}
 	_, err = tx.ExecContext(ctx, schema)
 	if err == nil {
+		err = migrateNodeFields(ctx, tx)
+	}
+	if err == nil {
 		err = migrateTaskFields(ctx, tx)
 	}
 	if err == nil {
@@ -248,6 +253,14 @@ func (s *Service) Execute(ctx context.Context, r Request) (any, error) {
 		}
 	case "context", "query", "append", "events", "permission", "submit", "submit_manual", "tasks",
 		"generateT2V", "generateI2V", "generateR2V", "generateV2V", "cancel_task", "resume_task":
+	case "connected_sessions":
+		if err := decodeData(r.Data, &struct{}{}); err != nil {
+			return nil, err
+		}
+	case "update_node", "delete_node", "update_edge", "delete_edge":
+		if r.Actor != "human" {
+			return nil, humanWriteOnly
+		}
 	default:
 		return nil, invalid("未知 Studio 操作：%s", r.Action)
 	}
@@ -258,6 +271,9 @@ func (s *Service) Execute(ctx context.Context, r Request) (any, error) {
 	if p == nil {
 		if r.Action == "context" {
 			return getStatus(ctx, nil, r)
+		}
+		if r.Action == "connected_sessions" {
+			return connectedSessionsResult{SessionIDs: []string{}}, nil
 		}
 		return nil, notBound
 	}
@@ -270,6 +286,11 @@ func (s *Service) Execute(ctx context.Context, r Request) (any, error) {
 		return p.query(ctx, r)
 	case "append":
 		return p.append(ctx, r)
+	case "connected_sessions":
+		ids, err := boundSessionIDs(ctx, p.db)
+		return connectedSessionsResult{SessionIDs: ids}, err
+	case "update_node", "delete_node", "update_edge", "delete_edge":
+		return s.humanWrite(ctx, p, r)
 	case "permission":
 		return p.permission(ctx, r)
 	case "submit", "submit_manual", "generateT2V", "generateI2V", "generateR2V", "generateV2V":
@@ -303,6 +324,10 @@ func (op operation) validate() error {
 }
 
 func (p *project) write(ctx context.Context, r Request, opID string, apply func(*sql.Tx, Status) (any, error)) (any, error) {
+	return p.writeChecked(ctx, r, opID, apply, nil)
+}
+
+func (p *project) writeChecked(ctx context.Context, r Request, opID string, apply func(*sql.Tx, Status) (any, error), beforeCommit func(*sql.Tx) error) (any, error) {
 	if err := (operation{ID: opID}).validate(); err != nil {
 		return nil, err
 	}
@@ -341,6 +366,11 @@ func (p *project) write(ctx context.Context, r Request, opID string, apply func(
 	_, err = tx.ExecContext(ctx, "INSERT INTO operations VALUES(?,?,?,?)", opID, r.SessionID, r.Action, string(data))
 	if err != nil {
 		return nil, err
+	}
+	if beforeCommit != nil {
+		if err := beforeCommit(tx); err != nil {
+			return nil, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err

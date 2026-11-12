@@ -15,6 +15,7 @@ type Request struct {
 	WorkspaceID   string          `json:"workspaceId"`
 	WorkspacePath string          `json:"workspacePath"`
 	Action        string          `json:"action"`
+	Actor         string          `json:"actor,omitempty"`
 	Data          json.RawMessage `json:"data"`
 }
 

@@ -51,3 +51,28 @@
 - `node tests/agent-fixture.mjs` 退出码 0，原生 Agent 18 次调用，重启后再 2 次。共享画布、身份边界和 Session 授权回归通过。
 - 接口验证使用本地 HTTP 夹具。没有调用真实供应商或提交付费生成，真实账户下的生成验收尚未执行。
 - `node --test tests/web.mjs` 在已安装 DSH 0.2.1-rc.3 上 1 项通过、0 失败，耗时 78.2 秒。小图中真实拖动图片端口至 T2V 草稿，打开保留原提示词的 R2V 派生版。整套流程验证了可搜索节点库、跨分页查找首帧、检查器派生和复制、缩略图、三 Session 共享、两页 SSE 及 2×50 并发。浏览器实测模板保存、重载后读取、夹具密钥写入和脱敏回读、删除预设。未点击真实供应商测试或生成。
+
+## 人工编辑与 Harness 活动联动
+
+Windows x64 安装版 DSH `0.2.1-rc.3`。运行 `pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1` 成功生成 Host、Browser 与 Windows AMD64 Go 工件。Web 测试使用 `scripts/dev.ps1` 启动隔离 DSH Home。
+
+- `node --test tests/web.mjs` 9 项通过、0 失败、0 跳过，耗时 86.79 秒。随后新增菜单禁用和两个窗口的版本冲突断言，专项 `node --test --test-name-pattern '^Native human CRUD' tests/web.mjs` 1 项通过。
+- `node tests/agent-fixture.mjs` 退出码 0。首轮记录 19 次原生工具调用，实际终止仍有运行轮次的 Host 后，用同一 DSH Home 重启并再记录 2 次。
+- Windows 用户上下文的 `go test -count=1 -v ./...` 46 个顶层用例通过，`go vet ./...` 退出码 0。`node --test tests/canvas-layout.mjs` 3 项通过。
+
+| # | 结果 | 实测证据 |
+| --- | --- | --- |
+| 1 | PASS | Session B 在原卡片保存 Session A 创建的节点。ID 和来源 Session 保持，`revision` 增加，A 页面通过 SSE 看到更新 |
+| 2 | PASS | 从节点菜单确认删除，常规画布隐藏卡片。真实 React Flow 端口拖拽更换来源，右键可删除连线。被引用的来源仍能按 ID 读取 |
+| 3 | PASS | 原生 Agent 持续运行时，通过画布新增并保存备注，另一会话读到新增 |
+| 4 | PASS | Browser Owner 直接请求已有节点改删和连线改删均返回 423。同 ID 批量追加被拒绝，原节点版本不变。Go 专项验证事务最后一刻被拒绝时无新事件 |
+| 5 | PASS | 原生 Agent 未注册人工改删工具。尝试用 `drama_append` 覆盖同一节点返回冲突，原生追加和派生仍可用 |
+| 6 | PASS | A 运行时，已经打开同一 Canvas 的 B 显示「AI 工作中」，编辑和删除菜单禁用 |
+| 7 | PASS | A 正常结束时 B 仍在运行，B 的未保存草稿仍无法提交 |
+| 8 | PASS | 最后一个 Agent 停止后，B 页面无需刷新即可在原节点保存。未连接的 Session 运行不会锁住画布 |
+| 9 | PASS | 原位草稿跨活动变化保持文本。另一窗口先保存时返回版本冲突，原草稿内容仍保留 |
+| 10 | PASS | 原生取消、模型异常、Agent 释放均恢复编辑。结束带活跃轮次的 Host 后启动新进程，同一 Canvas 恢复人工保存 |
+| 11 | PASS | A 正在运行时，另一 Workspace 仍可保存同 ID 节点 |
+| 12 | PASS | 后台视频轮询期间可以编辑并删除源节点。真实 Go Worker 继续轮询，追加保留来源 ID 和提交时镜头分组的结果节点，原生 Web 播放结果。另实测媒体连线、完整内联提示词、有序素材与 Session 自动生成授权 |
+
+Agent 活动来自安装版 Harness 的真实轮次。测试控制模型响应的开始与结束。视频回归在供应商 HTTP 边界使用隔离响应和已有 MP4，未提交新的外部付费任务。

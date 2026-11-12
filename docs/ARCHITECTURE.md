@@ -2,13 +2,17 @@
 
 DSH 原生 Web 负责 Workspace、Session、对话和侧栏生命周期。一个双端插件注册输入栏控件与 `Drama Canvas` 页类型。Client 使用插槽注入的 Session ID 获取工作区状态，异步回调打开 Tab 前核对当前原生挂载的 Session。每个 Session 持有独立的侧栏视图。
 
-所有工作区创作数据由一个 Go 子进程管理。Host 用经过 DSH Connection 认证的 Owner Peer 处理 UI 请求，并通过原生 Workspace Registry 解析 Session 归属。Agent 调用使用 DSH 工具执行上下文中的 Session。二者使用同一 Go 写入入口。Go HTTP 绑定随机回环端口，仅 Host 持有进程级授权。Host 结束后，Go 随其 stdin 管道关闭而退出。
+所有工作区创作数据由一个 Go 子进程管理。Host 用经过 DSH Connection 认证的 Browser Owner Peer 处理 UI 请求，并通过原生 Workspace Registry 解析 Session 归属。Agent 调用使用 DSH 工具执行上下文中的 Session。二者共用 Go 进程。Go HTTP 绑定随机回环端口，仅父子进程持有进程级授权。Host 结束后，Go 随其 stdin 管道关闭而退出。
 
-一个规范化目录对应一个 `.drama-studio/studio.db`。Canvas UUID 与项目一起保存。SQLite WAL 保存会话绑定、不可变节点、不可变引用、幂等操作结果、增量事件和任务。会话布局属于视图。已提交的节点与边和事件一起提交，浏览器通过经 DSH 认证的 SSE 恢复或刷新快照。
+一个规范化目录对应一个 `.drama-studio/studio.db`。Canvas UUID 与项目一起保存。SQLite WAL 保存会话绑定、节点、引用、幂等操作结果、增量事件和任务。会话布局属于视图。节点和边的更改与事件一起提交，浏览器通过经 DSH 认证的 SSE 恢复或刷新快照。
+
+人工改删请求由 Host 标记为 `human`。Go 取得 SQLite 写事务后检查绑定、节点 `revision` 和引用一致性，在提交前使用该事务读取的已连接 Session ID 向父 Host 请求准入。Host 同步核实 Workspace 归属和 `ctx.agents.get(id)?.status`。此检查确定并发顺序，随后到达的画布操作在 SQLite 事务之后观察结果。任一已连接 Agent 在准入时运行则回滚，返回 423。版本冲突返回 409。浏览器活动提示跟随 SSE，运行状态不写入数据库。Agent 只有读取和追加工具。
+
+草稿取消只影响本地表单。已提交节点删除后保留墓碑及历史引用，普通画布查询隐藏卡片，按 ID 查询可查看来源和任务关联。删除不会回收节点 ID。修改视频输入时，媒体边和 `mixedListOrder` 在同一事务更新。
 
 自动生成许可独立于持久绑定，按 Session 存在于服务内存。人工确认与 Agent 自动提交在服务端分别检查，使用同一个生成任务入口。Studio 权限覆盖 Studio 任务入口，DSH 的其他工具遵循各自的权限和凭据规则。
 
-任务只在节点和所选模型通过模式、参数和素材校验后入队。四种视频方法复用同一个 Provider 契约、SQLite 队列与资产管理。任务快照保存内联提示词、有序媒体引用、模型、参数、渠道协议和结果目录。Worker 取任务时从当前 Profile 的内存配置查找密钥。
+任务只在节点和所选模型通过模式、参数和素材校验后入队。四种视频方法复用同一个 Provider 契约、SQLite 队列与资产管理。任务快照保存内联提示词、有序媒体引用、模型、参数、渠道协议、结果目录和提交时的镜头分组。Worker 取任务时从当前 Profile 的内存配置查找密钥。
 
 同一 Host 的所有工作区共享生成并发额度，默认 2。每个任务从提交到轮询及下载占用一个额度。Worker 在提交前持久化提交阶段，收到上游 ID 后先落盘再轮询。到达轮询期限后可继续查询，Host 重启时从 DSH Workspace Registry 恢复已知 ID。提交结果不确定且未收到 ID 时，记录待对账原因并停止自动执行。下载落在项目资产目录，结果节点、完成时间和本地路径在同一事务提交，原有 SSE 事件触发画布刷新。
 

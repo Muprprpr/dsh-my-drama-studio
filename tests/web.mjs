@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { copyFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, readFile, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { basename, dirname, join, resolve } from 'node:path'
 import { test } from 'node:test'
@@ -19,13 +19,83 @@ import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 export const name = 'drama-web-fixture'
-export const inject = ['sessionController', 'workspaceRegistry', 'tools']
+export const inject = ['sessionController', 'workspaceRegistry', 'tools', 'llm']
 
 export async function apply(ctx) {
   console.info('[drama-web-fixture] PID ' + process.pid)
+  const llm = join(dirname(process.execPath), 'resources', 'app.asar', 'dsh', 'node_modules',
+    '@deepseek-ai', 'dsh-llm', 'lib', 'index.js')
+  const { LlmAdapter, createMessage, createUserMessage } = await import(pathToFileURL(llm).href)
+  const provider = 'drama-web-activity-fixture'
+  const model = 'held-turn'
+  const queued = []
+  const running = new Map()
+  ctx.llm.registerAdapter([provider], new class extends LlmAdapter {
+    async listModels() {
+      return [{ provider, id: model, name: model }]
+    }
+    async * stream(options) {
+      const gate = queued.shift()
+      if (!gate) throw new Error('No scripted activity turn')
+      const signal = options.signal
+      const stop = () => gate.finish.resolve()
+      signal?.addEventListener('abort', stop, { once: true })
+      gate.entered.resolve()
+      try {
+        signal?.throwIfAborted()
+        await gate.finish.promise
+        signal?.throwIfAborted()
+        yield { type: 'block-start', index: 0, blockType: 'text' }
+        yield { type: 'block-end', index: 0, block: { type: 'text', text: 'Activity turn completed.' } }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      } finally {
+        signal?.removeEventListener('abort', stop)
+        running.delete(gate.sessionId)
+      }
+    }
+  })
+  async function activity({ sessionId, requestId, action }) {
+    const { agent } = await ctx.sessionController.resolveAgent(sessionId)
+    if (!agent) throw new Error('Native activity Agent did not resolve')
+    if (action === 'start') {
+      await ctx.sessionController.selectModel({ sessionId, provider, model })
+      const gate = { sessionId, entered: Promise.withResolvers(), finish: Promise.withResolvers() }
+      running.set(sessionId, gate)
+      queued.push(gate)
+      const signal = AbortSignal.timeout(8000)
+      const result = await ctx.sessionController.prompt({
+        sessionId, requestId, mode: 'queue', content: [{ type: 'text', text: 'Hold this native turn for Web verification.' }],
+      }, signal)
+      if (!result.accepted) throw new Error('Native turn admission rejected')
+      await Promise.race([
+        gate.entered.promise,
+        new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })),
+      ])
+    } else if (action === 'finish') {
+      const gate = running.get(sessionId)
+      if (!gate) throw new Error('No native turn to finish')
+      gate.finish.resolve()
+    } else if (action === 'cancel') {
+      if (!ctx.sessionController.cancel({ sessionId }).accepted) throw new Error('Native cancel rejected')
+    } else if (action !== 'status') throw new Error('Unknown activity test command')
+    return { status: agent.status }
+  }
   ctx.effect(() => {
     let used = false
+    const commands = new Set()
     const watcher = watch(process.env.DSH_HOME, { persistent: false }, (_event, file) => {
+      if (file?.startsWith('activity-request-') && file.endsWith('.json') && !commands.has(file)) {
+        commands.add(file)
+        void (async () => {
+          let result
+          try {
+            result = await activity(JSON.parse(await readFile(join(process.env.DSH_HOME, file), 'utf8')))
+          } catch (error) {
+            result = { error: error.message }
+          }
+          await writeFile(join(process.env.DSH_HOME, file.replace('-request-', '-response-')), JSON.stringify(result))
+        })()
+      }
       if (file === 'agent-append.json' && !used) {
         used = true
         void (async () => {
@@ -44,11 +114,11 @@ export async function apply(ctx) {
         process.emit('SIGTERM')
       }
     })
-    return () => watcher.close()
+    return () => {
+      watcher.close()
+      for (const gate of running.values()) gate.finish.resolve()
+    }
   })
-  const llm = join(dirname(process.execPath), 'resources', 'app.asar', 'dsh', 'node_modules',
-    '@deepseek-ai', 'dsh-llm', 'lib', 'index.js')
-  const { createMessage, createUserMessage } = await import(pathToFileURL(llm).href)
   const records = []
   for (const workspaceName of ['Studio Shared', 'Studio Other']) {
     const path = join(process.env.DSH_HOME, workspaceName)
@@ -87,6 +157,25 @@ async function freePort() {
   return port
 }
 
+test('Windows launcher reports an occupied Web port before loading the profile', async () => {
+  const server = createServer()
+  await new Promise((resolve, reject) => server.once('error', reject).listen(0, '127.0.0.1', resolve))
+  try {
+    const { port } = server.address()
+    const result = spawnSync('powershell.exe', [
+      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', join(root, 'scripts', 'dev.ps1'),
+      '-Profile', 'port-check', '-Port', String(port), '-NoOpen',
+    ], {
+      cwd: root, encoding: 'utf8', windowsHide: true, timeout: 10_000,
+      env: { ...process.env, DSH_HOME: join(runtime, randomUUID()) },
+    })
+    assert.equal(result.status, 1, result.error?.message || result.stderr)
+    assert.ok(result.stderr.includes(`Port 127.0.0.1:${port} is already in use`), result.stderr)
+  } finally {
+    await new Promise(resolve => server.close(resolve))
+  }
+})
+
 function redact(text) {
   return text.replace(/(https?:\/\/127\.0\.0\.1:\d+[^\s?]*\?)[^\s"'<>]+/gu, '$1[redacted]')
 }
@@ -116,7 +205,7 @@ async function withWeb(run, { providerFixture = false } = {}) {
   const profile = join(home, 'profiles', 'web')
   const fixture = join(home, 'fixture.mjs')
   const entryRoot = join(profile, 'node_modules', 'dsh-my-drama-studio')
-  await mkdir(join(entryRoot, 'dist'), { recursive: true })
+  await mkdir(dirname(entryRoot), { recursive: true })
   await writeFile(join(home, 'package.json'), '{"name":"drama-web-fixture","private":true}\n')
   await writeFile(join(profile, 'package.json'), JSON.stringify({
     name: 'dsh-profile-web', private: true, dependencies: { 'dsh-my-drama-studio': '0.1.0' },
@@ -125,18 +214,19 @@ async function withWeb(run, { providerFixture = false } = {}) {
   await writeFile(fixture, fixtureSource)
   const port = await freePort()
   const env = { ...process.env, DSH_HOME: home, DSH_AGENTS_HOME: join(home, 'agents'), DSH_TELEMETRY_DISABLED: '1', DEEPSEEK_API_KEY: '' }
-  for (const file of ['package.json', 'dsh.bundle.patch', 'dist/host.js', 'dist/client.js']) {
-    await copyFile(join(root, file), join(entryRoot, file))
-  }
-  const executable = join(entryRoot, 'dist', 'studio.exe')
   if (providerFixture) {
+    await mkdir(join(entryRoot, 'dist'), { recursive: true })
+    for (const file of ['package.json', 'dsh.bundle.patch', 'dist/host.js', 'dist/client.js']) {
+      await copyFile(join(root, file), join(entryRoot, file))
+    }
+    const executable = join(entryRoot, 'dist', 'studio.exe')
     const compile = spawnSync('go.exe', ['test', '-c', '-o', executable, './studio'], {
       cwd: root, encoding: 'utf8', timeout: 90_000, windowsHide: true,
       env: { ...process.env, GOARCH: 'amd64', CGO_ENABLED: '0', GOCACHE: join(runtime, 'uiux-go-cache') },
     })
     assert.equal(compile.status, 0, compile.stderr || compile.error?.message)
     env.DRAMA_UIUX_PROVIDER_FIXTURE = resolve(videoAsset)
-  } else await copyFile(join(root, 'dist', 'studio.exe'), executable)
+  } else await symlink(root, entryRoot, 'junction')
   await writeFile(join(profile, 'cordis.patch.yml'), `- id: ui-settings-models
   config:
     credentialOnboarding: false
@@ -147,7 +237,10 @@ async function withWeb(run, { providerFixture = false } = {}) {
   const launch = `$launcher = Join-Path $env:LOCALAPPDATA 'Programs/DeepSeek Harness/resources/runtime/cli/bin/dsh.cmd'
 & $launcher web --host 127.0.0.1 --port ${port} --no-open
 exit $LASTEXITCODE`
-  const dsh = spawn('pwsh.exe', ['-NoProfile', '-Command', launch], {
+  const [shell, args] = providerFixture ? ['pwsh.exe', ['-NoProfile', '-Command', launch]]
+    : ['powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', join(root, 'scripts', 'dev.ps1'),
+      '-Port', String(port), '-NoOpen']]
+  const dsh = spawn(shell, args, {
     cwd: root, windowsHide: true, env,
   })
   let output = ''
@@ -197,6 +290,7 @@ exit $LASTEXITCODE`
     dsh.stderr.destroy()
     dsh.unref()
     await closingBrowser
+    if (!providerFixture) await unlink(entryRoot)
     if (passed) {
       const target = resolve(home)
       assert.equal(dirname(target), resolve(runtime))
@@ -252,6 +346,7 @@ async function request(page, endpoint, data) {
   return page.evaluate(async ({ endpoint, data }) => {
     const response = await fetch(`/api/drama/${endpoint}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data),
+      signal: AbortSignal.timeout(15_000),
     })
     return { status: response.status, body: await response.json() }
   }, { endpoint, data })
@@ -278,6 +373,22 @@ async function poll(fn, label, timeout = 10_000) {
     await delay(80)
   } while (Date.now() < deadline)
   throw new Error(label)
+}
+
+async function nativeActivity(home, record, action) {
+  const requestId = randomUUID()
+  const temporary = join(home, 'activity-' + requestId + '.tmp')
+  await writeFile(temporary, JSON.stringify({ sessionId: record.sessionId, requestId, action }))
+  await rename(temporary, join(home, 'activity-request-' + requestId + '.json'))
+  const result = await poll(async () => {
+    try {
+      return JSON.parse(await readFile(join(home, 'activity-response-' + requestId + '.json'), 'utf8'))
+    } catch (error) {
+      if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error
+    }
+  }, 'native activity command did not return: ' + action)
+  assert.ok(!result.error, result.error)
+  return result.status
 }
 
 async function frameWidth(page, expected) {
@@ -862,6 +973,330 @@ test('U3 shot filter, group and node collapse preserve saved contents', { timeou
   })
 })
 
+test('Native human CRUD follows live Workspace Agent activity', { timeout: 100_000 }, async () => {
+  await withWeb(async ({ page, context, url, records, home }) => {
+    const [a, b, unbound, other] = records
+    await select(page, a)
+    const canvasId = await open(page, a)
+    const aTicket = await ticketFor(page, a.sessionId)
+    const peer = await context.newPage()
+    await initialize(peer, new URL(url).origin)
+    await select(peer, b)
+    assert.equal(await open(peer, b), canvasId)
+    const bTicket = await ticketFor(peer, b.sessionId)
+    const independentContext = await context.browser().newContext({
+      storageState: await context.storageState(), locale: 'en-US', viewport: { width: 1680, height: 1000 },
+    })
+    const independent = await independentContext.newPage()
+    await initialize(independent, new URL(url).origin)
+    await select(independent, other)
+    assert.notEqual(await open(independent, other), canvasId)
+    const otherTicket = await ticketFor(independent, other.sessionId)
+
+    const note = title => ({ id: randomUUID(), type: 'note', content: { title, description: title + '正文' } })
+    const original = note('原位修改验收')
+    const disposable = note('可以直接删除')
+    const source = note('原始引用来源')
+    const replacement = note('替换引用来源')
+    const linked = note('引用目标')
+    const separate = note('另一工作区可编辑')
+    await append(page, aTicket, [original, disposable, source, replacement, linked], [{ source: source.id, target: linked.id }])
+    await append(independent, otherTicket, [separate])
+    const mutation = (browser, ticket, action, data) => request(browser, 'operation', {
+      ticket, action, data: { operationId: randomUUID(), ...data },
+    })
+    const current = async (browser, ticket, id) => (await query(browser, ticket, { id })).nodes[0]
+    const status = async (browser, record) => (await ok(browser, 'init', { sessionId: record.sessionId })).status
+    const update = (node, description) => ({
+      id: node.id, revision: node.revision, episodeId: node.episodeId, sceneId: node.sceneId, shotId: node.shotId,
+      content: { ...node.content, description },
+    })
+    const busy = browser => panel(browser).getByRole('status').getByText('AI 工作中', { exact: true })
+    const edit = async (browser, nodeId) => {
+      await browser.bringToFront()
+      await fit(browser)
+      const target = card(browser, nodeId)
+      await target.locator('.drama-node-titlebar').click({ button: 'right' })
+      await browser.getByRole('menuitem', { name: '编辑节点', exact: true }).click()
+      const form = target.getByRole('form', { name: '编辑节点', exact: true })
+      await form.waitFor()
+      return form
+    }
+    const remove = async (browser, nodeId) => {
+      await browser.bringToFront()
+      await fit(browser)
+      await card(browser, nodeId).locator('.drama-node-titlebar').click({ button: 'right' })
+      await browser.getByRole('menuitem', { name: '删除节点', exact: true }).click()
+      const confirmation = browser.getByRole('dialog', { name: '删除节点', exact: true })
+      await confirmation.getByRole('button', { name: '确认删除', exact: true }).click()
+      await confirmation.waitFor({ state: 'hidden' })
+    }
+    const save = form => form.getByRole('button', { name: '保存修改', exact: true })
+    const body = form => form.getByRole('textbox', { name: '正文', exact: true })
+
+    const before = await current(page, aTicket, original.id)
+    assert.equal(before.revision, 1)
+    const initialEdit = await edit(peer, original.id)
+    await body(initialEdit).fill('Session B 保存到原节点。')
+    await save(initialEdit).click()
+    await initialEdit.waitFor({ state: 'hidden' })
+    const edited = await current(peer, bTicket, original.id)
+    assert.equal(edited.revision, 2)
+    assert.equal(edited.id, original.id)
+    assert.equal(edited.createdBySession, a.sessionId)
+    assert.equal(edited.content.description, 'Session B 保存到原节点。')
+    await page.bringToFront()
+    await fit(page)
+    await card(page, original.id).getByText(edited.content.description, { exact: true }).waitFor()
+    assert.equal((await mutation(page, aTicket, 'update_node', update(before, '旧版本不能覆盖'))).status, 409)
+    await remove(peer, disposable.id)
+    assert.equal((await current(peer, bTicket, disposable.id)).deleted, true)
+    assert.ok(!(await query(peer, bTicket)).nodes.some(node => node.id === disposable.id))
+
+    let linkTarget = await current(peer, bTicket, linked.id)
+    assert.equal((await mutation(peer, bTicket, 'update_edge', {
+      source: source.id, target: linked.id, newSource: replacement.id, revision: linkTarget.revision,
+    })).status, 200)
+    let graph = await query(peer, bTicket)
+    assert.ok(graph.edges.some(edge => edge.source === replacement.id && edge.target === linked.id))
+    assert.ok(!graph.edges.some(edge => edge.source === source.id && edge.target === linked.id))
+    linkTarget = await current(peer, bTicket, linked.id)
+
+    await page.bringToFront()
+    await setPermission(page, true)
+    assert.equal((await status(peer, b)).aiRunning, false)
+    assert.equal(await nativeActivity(home, unbound, 'start'), 'running')
+    assert.equal((await status(peer, b)).aiRunning, false, 'unbound Agent locked the Canvas')
+    assert.equal((await status(peer, b)).autoGenerate, false)
+    await nativeActivity(home, unbound, 'cancel')
+
+    const unsaved = await edit(peer, original.id)
+    const draftText = 'AI 在保存前启动，这段未保存正文仍须保留。'
+    await body(unsaved).fill(draftText)
+    assert.equal(await nativeActivity(home, a, 'start'), 'running')
+    await busy(peer).waitFor()
+    await poll(() => save(unsaved).isDisabled(), 'open draft save did not reflect native activity')
+    assert.equal(await body(unsaved).inputValue(), draftText)
+    assert.equal((await status(peer, b)).aiRunning, true)
+    assert.equal((await status(independent, other)).aiRunning, false)
+    const otherBefore = await current(independent, otherTicket, separate.id)
+    assert.equal((await mutation(independent, otherTicket, 'update_node', update(otherBefore, '独立工作区照常保存。'))).status, 200)
+    assert.equal((await current(independent, otherTicket, separate.id)).revision, 2)
+
+    for (const [action, data] of [
+      ['update_node', update(edited, '后台请求也不可覆盖')],
+      ['delete_node', { id: original.id, revision: edited.revision }],
+      ['update_edge', { source: replacement.id, target: linked.id, newSource: source.id, revision: linkTarget.revision }],
+      ['delete_edge', { source: replacement.id, target: linked.id, revision: linkTarget.revision }],
+    ]) {
+      const rejected = await mutation(peer, bTicket, action, data)
+      assert.equal(rejected.status, 423, action + ' escaped native activity gate: ' + JSON.stringify(rejected.body))
+    }
+    assert.ok((await mutation(peer, bTicket, 'append', {
+      nodes: [{ ...original, content: { description: '批量覆盖也必须失败' } }],
+    })).status >= 400)
+    assert.equal((await current(peer, bTicket, original.id)).revision, edited.revision)
+
+    await page.bringToFront()
+    await busy(page).waitFor()
+    await fit(page)
+    await card(page, original.id).locator('.drama-node-titlebar').click({ button: 'right' })
+    for (const name of ['编辑节点', '删除节点']) {
+      assert.ok(await page.getByRole('menuitem', { name, exact: true }).isDisabled())
+    }
+    await page.keyboard.press('Escape')
+    const addition = await pick(page, '备注')
+    await addition.getByRole('textbox', { name: '节点名称', exact: true }).fill('AI 工作时人工新增')
+    await addition.getByRole('textbox', { name: '正文', exact: true }).fill('新增和阅读仍然可用。')
+    await addition.getByRole('button', { name: '创建节点', exact: true }).click()
+    await addition.waitFor({ state: 'hidden' })
+    assert.equal((await query(peer, bTicket, { q: 'AI 工作时人工新增' })).nodes.length, 1)
+
+    assert.equal(await nativeActivity(home, b, 'start'), 'running')
+    await nativeActivity(home, a, 'finish')
+    await poll(async () => (await nativeActivity(home, a, 'status')) === 'idle', 'native A did not finish')
+    assert.equal(await nativeActivity(home, b, 'status'), 'running')
+    assert.equal((await status(peer, b)).aiRunning, true)
+    assert.ok(await busy(peer).isVisible())
+    assert.ok(await save(unsaved).isDisabled())
+    await nativeActivity(home, b, 'cancel')
+    await peer.bringToFront()
+    await busy(peer).waitFor({ state: 'hidden' })
+    await poll(() => save(unsaved).isEnabled(), 'final Agent cancellation did not restore edit')
+    assert.equal(await body(unsaved).inputValue(), draftText)
+    await save(unsaved).click()
+    await unsaved.waitFor({ state: 'hidden' })
+    assert.equal((await current(page, aTicket, original.id)).content.description, draftText)
+    assert.equal((await current(page, aTicket, original.id)).revision, 3)
+    assert.equal((await status(peer, b)).aiRunning, false)
+
+    const conflicted = await edit(peer, original.id)
+    await body(conflicted).fill('版本冲突也要保留这段未保存正文。')
+    const latest = await current(page, aTicket, original.id)
+    assert.equal((await mutation(page, aTicket, 'update_node', update(latest, 'Session A 先保存。'))).status, 200)
+    await save(conflicted).click()
+    await conflicted.getByRole('alert').filter({ hasText: /画布内容已变化/u }).waitFor()
+    assert.equal(await body(conflicted).inputValue(), '版本冲突也要保留这段未保存正文。')
+    assert.equal((await current(page, aTicket, original.id)).content.description, 'Session A 先保存。')
+    await conflicted.getByRole('button', { name: '取消', exact: true }).click()
+    await conflicted.waitFor({ state: 'hidden' })
+
+    await remove(peer, replacement.id)
+    assert.equal((await current(peer, bTicket, replacement.id)).deleted, true)
+    graph = await query(peer, bTicket)
+    assert.ok(!graph.nodes.some(node => node.id === replacement.id))
+    assert.ok(graph.nodes.some(node => node.id === linked.id))
+    linkTarget = await current(peer, bTicket, linked.id)
+    assert.equal((await mutation(peer, bTicket, 'delete_edge', {
+      source: replacement.id, target: linked.id, revision: linkTarget.revision,
+    })).status, 200)
+    console.info('Human edits PASS: same-ID UI save/delete, revisions, edge replacement/delete, native overlapping Agent turns, backend 423, add while busy, draft preservation, workspace isolation and cancellation')
+  })
+})
+
+test('Native UI changes and deletes a saved edge', { timeout: 65_000 }, async () => {
+  await withWeb(async ({ page, records }) => {
+    const [record] = records
+    await select(page, record)
+    await open(page, record)
+    const ticket = await ticketFor(page, record.sessionId)
+    const note = title => ({ id: randomUUID(), type: 'note', content: { title, description: title + '正文' } })
+    const source = note('原始来源')
+    const next = note('新来源')
+    const target = note('连线目标')
+    await append(page, ticket, [source, next, target], [{ source: source.id, target: target.id }])
+    await flow(page).getByText('3 个节点', { exact: true }).waitFor()
+    await flow(page).getByRole('button', { name: '适配视图', exact: true }).click()
+    await page.bringToFront()
+    await delay(220)
+    const edge = id => flow(page).locator('.react-flow__edge[data-id="' + id + ':' + target.id + '"]')
+    const from = edge(source.id).locator('circle.react-flow__edgeupdater-source')
+    const to = card(page, next.id).locator('.drama-port-output')
+    const point = await from.evaluate(el => {
+      const rect = el.getBoundingClientRect()
+      for (let i = 0; i <= 6; i++) {
+        for (let j = 0; j <= 6; j++) {
+          const x = rect.left + rect.width * (i + 1) / 8
+          const y = rect.top + rect.height * (j + 1) / 8
+          if (document.elementFromPoint(x, y) === el) return { x, y }
+        }
+      }
+      return null
+    })
+    assert.ok(point, 'native edge source anchor was not clickable')
+    const toRect = await to.boundingBox()
+    await page.mouse.move(point.x, point.y)
+    await page.mouse.down()
+    await page.mouse.move(toRect.x + toRect.width / 2, toRect.y + toRect.height / 2, { steps: 20 })
+    await page.mouse.up()
+    await poll(async () => (await query(page, ticket)).edges.some(e => e.source === next.id && e.target === target.id),
+      'dragging the saved edge endpoint did not replace its source')
+    await edge(next.id).waitFor()
+    const path = edge(next.id).locator('.react-flow__edge-interaction')
+    const hit = await path.evaluate(el => {
+      const length = el.getTotalLength()
+      for (const fraction of [.5, .25, .75, .4, .6]) {
+        const point = el.getPointAtLength(length * fraction).matrixTransform(el.getScreenCTM())
+        if (document.elementFromPoint(point.x, point.y) === el) return { x: point.x, y: point.y }
+      }
+      return null
+    })
+    assert.ok(hit, 'saved edge was not clickable')
+    await page.mouse.click(hit.x, hit.y, { button: 'right' })
+    await page.getByRole('menuitem', { name: '删除连线', exact: true }).click()
+    const dialog = page.getByRole('dialog', { name: '删除连线', exact: true })
+    await dialog.getByRole('button', { name: '确认删除', exact: true }).click()
+    await dialog.waitFor({ state: 'hidden' })
+    assert.equal((await query(page, ticket)).edges.length, 0)
+    assert.equal((await query(page, ticket, { id: target.id })).nodes[0].revision, 3)
+    console.info('Native reconnect pointer and delete confirmation exercised the saved graph')
+  })
+})
+
+test('Native UI media connection edits the existing video in place', { timeout: 65_000, skip: !hasImage }, async () => {
+  await withWeb(async ({ page, records, home }) => {
+    const [record] = records
+    await select(page, record)
+    await open(page, record)
+    const ticket = await ticketFor(page, record.sessionId)
+    const imageId = randomUUID()
+    const videoId = randomUUID()
+    const workspace = join(home, record.workspaceName)
+    await mkdir(join(workspace, 'assets', 'images'), { recursive: true })
+    await copyFile(imageAsset, join(workspace, 'assets', 'images', 'source-image.png'))
+    const prompt = '完整提示词。固定中景，画面中的小鸭保持静止，门外脚步声逐渐靠近。'
+    await append(page, ticket, [
+      { id: imageId, type: 'image', content: { title: '图片参考', path: 'assets/images/source-image.png' } },
+      { id: videoId, type: 'video', content: { title: '原位编辑视频', mode: 't2v', prompt, mixedListOrder: [] } },
+    ])
+    await flow(page).getByText('2 个节点', { exact: true }).waitFor()
+    await flow(page).getByRole('button', { name: '适配视图', exact: true }).click()
+    await page.bringToFront()
+    await delay(220)
+    const source = await card(page, imageId).locator('.drama-port-output').boundingBox()
+    const target = await card(page, videoId).locator('.drama-port-input').boundingBox()
+    await page.mouse.move(source.x + source.width / 2, source.y + source.height / 2)
+    await page.mouse.down()
+    await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2, { steps: 20 })
+    await page.mouse.up()
+    const form = card(page, videoId).getByRole('form', { name: '编辑节点', exact: true })
+    await form.waitFor()
+    assert.equal(await form.getByRole('textbox', { name: '完整视频提示词', exact: true }).inputValue(), prompt)
+    await form.getByRole('button', { name: '保存修改', exact: true }).click()
+    await form.waitFor({ state: 'hidden' })
+    const result = await query(page, ticket)
+    const updated = result.nodes.find(item => item.id === videoId)
+    assert.equal(result.nodes.length, 2)
+    assert.equal(updated.revision, 2)
+    assert.equal(updated.content.prompt, prompt)
+    assert.equal(updated.content.mode, 'r2v')
+    assert.deepEqual(updated.content.mixedListOrder, [imageId])
+    assert.ok(updated.content.textList == null || updated.content.textList.length === 0)
+    assert.ok(result.edges.some(edge => edge.source === imageId && edge.target === videoId))
+    console.info('Native T2V→R2V connection retained original video ID and inline prompt')
+  })
+})
+
+test('Native reference strip preserves archived sources while an Agent runs', { timeout: 65_000 }, async () => {
+  await withWeb(async ({ page, records, home }) => {
+    const [record] = records
+    await select(page, record)
+    await open(page, record)
+    const ticket = await ticketFor(page, record.sessionId)
+    const source = { id: randomUUID(), type: 'note', content: { title: '已归档来源', description: '来源内容仍可读取。' } }
+    const target = { id: randomUUID(), type: 'note', content: { title: '保留引用的目标', description: '目标内容。' } }
+    await append(page, ticket, [source, target], [{ source: source.id, target: target.id }])
+    await operate(page, ticket, 'delete_node', { operationId: randomUUID(), id: source.id, revision: 1 })
+    const active = await query(page, ticket)
+    assert.ok(!active.nodes.some(node => node.id === source.id))
+    assert.ok(active.edges.some(edge => edge.source === source.id && edge.target === target.id))
+    await flow(page).getByText('1 个节点', { exact: true }).waitFor()
+    await flow(page).getByRole('button', { name: '适配视图', exact: true }).click()
+    const targetCard = card(page, target.id)
+    const viewSource = targetCard.getByRole('button', { name: '引用 · 画布外来源 ' + source.id, exact: true })
+    const removeReference = targetCard.getByRole('button', { name: '删除引用连线 · 画布外来源 ' + source.id, exact: true })
+    await viewSource.waitFor()
+    assert.equal(await nativeActivity(home, record, 'start'), 'running')
+    await panel(page).getByText('AI 工作中', { exact: true }).waitFor()
+    await poll(() => removeReference.isDisabled(), 'busy Agent did not disable removing a preserved edge')
+    await viewSource.click()
+    const archived = card(page, source.id)
+    await archived.getByText('已删除', { exact: true }).waitFor()
+    await archived.getByText('来源内容仍可读取。', { exact: true }).waitFor()
+    await flow(page).getByRole('button', { name: '清除定位', exact: true }).click()
+    await nativeActivity(home, record, 'cancel')
+    await poll(() => removeReference.isEnabled(), 'idle did not restore removing a preserved edge')
+    await removeReference.click()
+    const dialog = page.getByRole('dialog', { name: '删除连线', exact: true })
+    await dialog.getByRole('button', { name: '确认删除', exact: true }).click()
+    await dialog.waitFor({ state: 'hidden' })
+    assert.equal((await query(page, ticket)).edges.length, 0)
+    assert.equal((await query(page, ticket, { id: source.id })).nodes[0].deleted, true)
+    assert.equal((await query(page, ticket, { id: target.id })).nodes[0].revision, 2)
+    console.info('Native active Agent could read archived reference; idle user unlinked it with confirmation')
+  })
+})
+
 test('U4 native task drawer follows real Go worker in isolated provider fixture', { timeout: 150_000, skip: !hasVideo }, async () => {
   await withWeb(async ({ page, records, home }) => {
     const [a] = records
@@ -886,6 +1321,9 @@ test('U4 native task drawer follows real Go worker in isolated provider fixture'
     const ticket = await ticketFor(page, a.sessionId)
     const draft = await pick(page, 't2v')
     await draft.getByLabel('节点名称', { exact: true }).fill('排队与结果定位验收')
+    await draft.getByLabel('集', { exact: true }).fill('EP01')
+    await draft.getByLabel('场', { exact: true }).fill('S01')
+    await draft.getByLabel('镜头', { exact: true }).fill('SH08')
     await draft.getByLabel('完整视频提示词', { exact: true }).fill('固定中景。人物推开餐厅门，在门口停顿。')
     await draft.getByText('更多参数', { exact: true }).click()
     await draft.getByRole('button', { name: '时长（秒）', exact: true }).click()
@@ -919,6 +1357,17 @@ test('U4 native task drawer follows real Go worker in isolated provider fixture'
     await drawer.waitFor({ state: 'hidden' })
     await page.locator('[data-sidebar-right-toggle]').first().click()
     await panel(page).waitFor({ state: 'hidden' })
+    assert.equal((await ok(page, 'init', { sessionId: a.sessionId })).status.aiRunning, false)
+    await operate(page, ticket, 'update_node', {
+      operationId: randomUUID(), id: nodeId, revision: node.revision,
+      episodeId: 'EP09', sceneId: 'S09', shotId: 'SH99',
+      content: { ...node.content, prompt: '修改原节点的完整视频提示词，已提交任务使用先前的快照。' },
+    })
+    const [editedSource] = (await query(page, ticket, { id: nodeId })).nodes
+    assert.equal(editedSource.revision, node.revision + 1)
+    await operate(page, ticket, 'delete_node', { operationId: randomUUID(), id: nodeId, revision: editedSource.revision })
+    const [deletedSource] = (await query(page, ticket, { id: nodeId })).nodes
+    assert.equal(deletedSource.deleted, true)
     await writeFile(join(home, 'allow-fixture-result'), '')
     const completed = await poll(async () => {
       const { tasks } = await operate(page, ticket, 'tasks', {})
@@ -927,6 +1376,7 @@ test('U4 native task drawer follows real Go worker in isolated provider fixture'
     assert.ok(completed.resultNodeId)
     const [result] = (await query(page, ticket, { id: completed.resultNodeId })).nodes
     assert.equal(result.basedOn, nodeId)
+    assert.deepEqual([result.episodeId, result.sceneId, result.shotId], ['EP01', 'S01', 'SH08'])
     assert.ok(completed.completedAt)
     assert.match(completed.outputPath, /^assets\/native-results\/[^/]+\.mp4$/u)
     assert.equal(result.content.path, completed.outputPath)
@@ -947,7 +1397,7 @@ test('U4 native task drawer follows real Go worker in isolated provider fixture'
     assert.ok(await decodeVideoFrame(player))
     assert.ok(await player.evaluate(video => video.videoWidth > 0))
     await screenshot(page, '41-after-task-result-fixture.png')
-    console.info('U4 real persisted queue PASS: fixture-only provider, polling with node/drawer, native panel closed, worker completed, persisted result located and played; no external requests')
+    console.info('U4 persisted queue PASS: polling did not lock editing; source edit and tombstone preserved the submitted task and result lineage; existing MP4 decoded from the fixture result')
   }, { providerFixture: true })
 })
 

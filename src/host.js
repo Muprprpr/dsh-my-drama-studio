@@ -1,12 +1,12 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
-import { once } from 'node:events'
+import { EventEmitter, once } from 'node:events'
 import { startKernel, StudioError } from './kernel.js'
 import { streamMedia } from './media.js'
 import { registerTools } from './tools.js'
 import { openProfileSettings } from './profile-settings.js'
 
 export const name = 'my-drama-studio'
-export const inject = ['connection', 'webServer', 'workspaceRegistry', 'tools', 'settings', 'credentials', 'profileContext']
+export const inject = ['agents', 'connection', 'webServer', 'workspaceRegistry', 'tools', 'settings', 'credentials', 'profileContext']
 export { Config } from './profile-settings.js'
 
 export function keys(value, ...allowed) {
@@ -74,15 +74,43 @@ function route(ctx, path, run, method = 'POST') {
   }))
 }
 
+const humanEdits = new Set(['update_node', 'delete_node', 'update_edge', 'delete_edge'])
 const browserActions = new Set(['context', 'bind', 'disconnect', 'query', 'append', 'permission', 'submit_manual', 'tasks',
-  'generateT2V', 'generateI2V', 'generateR2V', 'generateV2V', 'cancel_task', 'resume_task'])
+  'generateT2V', 'generateI2V', 'generateR2V', 'generateV2V', 'cancel_task', 'resume_task', ...humanEdits])
 
 export async function apply(ctx, config) {
-  const kernel = await startKernel(ctx)
+  function workspaceRunning(sessionIds, connected) {
+    const members = new Set(sessionIds)
+    return connected.some(sessionId => members.has(sessionId) && ctx.agents.get(sessionId)?.status === 'running')
+  }
+
+  function checkHumanWrite(workspaceId, sessionId, connected) {
+    // The Go transaction owns the binding snapshot. Sample the live registry without yielding.
+    const members = ctx.workspaceRegistry.get(workspaceId)?.sessionIds
+    return Boolean(members?.includes(sessionId) && !workspaceRunning(members, connected))
+  }
+
+  const kernel = await startKernel(ctx, checkHumanWrite)
   const providerRequest = await openProfileSettings(ctx, config, kernel)
   const signingKey = randomBytes(32)
   const lifetime = new AbortController()
   ctx.effect(() => () => lifetime.abort())
+  const activity = new EventEmitter().setMaxListeners(0)
+  function agentChanged({ agent }) {
+    activity.emit('change', agent.id)
+  }
+  ctx.on('agent/status', agentChanged)
+  ctx.on('agent/disposed', agentChanged)
+
+  async function connectedSessions(sessionId, workspace, signal) {
+    return (await kernel(sessionId, workspace, 'connected_sessions', {}, signal)).sessionIds
+  }
+
+  async function addActivity(status, sessionId, workspace) {
+    const connected = status.connected ? await connectedSessions(sessionId, workspace) : []
+    status.aiRunning = workspaceRunning(workspace.sessionIds, connected)
+    return status
+  }
 
   function signature(payload, peer, workspace) {
     return createHmac('sha256', signingKey)
@@ -108,7 +136,7 @@ export async function apply(ctx, config) {
   route(ctx, '/api/drama/init', async (body, peer) => {
     const { sessionId } = keys(body, 'sessionId')
     const workspace = await workspaceFor(ctx, sessionId)
-    const status = await kernel(sessionId, workspace, 'context')
+    const status = await addActivity(await kernel(sessionId, workspace, 'context'), sessionId, workspace)
     const payload = Buffer.from(sessionId).toString('base64url')
     const ticket = `${payload}.${signature(payload, peer, workspace).toString('base64url')}`
     return { ticket, status }
@@ -123,7 +151,14 @@ export async function apply(ctx, config) {
     const { ticket, action, data } = keys(body, 'ticket', 'action', 'data')
     if (!browserActions.has(action)) throw new StudioError(400, 'Unknown Studio action')
     const { sessionId, workspace } = await verify(ticket, peer)
-    return kernel(sessionId, workspace, action, action === 'context' ? keys(data ?? {}) : keysData(data))
+    const input = action === 'context' ? keys(data ?? {}) : keysData(data)
+    if (humanEdits.has(action)) return kernel(sessionId, workspace, action, input, undefined, 'human')
+    const result = await kernel(sessionId, workspace, action, input)
+    if (action === 'query') await addActivity(result.status, sessionId, workspace)
+    else if (action === 'context' || action === 'bind' || action === 'disconnect') {
+      await addActivity(result, sessionId, workspace)
+    }
+    return result
   })
 
   route(ctx, '/api/drama/events', async (body, peer, _req, res) => {
@@ -140,21 +175,57 @@ export async function apply(ctx, config) {
     })
     res.flushHeaders()
     let after = start
+    let trackedSessions = new Set()
+    let refreshActivity = true
+    let currentWait
+    let published
+    function onActivity(sessionId) {
+      if (!trackedSessions.has(sessionId)) return
+      refreshActivity = true
+      // Wake the pending DB read without adding a durable Canvas event.
+      currentWait?.abort()
+    }
+    async function write(frame) {
+      if (!res.write(frame)) await once(res, 'drain', { signal })
+    }
+    activity.on('change', onActivity)
     try {
       while (!signal.aborted) {
-        const identity = await verify(ticket, peer)
-        const batch = await kernel(identity.sessionId, identity.workspace, 'events', { after }, signal)
+        const { sessionId, workspace } = await verify(ticket, peer)
+        if (refreshActivity) {
+          refreshActivity = false
+          const connected = await connectedSessions(sessionId, workspace, signal)
+          trackedSessions = new Set(connected)
+          const aiRunning = workspaceRunning(workspace.sessionIds, connected)
+          if (published !== aiRunning && !signal.aborted) {
+            await write(`data: ${JSON.stringify({ aiRunning })}\n\n`)
+            published = aiRunning
+          }
+        }
+        if (signal.aborted || refreshActivity) continue
+        const wake = new AbortController()
+        currentWait = wake
+        let batch
+        try {
+          batch = await kernel(sessionId, workspace, 'events', { after }, AbortSignal.any([signal, wake.signal]))
+        } catch (error) {
+          if (wake.signal.aborted) continue
+          throw error
+        } finally {
+          currentWait = undefined
+        }
         if (signal.aborted) break
         await verify(ticket, peer)
         const reset = batch.status.eventSeq < after
         if (reset) after = batch.status.eventSeq
         else if (batch.events.length) after = batch.events.at(-1).eventSeq
-        const frame = reset || batch.events.length ? `data: ${JSON.stringify(batch)}\n\n` : ': heartbeat\n\n'
-        if (!res.write(frame)) await once(res, 'drain', { signal })
+        if (reset || !batch.events.length || batch.events.some(event => event.type === 'binding')) refreshActivity = true
+        await write(reset || batch.events.length ? `data: ${JSON.stringify(batch)}\n\n` : ': heartbeat\n\n')
       }
     } catch (error) {
       if (!signal.aborted) res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`)
     } finally {
+      activity.off('change', onActivity)
       res.end()
     }
   })

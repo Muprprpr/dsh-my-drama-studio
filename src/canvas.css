@@ -151,6 +151,16 @@
 .drama-v2-picker-list .drama-v2-picker-label small,
 .drama-v2-picker-list .drama-v2-picker-empty { color: var(--dsw-alias-label-secondary); }
 .drama-v2-picker-list .drama-v2-picker-empty { margin: 5px 9px; }
+.drama-v2-delete-content {
+  font-size: 13px;
+  line-height: 20px;
+  overflow-wrap: anywhere;
+}
+.drama-v2-delete-content p {
+  margin: 6px 0 0;
+  color: var(--dsw-alias-label-secondary);
+}
+.drama-v2-delete-content [role='alert'] { color: var(--dsw-alias-state-error-primary); }
 @container (max-width: 350px) {
   .drama-v2-tool-text { display: none; }
   .drama-v2-tools { top: 8px; left: 8px; max-width: calc(100% - 16px); }

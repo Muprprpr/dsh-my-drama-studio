@@ -47,6 +47,9 @@ func run() error {
 	}
 	service := studio.New(providers)
 	defer service.Close()
+	if err := service.ConfigureHostActivity(os.Getenv("DRAMA_STUDIO_ACTIVITY_URL"), token); err != nil {
+		return err
+	}
 	workerDone := make(chan struct{})
 	go func() {
 		defer close(workerDone)

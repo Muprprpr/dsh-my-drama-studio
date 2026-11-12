@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"net/url"
 	"path"
 	"path/filepath"
@@ -30,6 +31,8 @@ type Node struct {
 	NodeInput
 	CreatedBySession string `json:"createdBySession"`
 	CreatedAt        string `json:"createdAt"`
+	Revision         int64  `json:"revision"`
+	Deleted          bool   `json:"deleted,omitempty"`
 }
 
 type Edge struct {
@@ -81,7 +84,11 @@ func (p *project) query(ctx context.Context, r Request) (queryResult, error) {
 		return queryResult{}, notBound
 	}
 	result := queryResult{Nodes: make([]Node, 0), Edges: make([]Edge, 0), Status: status}
-	query := `SELECT id,type,COALESCE(based_on,''),episode_id,scene_id,shot_id,content,created_by,created_at FROM nodes WHERE 1=1`
+	query := `SELECT id,type,COALESCE(based_on,''),episode_id,scene_id,shot_id,content,created_by,created_at,revision,deleted
+		FROM nodes WHERE 1=1`
+	if args.ID == "" {
+		query += " AND deleted=0"
+	}
 	var params []any
 	for _, filter := range []struct{ column, value string }{
 		{"id", args.ID}, {"type", args.Type}, {"episode_id", args.EpisodeID}, {"scene_id", args.SceneID},
@@ -131,7 +138,8 @@ func (p *project) query(ctx context.Context, r Request) (queryResult, error) {
 		}
 		var n Node
 		var content string
-		err := rows.Scan(&n.ID, &n.Type, &n.BasedOn, &n.EpisodeID, &n.SceneID, &n.ShotID, &content, &n.CreatedBySession, &n.CreatedAt)
+		err := rows.Scan(&n.ID, &n.Type, &n.BasedOn, &n.EpisodeID, &n.SceneID, &n.ShotID, &content,
+			&n.CreatedBySession, &n.CreatedAt, &n.Revision, &n.Deleted)
 		if err != nil {
 			return queryResult{}, err
 		}
@@ -146,7 +154,7 @@ func (p *project) query(ctx context.Context, r Request) (queryResult, error) {
 		return result, err
 	}
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
-	rows, err = tx.QueryContext(ctx, "SELECT source,target FROM edges WHERE source IN ("+placeholders+") AND target IN ("+placeholders+") ORDER BY rowid", append(ids, ids...)...)
+	rows, err = tx.QueryContext(ctx, "SELECT source,target FROM edges WHERE target IN ("+placeholders+") ORDER BY rowid", ids...)
 	if err != nil {
 		return queryResult{}, err
 	}
@@ -188,6 +196,8 @@ func (p *project) append(ctx context.Context, r Request) (any, error) {
 func appendNodes(ctx context.Context, tx *sql.Tx, session string, nodes []NodeInput, edges []Edge) (appendResult, error) {
 	result := appendResult{IDs: make([]string, 0, len(nodes))}
 	checkVideos := make(map[string]struct{})
+	newNodes := make(map[string]bool, len(nodes))
+	touchedTargets := make(map[string]bool)
 	eventIDs := make([]string, 0, len(nodes)+len(edges)*2)
 	createdAt := time.Now().UTC().Format(time.RFC3339Nano)
 	for _, n := range nodes {
@@ -201,14 +211,26 @@ func appendNodes(ctx context.Context, tx *sql.Tx, session string, nodes []NodeIn
 			return appendResult{}, invalid("新版本不能引用自己")
 		}
 		if n.BasedOn != "" {
-			if _, err := nodeType(ctx, tx, n.BasedOn); err != nil {
+			var exists bool
+			if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?)", n.BasedOn).Scan(&exists); err != nil {
 				return appendResult{}, err
 			}
+			if !exists {
+				return appendResult{}, invalid("来源节点 %q 不存在于当前 Canvas", n.BasedOn)
+			}
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO nodes VALUES(?,?,NULLIF(?,''),?,?,?,?,?,?)`,
-			n.ID, n.Type, n.BasedOn, session, n.EpisodeID, n.SceneID, n.ShotID, string(n.Content), createdAt); err != nil {
+		insert, err := tx.ExecContext(ctx, `INSERT INTO nodes(id,type,based_on,created_by,episode_id,scene_id,shot_id,content,created_at)
+			VALUES(?,?,NULLIF(?,''),?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING`,
+			n.ID, n.Type, n.BasedOn, session, n.EpisodeID, n.SceneID, n.ShotID, string(n.Content), createdAt)
+		if err != nil {
 			return appendResult{}, err
 		}
+		if count, err := insert.RowsAffected(); err != nil {
+			return appendResult{}, err
+		} else if count == 0 {
+			return appendResult{}, &requestError{http.StatusConflict, "节点 ID 已存在，请为新增节点使用新 ID"}
+		}
+		newNodes[n.ID] = true
 		result.IDs = append(result.IDs, n.ID)
 		eventIDs = append(eventIDs, n.ID)
 		if n.Type == "video" {
@@ -236,10 +258,18 @@ func appendNodes(ctx context.Context, tx *sql.Tx, session string, nodes []NodeIn
 		if _, err := tx.ExecContext(ctx, "INSERT INTO edges VALUES(?,?)", edge.Source, edge.Target); err != nil {
 			return appendResult{}, err
 		}
+		if !newNodes[edge.Target] {
+			touchedTargets[edge.Target] = true
+		}
 		eventIDs = append(eventIDs, edge.Source, edge.Target)
 	}
 	for id := range checkVideos {
 		if err := validateVideo(ctx, tx, id); err != nil {
+			return appendResult{}, err
+		}
+	}
+	for id := range touchedTargets {
+		if _, err := tx.ExecContext(ctx, "UPDATE nodes SET revision=revision+1 WHERE id=?", id); err != nil {
 			return appendResult{}, err
 		}
 	}
@@ -250,7 +280,7 @@ func appendNodes(ctx context.Context, tx *sql.Tx, session string, nodes []NodeIn
 
 func nodeType(ctx context.Context, tx *sql.Tx, id string) (string, error) {
 	var kind string
-	err := tx.QueryRowContext(ctx, "SELECT type FROM nodes WHERE id=?", id).Scan(&kind)
+	err := tx.QueryRowContext(ctx, "SELECT type FROM nodes WHERE id=? AND deleted=0", id).Scan(&kind)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", invalid("引用节点 %q 不存在于当前 Canvas", id)
 	}

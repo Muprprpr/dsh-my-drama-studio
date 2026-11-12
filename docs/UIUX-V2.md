@@ -1,5 +1,7 @@
 # Drama Canvas UI/UX V2
 
+本文 U0–U5 记录 UI/UX V2 当时的验收。当前人工原位编辑与删除权限见 [工程架构](ARCHITECTURE.md)。显式派生仍可追加新版本。
+
 ## U0 实际审计
 
 DSH Desktop launcher 的 `--version` 为 `0.2.1-rc.3`，React Flow 实装为 `@xyflow/react 12.11.0`。核对 rc.3 tag 的 `ui-primitives`、`ui-model-selection`、`ui-workspace`、`ui-sidebar-right` 和 `web/src/platform.ts`。原生 Web 共享模块表提供 `@deepseek-ai/dsh-client-ui-primitives`，插件构建应外置该包。CSS 在当前 esbuild 构建中明确按文本导入，构建前后可正常加载。

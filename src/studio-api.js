@@ -67,6 +67,10 @@ export async function subscribe(ticket, after, signal, onBatch, onError) {
           if (!frame.startsWith('data: ')) continue
           const batch = JSON.parse(frame.slice(6))
           if (batch.error) throw new StudioHTTPError(409, batch.error)
+          if (typeof batch.aiRunning === 'boolean') {
+            onBatch(batch)
+            continue
+          }
           after = batch.events.at(-1)?.eventSeq ?? batch.status.eventSeq
           onBatch(batch)
         }

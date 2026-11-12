@@ -113,6 +113,21 @@ func TestGenerationRecoveryAndAppendAfterDisconnect(t *testing.T) {
 	if known.Status != "polling" || known.ProviderTaskID != providerID || submits != 1 || polls != 0 {
 		t.Fatalf("provider id not persisted before polling: %+v, submit=%d poll=%d", known, submits, polls)
 	}
+	_, beforeEdit, err := scanTask(p.db.QueryRowContext(ctx, "SELECT "+taskColumns+" FROM tasks WHERE id=?", known.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetHumanWriteCheck(func(context.Context, string, string, []string) (bool, error) { return true, nil })
+	edited := mustEdit(t, s, dir, "b", "update_node", updateNodeArgs{
+		nodeRevisionArgs: nodeRevisionArgs{operation: operation{ID: "edit-during-poll"}, ID: nodeID, Revision: 1},
+		ShotID:           "SH002", Content: json.RawMessage(`{"prompt":"稍后提交的另一份提示词。"}`),
+	})
+	mustEdit(t, s, dir, "b", "delete_node", nodeRevisionArgs{
+		operation: operation{ID: "delete-during-poll"}, ID: nodeID, Revision: edited.Revision,
+	})
+	if _, stored, err := scanTask(p.db.QueryRowContext(ctx, "SELECT "+taskColumns+" FROM tasks WHERE id=?", known.ID)); err != nil || stored != beforeEdit {
+		t.Fatalf("source edits modified stored task input: %v", err)
+	}
 	mustCall(t, s, dir, "a", "disconnect", operation{ID: "disconnect"})
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
@@ -137,6 +152,9 @@ func TestGenerationRecoveryAndAppendAfterDisconnect(t *testing.T) {
 	if len(query.Nodes) != 1 || query.Nodes[0].BasedOn != nodeID || query.Nodes[0].CreatedBySession != "a" || query.Nodes[0].ShotID != "SH001" {
 		t.Fatalf("result node: %+v", query.Nodes)
 	}
+	if source := exactNode(t, s, dir, "b", nodeID); !source.Deleted || source.ShotID != "SH002" {
+		t.Fatalf("task source archive lost provenance: %+v", source)
+	}
 	file, err := os.Open(filepath.Join(dir, "assets", "images", finished.ID+".png"))
 	if err != nil {
 		t.Fatal(err)
@@ -145,7 +163,7 @@ func TestGenerationRecoveryAndAppendAfterDisconnect(t *testing.T) {
 	if _, err := png.Decode(file); err != nil {
 		t.Fatalf("saved result could not be opened: %v", err)
 	}
-	t.Log("fixture only: pending, durable submitting and task ID, restart polling, downloaded real PNG bytes, appended result after the submitting Session disconnected")
+	t.Log("fixture only: pending, durable submitting and task ID, restart polling, original input and shot snapshot preserved after source edit/delete, downloaded real PNG bytes and appended result after Session disconnect")
 }
 
 func TestUncertainGenerationNeverResubmits(t *testing.T) {
