@@ -52,9 +52,17 @@ func TestReplicatePredictionModes(t *testing.T) {
 		name, nodeType, mode, model, field, endpoint, version, extension string
 		references                                                       []GenerationReference
 		expectedMedia                                                    any
+		imageLimit                                                       int
 	}{
 		{name: "T2I Flux", nodeType: "image", mode: "t2i", model: "black-forest-labs/flux-schnell",
 			endpoint: "/v1/models/black-forest-labs/flux-schnell/predictions", extension: ".webp"},
+		{name: "T2I single reference", nodeType: "image", mode: "t2i", model: "black-forest-labs/flux-kontext-pro",
+			field: "input_image", endpoint: "/v1/models/black-forest-labs/flux-kontext-pro/predictions", extension: ".png",
+			references: []GenerationReference{{Type: "image", URL: imageOne}}, expectedMedia: imageOne, imageLimit: 1},
+		{name: "T2I multiple references", nodeType: "image", mode: "t2i", model: "example/image-model",
+			field: "image_inputs", endpoint: "/v1/models/example/image-model/predictions", extension: ".png",
+			references:    []GenerationReference{{Type: "image", URL: imageOne}, {Type: "image", URL: imageTwo}},
+			expectedMedia: []any{imageOne, imageTwo}, imageLimit: 3},
 		{name: "T2V Wan", nodeType: "video", mode: "t2v", model: "wan-video/wan-2.7-t2v",
 			endpoint: "/v1/models/wan-video/wan-2.7-t2v/predictions", extension: ".mp4"},
 		{name: "I2V versioned Wan", nodeType: "video", mode: "i2v", model: "wan-video/wan-2.7-i2v:" + version,
@@ -115,7 +123,8 @@ func TestReplicatePredictionModes(t *testing.T) {
 			})
 			ctx := context.Background()
 			provider := newReplicateProvider(ProviderProfile{Mode: test.mode, Model: test.model, InputField: test.field,
-				Options: map[string]any{"seed": 31}}, "fixture-token", client)
+				Options: map[string]any{"seed": 31},
+				Limits:  VideoLimits{References: map[string]int{"image": test.imageLimit}}}, "fixture-token", client)
 			if err := provider.(interface{ Verify(context.Context) error }).Verify(ctx); err != nil {
 				t.Fatal(err)
 			}

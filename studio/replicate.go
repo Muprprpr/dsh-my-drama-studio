@@ -98,7 +98,11 @@ func replicateRequest(profile ProviderProfile, input GenerationInput) (string, r
 
 	mediaField := profile.InputField
 	switch mode {
-	case "t2i", "t2v":
+	case "t2i":
+		if maximum := profile.Limits.References["image"]; len(input.References) > maximum {
+			return "", body, fmt.Errorf("当前图片模型最多接收 %d 张参考图", maximum)
+		}
+	case "t2v":
 		if len(input.References) != 0 || mediaField != "" {
 			return "", body, errors.New("纯文生成无需媒体输入")
 		}
@@ -123,7 +127,7 @@ func replicateRequest(profile ProviderProfile, input GenerationInput) (string, r
 	}
 	for _, ref := range input.References {
 		if ref.Type != "image" || (ref.URL == "" && ref.Path == "") {
-			return "", body, errors.New("Replicate 视频输入只接受已连接的图片素材")
+			return "", body, errors.New("当前 Replicate 预设只接受已连接的图片素材")
 		}
 		if ref.URL != "" && !providerURL(ref.URL) {
 			return "", body, errors.New("图片需要可访问的外部 HTTP/HTTPS 地址")
@@ -230,7 +234,7 @@ func (p *replicateProvider) Submit(ctx context.Context, input GenerationInput) (
 			}
 			references = append(references, assetURL)
 		}
-		if p.profile.Mode == "i2v" {
+		if p.profile.Mode == "i2v" || p.profile.Mode == "t2i" && p.profile.Limits.References["image"] == 1 {
 			body.Input[p.profile.InputField] = references[0]
 		} else {
 			body.Input[p.profile.InputField] = references

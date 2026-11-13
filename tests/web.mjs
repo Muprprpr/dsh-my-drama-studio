@@ -3,6 +3,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { copyFile, mkdir, mkdtemp, readFile, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
+import { createServer as createHTTPServer } from 'node:http'
 import { createServer } from 'node:net'
 import { basename, dirname, join, resolve } from 'node:path'
 import { test } from 'node:test'
@@ -54,7 +55,7 @@ export async function apply(ctx) {
       }
     }
   })
-  async function activity({ sessionId, requestId, action }) {
+  async function activity({ sessionId, requestId, action, nodeId }) {
     const { agent } = await ctx.sessionController.resolveAgent(sessionId)
     if (!agent) throw new Error('Native activity Agent did not resolve')
     if (action === 'start') {
@@ -71,6 +72,12 @@ export async function apply(ctx) {
         gate.entered.promise,
         new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })),
       ])
+    } else if (action === 'query') {
+      if (!running.has(sessionId)) throw new Error('No native turn to query')
+      const result = await ctx.tools.execute({ agent, callId: requestId, name: 'drama_query',
+        arguments: { id: nodeId }, signal: AbortSignal.timeout(8000) })
+      if (result.isError) throw new Error(result.content?.[0]?.text || 'Native query failed')
+      if (!JSON.stringify(result).includes(nodeId)) throw new Error('Native query did not return the requested node')
     } else if (action === 'finish') {
       const gate = running.get(sessionId)
       if (!gate) throw new Error('No native turn to finish')
@@ -187,10 +194,12 @@ const chrome = [
 const evidence = join(root, 'docs', 'uiux-v2')
 const desktop = join(process.env.USERPROFILE ?? '', 'Desktop')
 const imageAsset = process.env.DRAMA_UIUX_IMAGE ?? join(desktop, '课件/4-5-6文生图 图生图/文生图 资料/资产/黄色毛绒小鸭.png')
+const projectImageAsset = process.env.DRAMA_UIUX_PROJECT_IMAGE ?? join(dirname(imageAsset), '餐厅门口.png')
 const videoAsset = process.env.DRAMA_UIUX_VIDEO ?? join(desktop, '转绘项目-1000条样片/导出测试/测试片段.mp4')
 const hasImage = existsSync(imageAsset)
 const hasVideo = existsSync(videoAsset)
 const capture = process.env.DRAMA_UIUX_CAPTURE === '1'
+const studioExecutable = process.env.DRAMA_UIUX_STUDIO_EXE
 
 async function screenshot(page, file) {
   if (!capture) return
@@ -214,18 +223,21 @@ async function withWeb(run, { providerFixture = false } = {}) {
   await writeFile(fixture, fixtureSource)
   const port = await freePort()
   const env = { ...process.env, DSH_HOME: home, DSH_AGENTS_HOME: join(home, 'agents'), DSH_TELEMETRY_DISABLED: '1', DEEPSEEK_API_KEY: '' }
-  if (providerFixture) {
+  const isolatedPlugin = providerFixture || studioExecutable
+  if (isolatedPlugin) {
     await mkdir(join(entryRoot, 'dist'), { recursive: true })
     for (const file of ['package.json', 'dsh.bundle.patch', 'dist/host.js', 'dist/client.js']) {
       await copyFile(join(root, file), join(entryRoot, file))
     }
     const executable = join(entryRoot, 'dist', 'studio.exe')
-    const compile = spawnSync('go.exe', ['test', '-c', '-o', executable, './studio'], {
-      cwd: root, encoding: 'utf8', timeout: 90_000, windowsHide: true,
-      env: { ...process.env, GOARCH: 'amd64', CGO_ENABLED: '0', GOCACHE: join(runtime, 'uiux-go-cache') },
-    })
-    assert.equal(compile.status, 0, compile.stderr || compile.error?.message)
-    env.DRAMA_UIUX_PROVIDER_FIXTURE = resolve(videoAsset)
+    if (providerFixture) {
+      const compile = spawnSync('go.exe', ['test', '-c', '-o', executable, './studio'], {
+        cwd: root, encoding: 'utf8', timeout: 90_000, windowsHide: true,
+        env: { ...process.env, GOARCH: 'amd64', CGO_ENABLED: '0', GOCACHE: join(runtime, 'uiux-go-cache') },
+      })
+      assert.equal(compile.status, 0, compile.stderr || compile.error?.message)
+      env.DRAMA_UIUX_PROVIDER_FIXTURE = resolve(videoAsset)
+    } else await copyFile(studioExecutable, executable)
   } else await symlink(root, entryRoot, 'junction')
   await writeFile(join(profile, 'cordis.patch.yml'), `- id: ui-settings-models
   config:
@@ -237,7 +249,7 @@ async function withWeb(run, { providerFixture = false } = {}) {
   const launch = `$launcher = Join-Path $env:LOCALAPPDATA 'Programs/DeepSeek Harness/resources/runtime/cli/bin/dsh.cmd'
 & $launcher web --host 127.0.0.1 --port ${port} --no-open
 exit $LASTEXITCODE`
-  const [shell, args] = providerFixture ? ['pwsh.exe', ['-NoProfile', '-Command', launch]]
+  const [shell, args] = isolatedPlugin ? ['pwsh.exe', ['-NoProfile', '-Command', launch]]
     : ['powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', join(root, 'scripts', 'dev.ps1'),
       '-Port', String(port), '-NoOpen']]
   const dsh = spawn(shell, args, {
@@ -249,6 +261,8 @@ exit $LASTEXITCODE`
   dsh.stdout.on('data', chunk => { output += chunk })
   dsh.stderr.on('data', chunk => { output += chunk })
   let browser, page
+  const pageErrors = []
+  const consoleErrors = []
   let passed = false
   try {
     let url, records
@@ -266,15 +280,17 @@ exit $LASTEXITCODE`
     browser = await chromium.launch({ executablePath: chrome, headless: true })
     const context = await browser.newContext({ locale: 'en-US', colorScheme: 'light', viewport: { width: 1680, height: 1000 } })
     page = await context.newPage()
-    const pageErrors = []
-    page.on('pageerror', error => pageErrors.push(error.message))
+    page.on('pageerror', error => pageErrors.push(error.stack ?? error.message))
+    page.on('console', message => {
+      if (message.type() === 'error') consoleErrors.push(message.text())
+    })
     await initialize(page, url)
     await run({ page, context, url, records, home })
     assert.deepEqual(pageErrors, [])
     passed = true
   } catch (error) {
     await page?.screenshot({ path: join(home, 'failure.png'), animations: 'disabled' }).catch(() => {})
-    throw new Error(redact(`${error.stack}\nTest profile: ${home}\nDSH output:\n${output.split(/\r?\n/u).slice(0, 25).join('\n')}`))
+    throw new Error(redact(`${error.stack}\nTest profile: ${home}\nBrowser errors:\n${[...pageErrors, ...consoleErrors].join('\n')}\nDSH output:\n${output.split(/\r?\n/u).slice(0, 25).join('\n')}`))
   } finally {
     const closingBrowser = browser?.close()
     const pid = output.match(/\[drama-web-fixture\] PID (\d+)/u)?.[1]
@@ -290,7 +306,7 @@ exit $LASTEXITCODE`
     dsh.stderr.destroy()
     dsh.unref()
     await closingBrowser
-    if (!providerFixture) await unlink(entryRoot)
+    if (!isolatedPlugin) await unlink(entryRoot)
     if (passed) {
       const target = resolve(home)
       assert.equal(dirname(target), resolve(runtime))
@@ -317,6 +333,8 @@ const panel = page => page.getByTestId('drama-canvas')
 const flow = page => page.getByRole('region', { name: '创作节点画布', exact: true })
 const drama = page => page.getByRole('button', { name: 'Drama', exact: true })
 const card = (page, id) => flow(page).locator(`article[data-drama-node-id="${id}"]`)
+const graphEdge = (page, source, target) =>
+  flow(page).locator('.react-flow__edge[data-id=' + JSON.stringify(JSON.stringify([source, target])) + ']')
 const draftCard = page => flow(page).locator('article[data-drama-draft="true"]')
 const menu = page => page.getByRole('button', { name: 'Drama 设置', exact: true })
 const sidebarMode = (page, mode) => page.locator(`[data-sidebar-right-mode="${mode}"]`).first()
@@ -375,10 +393,10 @@ async function poll(fn, label, timeout = 10_000) {
   throw new Error(label)
 }
 
-async function nativeActivity(home, record, action) {
+async function nativeActivity(home, record, action, nodeId) {
   const requestId = randomUUID()
   const temporary = join(home, 'activity-' + requestId + '.tmp')
-  await writeFile(temporary, JSON.stringify({ sessionId: record.sessionId, requestId, action }))
+  await writeFile(temporary, JSON.stringify({ sessionId: record.sessionId, requestId, action, nodeId }))
   await rename(temporary, join(home, 'activity-request-' + requestId + '.json'))
   const result = await poll(async () => {
     try {
@@ -578,6 +596,11 @@ async function inputLayoutTest(page, textarea) {
   const before = await viewport.evaluate(element => element.style.transform)
   const nodeBefore = await position.evaluate(element => element.style.transform)
   const point = { x: bounds.x + Math.min(30, bounds.width / 4), y: bounds.y + 13 }
+  const target = await textarea.evaluate((element, point) => {
+    const hit = document.elementFromPoint(point.x, point.y)
+    return hit === element ? '' : hit?.outerHTML.slice(0, 180) ?? 'outside viewport'
+  }, point)
+  assert.equal(target, '', 'textarea drag starts outside the editor')
   await page.mouse.move(point.x, point.y)
   await page.mouse.down()
   await page.mouse.move(point.x + 46, point.y + 10, { steps: 9 })
@@ -599,7 +622,7 @@ async function inputLayoutTest(page, textarea) {
   assert.equal(await position.evaluate(element => element.style.transform), nodeBefore, 'text selection dragged the node')
 }
 
-async function dragCanvasBlank(page) {
+async function dragCanvasBlank(page, withSpace = false) {
   const region = flow(page)
   const point = await region.evaluate(element => {
     const bounds = element.getBoundingClientRect()
@@ -615,10 +638,15 @@ async function dragCanvasBlank(page) {
   assert.ok(point, 'no visible blank canvas area')
   const viewport = region.locator('.react-flow__viewport')
   const before = await viewport.evaluate(element => element.style.transform)
+  if (withSpace) {
+    await region.focus()
+    await page.keyboard.down('Space')
+  }
   await page.mouse.move(point.x, point.y)
   await page.mouse.down()
   await page.mouse.move(point.x - 30, point.y - 35, { steps: 10 })
   await page.mouse.up()
+  if (withSpace) await page.keyboard.up('Space')
   await poll(async () => (await viewport.evaluate(element => element.style.transform)) !== before, 'blank drag did not pan canvas')
   return point
 }
@@ -631,6 +659,32 @@ async function setTheme(page, scheme) {
 async function fit(page) {
   await panel(page).getByRole('button', { name: '适配视图', exact: true }).click()
   await delay(280)
+}
+
+async function dragReference(page, source, target) {
+  await fit(page)
+  const from = await card(page, source).locator('.drama-port-output').boundingBox()
+  const to = await card(page, target).locator('.drama-port-input').boundingBox()
+  assert.ok(from && to, 'source and target handles must be present')
+  await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2)
+  await page.mouse.down()
+  await page.mouse.move(to.x + to.width / 2, to.y + to.height / 2, { steps: 20 })
+  await page.mouse.up()
+}
+
+async function clickBlank(page) {
+  const blank = await flow(page).locator('.react-flow__pane').evaluate(pane => {
+    const bounds = pane.getBoundingClientRect()
+    for (const y of [.72, .82, .48, .6, .22]) {
+      for (const x of [.88, .72, .52, .38, .18, .12]) {
+        const point = { x: bounds.left + bounds.width * x, y: bounds.top + bounds.height * y }
+        if (document.elementFromPoint(point.x, point.y) === pane) return point
+      }
+    }
+    return null
+  })
+  assert.ok(blank, 'no blank canvas area available')
+  await page.mouse.click(blank.x, blank.y)
 }
 
 async function dragNode(page, id) {
@@ -776,6 +830,7 @@ test('U2 U3 U5 node drafts, shared Sessions, media and native theme/layout', { t
     assert.equal(original.shotId, 'SH03')
     await observer.bringToFront()
     await card(observer, original.id).waitFor()
+    await card(observer, original.id).hover()
     await card(observer, original.id).getByRole('button', { name: '派生版本', exact: true }).click()
     const revision = draftCard(observer).last().getByRole('form', { name: '另存为新版本', exact: true })
     await revision.getByRole('textbox', { name: '节点名称', exact: true }).fill('推门进入餐厅 V2')
@@ -806,8 +861,9 @@ test('U2 U3 U5 node drafts, shared Sessions, media and native theme/layout', { t
 
     await fit(page)
     await card(page, revised.id).locator('.drama-node-titlebar').click({ button: 'right' })
-    await page.getByText('复制为新节点', { exact: true }).waitFor()
+    await page.getByRole('menuitem', { name: '复制 · Ctrl+C', exact: true }).waitFor()
     await page.keyboard.press('Escape')
+    await card(page, revised.id).hover()
     await card(page, revised.id).getByRole('button', { name: '新增后继节点', exact: true }).click()
     const successor = await pick(page, '备注', async () => {})
     await successor.getByRole('textbox', { name: '节点名称', exact: true }).fill('后继剪辑备忘')
@@ -824,6 +880,7 @@ test('U2 U3 U5 node drafts, shared Sessions, media and native theme/layout', { t
 
     const { imageId, videoId } = await addExistingMedia(page, first, join(home, a.workspaceName))
     await panel(page).getByText(`${6 + Number(hasImage) + Number(hasVideo)} 个节点`, { exact: false }).first().waitFor()
+    await clickBlank(page)
     await fit(page)
     if (hasImage) {
       const image = card(page, imageId).locator('img').first()
@@ -992,6 +1049,9 @@ test('Native human CRUD follows live Workspace Agent activity', { timeout: 100_0
     await select(independent, other)
     assert.notEqual(await open(independent, other), canvasId)
     const otherTicket = await ticketFor(independent, other.sessionId)
+    await peer.bringToFront()
+    await sidebarMode(peer, 'fullscreen').click()
+    await peer.locator('[data-sidebar-right-panel="fullscreen"]').waitFor()
 
     const note = title => ({ id: randomUUID(), type: 'note', content: { title, description: title + '正文' } })
     const original = note('原位修改验收')
@@ -999,8 +1059,9 @@ test('Native human CRUD follows live Workspace Agent activity', { timeout: 100_0
     const source = note('原始引用来源')
     const replacement = note('替换引用来源')
     const linked = note('引用目标')
+    const unused = note('同画布未使用节点')
     const separate = note('另一工作区可编辑')
-    await append(page, aTicket, [original, disposable, source, replacement, linked], [{ source: source.id, target: linked.id }])
+    await append(page, aTicket, [original, disposable, source, replacement, linked, unused], [{ source: source.id, target: linked.id }])
     await append(independent, otherTicket, [separate])
     const mutation = (browser, ticket, action, data) => request(browser, 'operation', {
       ticket, action, data: { operationId: randomUUID(), ...data },
@@ -1016,17 +1077,17 @@ test('Native human CRUD follows live Workspace Agent activity', { timeout: 100_0
       await browser.bringToFront()
       await fit(browser)
       const target = card(browser, nodeId)
-      await target.locator('.drama-node-titlebar').click({ button: 'right' })
-      await browser.getByRole('menuitem', { name: '编辑节点', exact: true }).click()
-      const form = target.getByRole('form', { name: '编辑节点', exact: true })
-      await form.waitFor()
-      return form
+      const openForm = target.getByRole('form', { name: '编辑节点', exact: true })
+      if (await openForm.isVisible()) return openForm
+      await target.locator('.drama-node-titlebar').click()
+      await openForm.waitFor()
+      return openForm
     }
     const remove = async (browser, nodeId) => {
       await browser.bringToFront()
       await fit(browser)
       await card(browser, nodeId).locator('.drama-node-titlebar').click({ button: 'right' })
-      await browser.getByRole('menuitem', { name: '删除节点', exact: true }).click()
+      await browser.getByRole('menuitem', { name: /^删除节点/u }).click()
       const confirmation = browser.getByRole('dialog', { name: '删除节点', exact: true })
       await confirmation.getByRole('button', { name: '确认删除', exact: true }).click()
       await confirmation.waitFor({ state: 'hidden' })
@@ -1075,6 +1136,8 @@ test('Native human CRUD follows live Workspace Agent activity', { timeout: 100_0
     await body(unsaved).fill(draftText)
     assert.equal(await nativeActivity(home, a, 'start'), 'running')
     await busy(peer).waitFor()
+    assert.equal(await nativeActivity(home, a, 'query', original.id), 'running')
+    assert.equal(await nativeActivity(home, a, 'query', linked.id), 'running')
     await poll(() => save(unsaved).isDisabled(), 'open draft save did not reflect native activity')
     assert.equal(await body(unsaved).inputValue(), draftText)
     assert.equal((await status(peer, b)).aiRunning, true)
@@ -1082,6 +1145,8 @@ test('Native human CRUD follows live Workspace Agent activity', { timeout: 100_0
     const otherBefore = await current(independent, otherTicket, separate.id)
     assert.equal((await mutation(independent, otherTicket, 'update_node', update(otherBefore, '独立工作区照常保存。'))).status, 200)
     assert.equal((await current(independent, otherTicket, separate.id)).revision, 2)
+    const unusedBefore = await current(peer, bTicket, unused.id)
+    assert.equal((await mutation(peer, bTicket, 'update_node', update(unusedBefore, '同画布中未使用的节点照常保存。'))).status, 200)
 
     for (const [action, data] of [
       ['update_node', update(edited, '后台请求也不可覆盖')],
@@ -1101,9 +1166,7 @@ test('Native human CRUD follows live Workspace Agent activity', { timeout: 100_0
     await busy(page).waitFor()
     await fit(page)
     await card(page, original.id).locator('.drama-node-titlebar').click({ button: 'right' })
-    for (const name of ['编辑节点', '删除节点']) {
-      assert.ok(await page.getByRole('menuitem', { name, exact: true }).isDisabled())
-    }
+    assert.ok(await page.getByRole('menuitem', { name: /^删除节点/u }).isDisabled())
     await page.keyboard.press('Escape')
     const addition = await pick(page, '备注')
     await addition.getByRole('textbox', { name: '节点名称', exact: true }).fill('AI 工作时人工新增')
@@ -1113,6 +1176,7 @@ test('Native human CRUD follows live Workspace Agent activity', { timeout: 100_0
     assert.equal((await query(peer, bTicket, { q: 'AI 工作时人工新增' })).nodes.length, 1)
 
     assert.equal(await nativeActivity(home, b, 'start'), 'running')
+    assert.equal(await nativeActivity(home, b, 'query', original.id), 'running')
     await nativeActivity(home, a, 'finish')
     await poll(async () => (await nativeActivity(home, a, 'status')) === 'idle', 'native A did not finish')
     assert.equal(await nativeActivity(home, b, 'status'), 'running')
@@ -1146,10 +1210,7 @@ test('Native human CRUD follows live Workspace Agent activity', { timeout: 100_0
     graph = await query(peer, bTicket)
     assert.ok(!graph.nodes.some(node => node.id === replacement.id))
     assert.ok(graph.nodes.some(node => node.id === linked.id))
-    linkTarget = await current(peer, bTicket, linked.id)
-    assert.equal((await mutation(peer, bTicket, 'delete_edge', {
-      source: replacement.id, target: linked.id, revision: linkTarget.revision,
-    })).status, 200)
+    assert.ok(!graph.edges.some(edge => edge.source === replacement.id && edge.target === linked.id))
     console.info('Human edits PASS: same-ID UI save/delete, revisions, edge replacement/delete, native overlapping Agent turns, backend 423, add while busy, draft preservation, workspace isolation and cancellation')
   })
 })
@@ -1169,7 +1230,7 @@ test('Native UI changes and deletes a saved edge', { timeout: 65_000 }, async ()
     await flow(page).getByRole('button', { name: '适配视图', exact: true }).click()
     await page.bringToFront()
     await delay(220)
-    const edge = id => flow(page).locator('.react-flow__edge[data-id="' + id + ':' + target.id + '"]')
+    const edge = id => graphEdge(page, id, target.id)
     const from = edge(source.id).locator('circle.react-flow__edgeupdater-source')
     const to = card(page, next.id).locator('.drama-port-output')
     const point = await from.evaluate(el => {
@@ -1213,87 +1274,35 @@ test('Native UI changes and deletes a saved edge', { timeout: 65_000 }, async ()
   })
 })
 
-test('Native UI media connection edits the existing video in place', { timeout: 65_000, skip: !hasImage }, async () => {
+test('Native deletion preserves source content and removes its live references', { timeout: 65_000 }, async () => {
   await withWeb(async ({ page, records, home }) => {
     const [record] = records
     await select(page, record)
     await open(page, record)
     const ticket = await ticketFor(page, record.sessionId)
-    const imageId = randomUUID()
-    const videoId = randomUUID()
-    const workspace = join(home, record.workspaceName)
-    await mkdir(join(workspace, 'assets', 'images'), { recursive: true })
-    await copyFile(imageAsset, join(workspace, 'assets', 'images', 'source-image.png'))
-    const prompt = '完整提示词。固定中景，画面中的小鸭保持静止，门外脚步声逐渐靠近。'
-    await append(page, ticket, [
-      { id: imageId, type: 'image', content: { title: '图片参考', path: 'assets/images/source-image.png' } },
-      { id: videoId, type: 'video', content: { title: '原位编辑视频', mode: 't2v', prompt, mixedListOrder: [] } },
-    ])
-    await flow(page).getByText('2 个节点', { exact: true }).waitFor()
-    await flow(page).getByRole('button', { name: '适配视图', exact: true }).click()
-    await page.bringToFront()
-    await delay(220)
-    const source = await card(page, imageId).locator('.drama-port-output').boundingBox()
-    const target = await card(page, videoId).locator('.drama-port-input').boundingBox()
-    await page.mouse.move(source.x + source.width / 2, source.y + source.height / 2)
-    await page.mouse.down()
-    await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2, { steps: 20 })
-    await page.mouse.up()
-    const form = card(page, videoId).getByRole('form', { name: '编辑节点', exact: true })
-    await form.waitFor()
-    assert.equal(await form.getByRole('textbox', { name: '完整视频提示词', exact: true }).inputValue(), prompt)
-    await form.getByRole('button', { name: '保存修改', exact: true }).click()
-    await form.waitFor({ state: 'hidden' })
-    const result = await query(page, ticket)
-    const updated = result.nodes.find(item => item.id === videoId)
-    assert.equal(result.nodes.length, 2)
-    assert.equal(updated.revision, 2)
-    assert.equal(updated.content.prompt, prompt)
-    assert.equal(updated.content.mode, 'r2v')
-    assert.deepEqual(updated.content.mixedListOrder, [imageId])
-    assert.ok(updated.content.textList == null || updated.content.textList.length === 0)
-    assert.ok(result.edges.some(edge => edge.source === imageId && edge.target === videoId))
-    console.info('Native T2V→R2V connection retained original video ID and inline prompt')
-  })
-})
-
-test('Native reference strip preserves archived sources while an Agent runs', { timeout: 65_000 }, async () => {
-  await withWeb(async ({ page, records, home }) => {
-    const [record] = records
-    await select(page, record)
-    await open(page, record)
-    const ticket = await ticketFor(page, record.sessionId)
-    const source = { id: randomUUID(), type: 'note', content: { title: '已归档来源', description: '来源内容仍可读取。' } }
-    const target = { id: randomUUID(), type: 'note', content: { title: '保留引用的目标', description: '目标内容。' } }
+    const source = { id: randomUUID(), type: 'note', content: { title: '待删除来源', description: '来源内容仍可读取。' } }
+    const target = { id: randomUUID(), type: 'note', content: { title: '引用目标', description: '目标内容。' } }
     await append(page, ticket, [source, target], [{ source: source.id, target: target.id }])
-    await operate(page, ticket, 'delete_node', { operationId: randomUUID(), id: source.id, revision: 1 })
+    assert.equal(await nativeActivity(home, record, 'start'), 'running')
+    assert.equal(await nativeActivity(home, record, 'query', target.id), 'running')
+    await panel(page).getByText('AI 工作中', { exact: true }).waitFor()
+    const blocked = await request(page, 'operation', { ticket, action: 'delete_node',
+      data: { operationId: randomUUID(), id: source.id, revision: 1 } })
+    assert.equal(blocked.status, 423)
+    await nativeActivity(home, record, 'cancel')
+    await panel(page).getByText('AI 工作中', { exact: true }).waitFor({ state: 'hidden' })
+    await fit(page)
+    await card(page, source.id).locator('.drama-node-titlebar').click()
+    await page.keyboard.press('Delete')
+    await poll(async () => (await query(page, ticket, { id: source.id })).nodes[0].deleted, 'idle source deletion did not persist')
     const active = await query(page, ticket)
     assert.ok(!active.nodes.some(node => node.id === source.id))
-    assert.ok(active.edges.some(edge => edge.source === source.id && edge.target === target.id))
+    assert.ok(!active.edges.some(edge => edge.source === source.id && edge.target === target.id))
     await flow(page).getByText('1 个节点', { exact: true }).waitFor()
-    await flow(page).getByRole('button', { name: '适配视图', exact: true }).click()
-    const targetCard = card(page, target.id)
-    const viewSource = targetCard.getByRole('button', { name: '引用 · 画布外来源 ' + source.id, exact: true })
-    const removeReference = targetCard.getByRole('button', { name: '删除引用连线 · 画布外来源 ' + source.id, exact: true })
-    await viewSource.waitFor()
-    assert.equal(await nativeActivity(home, record, 'start'), 'running')
-    await panel(page).getByText('AI 工作中', { exact: true }).waitFor()
-    await poll(() => removeReference.isDisabled(), 'busy Agent did not disable removing a preserved edge')
-    await viewSource.click()
-    const archived = card(page, source.id)
-    await archived.getByText('已删除', { exact: true }).waitFor()
-    await archived.getByText('来源内容仍可读取。', { exact: true }).waitFor()
-    await flow(page).getByRole('button', { name: '清除定位', exact: true }).click()
-    await nativeActivity(home, record, 'cancel')
-    await poll(() => removeReference.isEnabled(), 'idle did not restore removing a preserved edge')
-    await removeReference.click()
-    const dialog = page.getByRole('dialog', { name: '删除连线', exact: true })
-    await dialog.getByRole('button', { name: '确认删除', exact: true }).click()
-    await dialog.waitFor({ state: 'hidden' })
-    assert.equal((await query(page, ticket)).edges.length, 0)
-    assert.equal((await query(page, ticket, { id: source.id })).nodes[0].deleted, true)
-    assert.equal((await query(page, ticket, { id: target.id })).nodes[0].revision, 2)
-    console.info('Native active Agent could read archived reference; idle user unlinked it with confirmation')
+    const [archived] = (await query(page, ticket, { id: source.id })).nodes
+    assert.equal(archived.deleted, true)
+    assert.deepEqual(archived.content, source.content)
+    console.info('Native Agent use protected source deletion until idle; deletion removed the active edge and kept source content')
   })
 })
 
@@ -1325,7 +1334,6 @@ test('U4 native task drawer follows real Go worker in isolated provider fixture'
     await draft.getByLabel('场', { exact: true }).fill('S01')
     await draft.getByLabel('镜头', { exact: true }).fill('SH08')
     await draft.getByLabel('完整视频提示词', { exact: true }).fill('固定中景。人物推开餐厅门，在门口停顿。')
-    await draft.getByText('更多参数', { exact: true }).click()
     await draft.getByRole('button', { name: '时长（秒）', exact: true }).click()
     await page.getByRole('menuitem', { name: '8', exact: true }).click()
     await draft.getByRole('button', { name: '创建节点', exact: true }).click()
@@ -1336,6 +1344,7 @@ test('U4 native task drawer follows real Go worker in isolated provider fixture'
     assert.equal(node.content.textList, undefined)
     const nodeId = node.id
     const source = card(page, nodeId)
+    await source.locator('.drama-node-titlebar').click()
     await source.getByRole('button', { name: '生成…', exact: true }).click()
     const confirm = source.getByRole('dialog', { name: '确认生成', exact: true })
     const submit = confirm.getByRole('button', { name: '确认提交', exact: true })
@@ -1358,16 +1367,15 @@ test('U4 native task drawer follows real Go worker in isolated provider fixture'
     await page.locator('[data-sidebar-right-toggle]').first().click()
     await panel(page).waitFor({ state: 'hidden' })
     assert.equal((await ok(page, 'init', { sessionId: a.sessionId })).status.aiRunning, false)
-    await operate(page, ticket, 'update_node', {
+    const pendingEdit = {
       operationId: randomUUID(), id: nodeId, revision: node.revision,
       episodeId: 'EP09', sceneId: 'S09', shotId: 'SH99',
       content: { ...node.content, prompt: '修改原节点的完整视频提示词，已提交任务使用先前的快照。' },
-    })
-    const [editedSource] = (await query(page, ticket, { id: nodeId })).nodes
-    assert.equal(editedSource.revision, node.revision + 1)
-    await operate(page, ticket, 'delete_node', { operationId: randomUUID(), id: nodeId, revision: editedSource.revision })
-    const [deletedSource] = (await query(page, ticket, { id: nodeId })).nodes
-    assert.equal(deletedSource.deleted, true)
+    }
+    const blocked = await request(page, 'operation', { ticket, action: 'update_node', data: pendingEdit })
+    assert.equal(blocked.status, 423)
+    const [unchanged] = (await query(page, ticket, { id: nodeId })).nodes
+    assert.equal(unchanged.revision, node.revision)
     await writeFile(join(home, 'allow-fixture-result'), '')
     const completed = await poll(async () => {
       const { tasks } = await operate(page, ticket, 'tasks', {})
@@ -1392,12 +1400,17 @@ test('U4 native task drawer follows real Go worker in isolated provider fixture'
     await drawer.getByText('完成', { exact: true }).waitFor()
     await drawer.getByRole('button', { name: '查看结果', exact: true }).click()
     const resultCard = card(page, completed.resultNodeId)
-    await resultCard.getByRole('button', { name: '打开视频预览', exact: true }).click()
     const player = resultCard.locator('video')
+    await player.waitFor()
     assert.ok(await decodeVideoFrame(player))
     assert.ok(await player.evaluate(video => video.videoWidth > 0))
+    await operate(page, ticket, 'update_node', { ...pendingEdit, operationId: randomUUID() })
+    const [editedSource] = (await query(page, ticket, { id: nodeId })).nodes
+    assert.equal(editedSource.revision, node.revision + 1)
+    const [preserved] = (await query(page, ticket, { id: completed.resultNodeId })).nodes
+    assert.equal(preserved.content.path, completed.outputPath)
     await screenshot(page, '41-after-task-result-fixture.png')
-    console.info('U4 persisted queue PASS: polling did not lock editing; source edit and tombstone preserved the submitted task and result lineage; existing MP4 decoded from the fixture result')
+    console.info('U4 persisted queue PASS: polling protected the task source; editing resumed afterward and preserved result lineage and playback')
   }, { providerFixture: true })
 })
 
@@ -1456,5 +1469,301 @@ test('U5 native video editors retain ordered media and inline prompts', { timeou
     }
     assert.equal((await operate(page, ticket, 'tasks', {})).tasks.length, 0)
     console.info('U5 native video editors PASS: I2V first/tail, ordered R2V image/video/audio, V2V source, inline prompts and no generation')
+  })
+})
+
+test('Native canvas uploads media and sends the connected PNG to the configured video endpoint', {
+  timeout: 125_000, skip: !hasImage || !hasVideo || !existsSync(projectImageAsset),
+}, async () => {
+  const received = []
+  const endpoint = createHTTPServer(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    received.push({ method: req.method, url: req.url, data: Buffer.concat(chunks) })
+    // The test captures the production request without returning a synthetic result.
+    res.writeHead(422, { 'Content-Type': 'application/json' }).end('{"error":"Local request capture"}')
+  })
+  await new Promise((resolve, reject) => endpoint.once('error', reject).listen(0, '127.0.0.1', resolve))
+  try {
+    await withWeb(async ({ page, records, home }) => {
+      const [record] = records
+      const settings = (action, data) => ok(page, 'providers', { action, data })
+      const configured = await settings('channel_save', { channel: {
+        name: '回环请求验收', protocol: 'custom-rest', baseUrl: 'http://127.0.0.1:' + endpoint.address().port,
+        advanced: {
+          submitUrl: '/jobs', submitMethod: 'POST', auth: 'none',
+          fields: { firstFrame: 'input.first_frame', duration: 'input.duration' },
+          taskIdPath: 'id', queryUrl: '/jobs/{taskId}', statusPath: 'status',
+          statusMap: { done: 'completed', error: 'failed' }, outputUrlPath: 'url',
+        },
+      } })
+      const saved = await settings('provider_save', {
+        revision: configured.revision,
+        profile: {
+          name: '回环首帧预设', channelId: configured.channels[0].id, model: 'capture-i2v',
+          modes: ['i2v'], defaults: { duration: 4 }, limits: { durations: [4, 8] },
+        },
+      })
+      const profileId = saved.profiles[0].id
+      await select(page, record)
+      await open(page, record)
+      await sidebarMode(page, 'fullscreen').click()
+      let ticket = await ticketFor(page, record.sessionId)
+
+      const png = await readFile(imageAsset)
+      const drop = await page.evaluateHandle(({ filename, data }) => {
+        const transfer = new DataTransfer()
+        transfer.items.add(new File([Uint8Array.from(atob(data), byte => byte.charCodeAt(0))], filename, { type: 'image/png' }))
+        return transfer
+      }, { filename: basename(imageAsset), data: png.toString('base64') })
+      const pane = flow(page).locator('.react-flow__pane')
+      const bounds = await pane.boundingBox()
+      await pane.dispatchEvent('drop', { dataTransfer: drop,
+        clientX: bounds.x + bounds.width * .45, clientY: bounds.y + bounds.height * .35 })
+      await drop.dispose()
+      const image = await poll(async () => (await query(page, ticket, { type: 'image' })).nodes.find(node => node.content.path),
+        'dropping the real PNG did not create a persistent image')
+      await card(page, image.id).locator('img').first().evaluate(async element => {
+        await element.decode()
+        if (!element.naturalWidth || !element.naturalHeight) throw new Error('Uploaded image did not decode')
+      })
+
+      const emptyDraft = await pick(page, '图片')
+      await emptyDraft.getByRole('textbox', { name: '节点名称', exact: true }).fill('本地上传图片验收')
+      await emptyDraft.getByRole('button', { name: '创建节点', exact: true }).click()
+      const emptyImage = await poll(async () => (await query(page, ticket, { q: '本地上传图片验收' })).nodes[0],
+        'empty image node was not created')
+      const uploadImage = page.waitForEvent('filechooser')
+      await card(page, emptyImage.id).getByRole('button', { name: '上传图片', exact: true }).click()
+      await (await uploadImage).setFiles(projectImageAsset)
+      await poll(async () => (await query(page, ticket, { id: emptyImage.id })).nodes[0].content.path,
+        'image node upload did not save the asset')
+      await card(page, emptyImage.id).locator('img').first().evaluate(element => element.decode())
+
+      const clipDraft = await pick(page, '视频素材')
+      const clipUpload = clipDraft.getByRole('button', { name: '上传视频', exact: true })
+      const chooser = page.waitForEvent('filechooser')
+      await clipUpload.click()
+      await (await chooser).setFiles(videoAsset)
+      await clipDraft.getByRole('button', { name: '上传视频', exact: true }).waitFor()
+      await clipDraft.getByRole('button', { name: '创建节点', exact: true }).click()
+      const clip = await poll(async () => (await query(page, ticket, { type: 'video' })).nodes.find(node => node.content.path),
+        'uploading a real MP4 did not create a persistent video')
+      await fit(page)
+      await card(page, clip.id).locator('.drama-node-titlebar').click()
+      assert.ok(await decodeVideoFrame(card(page, clip.id).locator('video')))
+
+      const prompt = '以 @图片1 为首帧，保留小鸭轮廓。固定中景，停顿半秒后渐亮，保留室内环境声。'
+      const formFor = node => card(page, node.id).getByRole('form', { name: '编辑节点', exact: true })
+      async function draftVideo(title, mode = 't2v') {
+        const draft = await pick(page, mode)
+        await draft.getByRole('textbox', { name: '节点名称', exact: true }).fill(title)
+        await draft.getByRole('textbox', { name: '完整视频提示词', exact: true }).fill(prompt.replace('以 @图片1 为首帧，', ''))
+        await draft.getByRole('button', { name: '创建节点', exact: true }).click()
+        return poll(async () => (await query(page, ticket, { q: title })).nodes.find(node => node.content.title === title),
+          'video draft was not saved: ' + title)
+      }
+      const first = await draftVideo('首帧连接验收甲')
+      const second = await draftVideo('首帧连接验收乙')
+      await clickBlank(page)
+      const edge = target => graphEdge(page, image.id, target.id)
+      for (const target of [first, second]) {
+        await dragReference(page, image.id, target.id)
+        await poll(async () => (await query(page, ticket)).edges.some(item => item.source === image.id && item.target === target.id),
+          'canvas drag did not save the image reference')
+        await edge(target).waitFor()
+      }
+
+      const firstBox = card(page, first.id).locator('.drama-node-titlebar')
+      const nodeGeometry = node => card(page, node.id).evaluate(element => {
+        const box = element.getBoundingClientRect()
+        const handle = selector => {
+          const rect = element.querySelector(selector).getBoundingClientRect()
+          return [Math.round(rect.left - box.left), Math.round(rect.top - box.top)]
+        }
+        return {
+          transform: element.closest('.react-flow__node').style.transform,
+          input: handle('.drama-port-input'), output: handle('.drama-port-output'),
+        }
+      })
+      await clickBlank(page)
+      await fit(page)
+      const before = await nodeGeometry(first)
+      await firstBox.click()
+      await formFor(first).waitFor()
+      assert.deepEqual(await nodeGeometry(first), before, 'opening the editor moved the node or its handles')
+      assert.ok(await formFor(first).evaluate(element => element.getBoundingClientRect().top >=
+        element.closest('article').getBoundingClientRect().bottom), 'editor did not open below the node card')
+      await formFor(first).getByRole('button', { name: '生成预设', exact: true }).waitFor()
+      await formFor(first).getByText(/^首帧 · /u).first().waitFor()
+      const promptBox = formFor(first).getByRole('textbox', { name: '完整视频提示词', exact: true })
+      await promptBox.fill(prompt + '。')
+      await promptBox.press('End')
+      await promptBox.press('Backspace')
+      assert.equal(await promptBox.inputValue(), prompt)
+      assert.ok(!(await query(page, ticket, { id: first.id })).nodes[0].deleted)
+      await formFor(first).getByRole('button', { name: '生成预设', exact: true }).click()
+      await page.getByRole('menuitem', { name: '回环首帧预设', exact: true }).click()
+      await formFor(first).getByRole('button', { name: '时长（秒）', exact: true }).click()
+      await page.getByRole('menuitem', { name: '8', exact: true }).click()
+      await formFor(first).getByRole('button', { name: '保存修改', exact: true }).click()
+      await poll(async () => (await query(page, ticket, { id: first.id })).nodes[0].content.params?.duration === 8,
+        'node-local model parameters were not saved')
+      await fit(page)
+      await card(page, second.id).locator('.drama-node-titlebar').click()
+      await formFor(second).waitFor()
+      assert.equal(await formFor(first).count(), 0, 'switching selection left the first editor open')
+      await clickBlank(page)
+      await formFor(second).waitFor({ state: 'hidden' })
+      await fit(page)
+
+      const path = edge(second).locator('.react-flow__edge-interaction')
+      const hit = await path.evaluate(element => {
+        const total = element.getTotalLength()
+        for (const fraction of [.5, .3, .7, .4, .6, .8, .9, .2]) {
+          const point = element.getPointAtLength(total * fraction).matrixTransform(element.getScreenCTM())
+          if (document.elementFromPoint(point.x, point.y) === element) return { x: point.x, y: point.y }
+        }
+        return null
+      })
+      assert.ok(hit, 'saved image reference could not be selected')
+      await page.mouse.click(hit.x, hit.y)
+      await poll(async () => (await edge(second).getAttribute('class'))?.includes('selected'), 'edge did not highlight on click')
+      await page.keyboard.press('Delete')
+      await poll(async () => !(await query(page, ticket)).edges.some(item => item.source === image.id && item.target === second.id),
+        'deleting the selected edge did not remove the reference')
+      const afterDelete = await query(page, ticket, { id: second.id })
+      assert.ok(!afterDelete.nodes[0].content.mixedListOrder?.includes(image.id), 'removed image remained a model reference')
+
+      const projectAsset = { id: randomUUID(), type: 'image',
+        content: { title: '项目原有餐厅门口图', path: 'assets/images/restaurant.png' } }
+      const assets = join(home, record.workspaceName, 'assets', 'images')
+      await copyFile(projectImageAsset, join(assets, 'restaurant.png'))
+      await append(page, ticket, [projectAsset])
+      await fit(page)
+      await card(page, second.id).locator('.drama-node-titlebar').click()
+      await formFor(second).getByRole('button', { name: '从项目资产添加', exact: true }).click()
+      await page.getByRole('menuitem').filter({ hasText: projectAsset.content.title }).click()
+      await formFor(second).getByRole('button', { name: '保存修改', exact: true }).click()
+      await poll(async () => (await query(page, ticket)).edges.some(item => item.source === projectAsset.id && item.target === second.id),
+        'selecting a project asset did not persist a reference')
+
+      await page.reload({ waitUntil: 'domcontentloaded' })
+      await panel(page).and(page.locator(`[data-session-id="${record.sessionId}"][data-canvas-id]`)).waitFor()
+      ticket = await ticketFor(page, record.sessionId)
+      const reloaded = await query(page, ticket)
+      const restored = reloaded.nodes.find(node => node.id === first.id)
+      assert.equal(restored.content.prompt, prompt)
+      assert.equal(restored.content.profileId, profileId)
+      assert.equal(restored.content.params.duration, 8)
+      assert.deepEqual(restored.content.mixedListOrder, [image.id])
+      assert.ok(!restored.content.textList?.length)
+      assert.ok(reloaded.edges.some(item => item.source === image.id && item.target === first.id))
+      assert.ok(!reloaded.edges.some(item => item.source === image.id && item.target === second.id))
+      assert.deepEqual(reloaded.nodes.find(item => item.id === second.id).content.mixedListOrder, [projectAsset.id])
+      assert.ok(reloaded.edges.some(item => item.source === projectAsset.id && item.target === second.id))
+      assert.equal((await operate(page, ticket, 'tasks', {})).tasks.length, 0, 'configuration silently submitted a generation')
+
+      await fit(page)
+      await card(page, first.id).locator('.drama-node-titlebar').click()
+      await card(page, first.id).getByRole('button', { name: '生成…', exact: true }).click()
+      await page.getByRole('dialog', { name: '确认生成', exact: true })
+        .getByRole('button', { name: '确认提交', exact: true }).click()
+      const outgoing = await poll(() => received[0], 'worker did not send a request to the configured channel')
+      assert.deepEqual([outgoing.method, outgoing.url], ['POST', '/jobs'])
+      const payload = JSON.parse(outgoing.data)
+      assert.equal(payload.model, 'capture-i2v')
+      assert.equal(payload.prompt, prompt)
+      assert.equal(payload.input.duration, 8)
+      assert.match(payload.input.first_frame, /^data:image\/png;base64,/u)
+      assert.ok(Buffer.from(payload.input.first_frame.split(',')[1], 'base64').equals(png),
+        'upstream image bytes differed from the uploaded PNG')
+      const failure = await poll(async () => (await operate(page, ticket, 'tasks', {})).tasks.find(task =>
+        task.nodeId === first.id && task.status === 'failed'), 'provider rejection was not shown as a failed task')
+      assert.equal(failure.resultNodeId, undefined)
+      assert.deepEqual((await query(page, ticket, { id: first.id })).nodes[0].content, restored.content)
+      assert.equal(received.length, 1, 'the deliberate rejection should not be retried')
+    })
+  } finally {
+    await new Promise(resolve => endpoint.close(resolve))
+  }
+})
+
+test('Native canvas keyboard operations respect editing and preserve the copied subgraph', {
+  timeout: 85_000, skip: !existsSync(projectImageAsset),
+}, async () => {
+  await withWeb(async ({ page, context, records, home }) => {
+    const [record] = records
+    await context.grantPermissions(['clipboard-read', 'clipboard-write'])
+    await select(page, record)
+    await open(page, record)
+    await sidebarMode(page, 'fullscreen').click()
+    const ticket = await ticketFor(page, record.sessionId)
+    const first = { id: randomUUID(), type: 'note', content: { title: '快捷键来源', description: '来源文本。' } }
+    const second = { id: randomUUID(), type: 'note', content: { title: '快捷键目标', description: '目标文本。' } }
+    await append(page, ticket, [first, second], [{ source: first.id, target: second.id }])
+    await fit(page)
+    const boxSelect = flow(page).getByRole('button', { name: '框选', exact: true })
+    await boxSelect.click()
+    await dragCanvasBlank(page, true)
+    await boxSelect.click()
+    await clickBlank(page)
+    await page.keyboard.press('Control+a')
+    await flow(page).getByText(/已选 2/u).waitFor()
+    await page.keyboard.press('Control+c')
+    await page.keyboard.press('Control+v')
+    const duplicated = await poll(async () => {
+      const graph = await query(page, ticket)
+      return graph.nodes.length === 4 && graph
+    }, 'copy and paste did not duplicate both selected nodes')
+    const original = new Set([first.id, second.id])
+    const copies = duplicated.nodes.filter(node => !original.has(node.id))
+    assert.deepEqual(new Set(copies.map(node => node.content.description)),
+      new Set([first.content.description, second.content.description]))
+    assert.equal(duplicated.edges.filter(edge => copies.some(node => node.id === edge.source) &&
+      copies.some(node => node.id === edge.target)).length, 1)
+    await page.keyboard.press('Control+z')
+    await poll(async () => (await query(page, ticket)).nodes.length === 2, 'undo did not remove pasted nodes')
+    await page.keyboard.press('Control+Shift+z')
+    await poll(async () => (await query(page, ticket)).nodes.length === 4, 'redo did not restore pasted nodes')
+    await clickBlank(page)
+    await page.keyboard.press('Control+a')
+    await page.keyboard.press('Backspace')
+    await poll(async () => (await query(page, ticket)).nodes.length === 0, 'Backspace did not remove the selected nodes')
+    await page.keyboard.press('Control+z')
+    await poll(async () => (await query(page, ticket)).nodes.length === 4, 'undo did not restore the deleted selection')
+    await fit(page)
+    await card(page, first.id).locator('.drama-node-titlebar').click()
+    await card(page, first.id).getByRole('form', { name: '编辑节点', exact: true }).waitFor()
+    await page.keyboard.press('Delete')
+    await poll(async () => (await query(page, ticket, { id: first.id })).nodes[0].deleted,
+      'Delete did not remove the selected node')
+    assert.ok(!(await query(page, ticket)).edges.some(edge => edge.source === first.id))
+
+    const png = await readFile(projectImageAsset)
+    await page.evaluate(async base64 => {
+      const blob = new Blob([Uint8Array.from(atob(base64), byte => byte.charCodeAt(0))], { type: 'image/png' })
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
+    }, png.toString('base64'))
+    await clickBlank(page)
+    await page.keyboard.press('Control+v')
+    const image = await poll(async () => (await query(page, ticket, { type: 'image' })).nodes.find(node => node.content.path),
+      'Ctrl+V with a real clipboard image did not create a node')
+    await card(page, image.id).locator('img').first().evaluate(element => element.decode())
+    await fit(page)
+    await card(page, image.id).locator('.drama-node-titlebar').click()
+    await page.keyboard.press('Control+d')
+    const copiesOfImage = await poll(async () => {
+      const { nodes } = await query(page, ticket, { type: 'image' })
+      return nodes.length === 2 && nodes
+    }, 'Ctrl+D did not duplicate the image instance')
+    assert.ok(copiesOfImage.every(node => node.content.path === image.content.path))
+    const duplicate = copiesOfImage.find(node => node.id !== image.id)
+    await card(page, duplicate.id).locator('.drama-node-titlebar').click()
+    await flow(page).focus()
+    await page.keyboard.press('Delete')
+    await poll(async () => (await query(page, ticket, { type: 'image' })).nodes.length === 1,
+      'deleting a duplicate should leave the other instance')
+    assert.ok(existsSync(join(home, record.workspaceName, image.content.path)), 'deleting a node removed its source file')
   })
 })

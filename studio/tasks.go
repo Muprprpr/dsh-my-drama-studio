@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -80,14 +81,14 @@ func (p *project) submit(ctx context.Context, r Request, providers providerRegis
 			return nil, err
 		}
 		if kind == "video" {
-			if err := validateVideo(ctx, tx, args.NodeID); err != nil {
+			if err := validateVideo(ctx, tx, args.NodeID, true); err != nil {
 				return nil, err
 			}
 		}
 		if providers == nil {
 			return nil, providerUnavailable
 		}
-		input, pinned, err := generationInput(ctx, tx, args.NodeID, kind, snapshot)
+		input, pinned, sourceIDs, err := generationInput(ctx, tx, args.NodeID, kind, snapshot)
 		if err != nil {
 			return nil, err
 		}
@@ -104,7 +105,7 @@ func (p *project) submit(ctx context.Context, r Request, providers providerRegis
 		if err != nil {
 			return nil, err
 		}
-		encoded, err := json.Marshal(generationRequest{GenerationInput: input, SourceGroup: &group})
+		encoded, err := json.Marshal(generationRequest{GenerationInput: input, SourceGroup: &group, SourceNodeIDs: sourceIDs})
 		if err != nil {
 			return nil, err
 		}
@@ -134,13 +135,12 @@ func submissionNode(ctx context.Context, tx *sql.Tx, id string) (kind, snapshot 
 		return "", "", err
 	}
 	var content struct {
-		Prompt string `json:"prompt"`
-		Mode   string `json:"mode"`
-		Path   string `json:"path"`
-		URL    string `json:"url"`
+		Mode string `json:"mode"`
+		Path string `json:"path"`
+		URL  string `json:"url"`
 	}
-	if (kind != "image" && kind != "video") || json.Unmarshal([]byte(snapshot), &content) != nil || strings.TrimSpace(content.Prompt) == "" {
-		return "", "", invalid("选择内联完整提示词的图片或视频节点")
+	if (kind != "image" && kind != "video") || json.Unmarshal([]byte(snapshot), &content) != nil {
+		return "", "", invalid("请选择图片或视频生成节点")
 	}
 	if kind == "video" && content.Mode == "" && (content.Path != "" || content.URL != "") {
 		return "", "", invalid("请选择视频生成草稿")
@@ -303,7 +303,7 @@ func (p *project) controlTask(ctx context.Context, r Request) (any, error) {
 	})
 }
 
-func generationInput(ctx context.Context, tx *sql.Tx, id, kind, snapshot string) (GenerationInput, string, error) {
+func generationInput(ctx context.Context, tx *sql.Tx, id, kind, snapshot string) (GenerationInput, string, []string, error) {
 	var content struct {
 		Prompt    string          `json:"prompt"`
 		Order     []string        `json:"mixedListOrder"`
@@ -312,59 +312,93 @@ func generationInput(ctx context.Context, tx *sql.Tx, id, kind, snapshot string)
 		Params    json.RawMessage `json:"params"`
 	}
 	if err := json.Unmarshal([]byte(snapshot), &content); err != nil {
-		return GenerationInput{}, "", invalid("生成节点的媒体引用无效")
+		return GenerationInput{}, "", nil, invalid("生成节点格式无效")
 	}
 	input := GenerationInput{Type: kind, Prompt: content.Prompt, Mode: content.Mode}
-	if kind == "video" {
-		params, err := decodeVideoParams(content.Params)
-		if err != nil {
-			return GenerationInput{}, "", err
-		}
-		input.Params = params
+	params, err := decodeVideoParams(content.Params)
+	if err != nil {
+		return GenerationInput{}, "", nil, err
 	}
+	input.Params = params
+	if kind == "image" {
+		content.Order, err = imageReferenceOrder(ctx, tx, id, content.Order)
+		if err != nil {
+			return GenerationInput{}, "", nil, err
+		}
+	}
+	sourceIDs := []string{}
 	kinds := make([]string, 0, len(content.Order))
+	var text []string
 	for _, reference := range content.Order {
-		var raw, refType string
-		err := tx.QueryRowContext(ctx, `SELECT type,content FROM nodes JOIN edges ON edges.source=nodes.id
-  WHERE edges.target=? AND nodes.id=?`, id, reference).Scan(&refType, &raw)
+		var source Node
+		var raw string
+		err := tx.QueryRowContext(ctx, `SELECT nodes.type,nodes.content FROM nodes JOIN edges ON edges.source=nodes.id
+			WHERE edges.target=? AND nodes.id=? AND nodes.deleted=0`, id, reference).Scan(&source.Type, &raw)
+		if errors.Is(err, sql.ErrNoRows) && kind == "image" {
+			continue // Legacy archived image links do not participate in current generation.
+		}
 		if errors.Is(err, sql.ErrNoRows) {
-			return GenerationInput{}, "", invalid("生成节点引用了未连接媒体")
+			return GenerationInput{}, "", nil, invalid("视频节点引用了已移除的素材")
 		}
 		if err != nil {
-			return GenerationInput{}, "", err
+			return GenerationInput{}, "", nil, err
+		}
+		source.ID, source.Content = reference, json.RawMessage(raw)
+		sourceIDs = append(sourceIDs, reference)
+		if kind == "image" && isTextNode(source.Type) {
+			if context := nodeText(source.Content); context != "" {
+				text = append(text, context)
+			}
+			continue
+		}
+		if source.Type != "image" && (kind != "video" || !isVideoMedia(source.Type)) {
+			return GenerationInput{}, "", nil, invalid("生成节点包含不兼容的参考素材")
+		}
+		resolved, err := resolveMediaNode(ctx, tx, source)
+		if err != nil {
+			return GenerationInput{}, "", nil, err
+		}
+		if resolved.ID == "" {
+			return GenerationInput{}, "", nil, invalid("等待上游节点产出素材")
+		}
+		if resolved.ID != source.ID {
+			sourceIDs = append(sourceIDs, resolved.ID)
 		}
 		var media struct {
 			URL  string `json:"url"`
 			Path string `json:"path"`
 		}
-		if refType != "image" && (kind != "video" || refType != "video" && refType != "audio") {
-			return GenerationInput{}, "", invalid("生成节点只能读取实际连接的媒体")
+		if json.Unmarshal(resolved.Content, &media) != nil || (!providerURL(media.URL) && media.Path == "") {
+			return GenerationInput{}, "", nil, invalid("模型参考素材需要项目内媒体或可访问的外部 HTTP/HTTPS URL")
 		}
-		if json.Unmarshal([]byte(raw), &media) != nil || (!providerURL(media.URL) && media.Path == "") {
-			return GenerationInput{}, "", invalid("模型参考素材需要项目内媒体或可访问的外部 HTTP/HTTPS URL")
-		}
-		ref := GenerationReference{Type: refType, Path: media.Path}
+		ref := GenerationReference{Type: source.Type, Path: media.Path}
 		if providerURL(media.URL) {
 			ref.URL = media.URL
 		}
 		input.References = append(input.References, ref)
-		kinds = append(kinds, refType)
+		kinds = append(kinds, source.Type)
+	}
+	if len(text) > 0 {
+		prompt := append([]string{strings.TrimSpace(input.Prompt)}, text...)
+		input.Prompt = strings.TrimSpace(strings.Join(prompt, "\n\n"))
+	}
+	if strings.TrimSpace(input.Prompt) == "" {
+		return GenerationInput{}, "", nil, invalid("请填写生成提示词")
 	}
 	if kind == "image" {
 		if input.Mode != "" && input.Mode != "t2i" {
-			return GenerationInput{}, "", invalid("图片节点需要 T2I 预设")
+			return GenerationInput{}, "", nil, invalid("图片生成需要 T2I 预设")
 		}
 		input.Mode = "t2i"
-		return input, content.ProfileID, nil
+		return input, content.ProfileID, sourceIDs, nil
 	}
-	count := len(input.References)
 	if input.Mode == "" {
 		for _, media := range kinds {
 			if media != "image" {
-				return GenerationInput{}, "", invalid("包含视频或音频素材的节点需要明确生成方式")
+				return GenerationInput{}, "", nil, invalid("引用视频或音频素材时请明确选择生成方式")
 			}
 		}
-		switch count {
+		switch len(kinds) {
 		case 0:
 			input.Mode = "t2v"
 		case 1:
@@ -374,9 +408,74 @@ func generationInput(ctx context.Context, tx *sql.Tx, id, kind, snapshot string)
 		}
 	}
 	if err := validateVideoInputs(input.Mode, kinds); err != nil {
-		return GenerationInput{}, "", err
+		return GenerationInput{}, "", nil, err
 	}
-	return input, content.ProfileID, nil
+	if err := validateVideoPromptReferences(input.Prompt, kinds); err != nil {
+		return GenerationInput{}, "", nil, err
+	}
+	return input, content.ProfileID, sourceIDs, nil
+}
+
+func nodeText(raw json.RawMessage) string {
+	var data struct{ Text, Description, Prompt string }
+	if json.Unmarshal(raw, &data) != nil {
+		return ""
+	}
+	for _, candidate := range []string{data.Text, data.Description, data.Prompt} {
+		if text := strings.TrimSpace(candidate); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func imageReferenceOrder(ctx context.Context, tx *sql.Tx, target string, order []string) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT source,type FROM edges JOIN nodes ON source=nodes.id
+		WHERE target=? AND deleted=0 ORDER BY edges.rowid`, target)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var connected []string
+	for rows.Next() {
+		var id, kind string
+		if err := rows.Scan(&id, &kind); err != nil {
+			return nil, err
+		}
+		if kind == "image" || isTextNode(kind) {
+			connected = append(connected, id)
+		}
+	}
+	var effective []string
+	for _, source := range append(slices.Clone(order), connected...) {
+		if slices.Contains(connected, source) && !slices.Contains(effective, source) {
+			effective = append(effective, source)
+		}
+	}
+	return effective, rows.Err()
+}
+
+func taskLockedNodes(ctx context.Context, tx *sql.Tx) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `WITH RECURSIVE active AS (
+		SELECT node_id,input FROM tasks WHERE status IN ('pending','submitting','polling','paused')
+	), locked(id) AS (
+		SELECT node_id FROM active
+		UNION SELECT value FROM active,json_each(active.input,'$.sourceNodeIds') WHERE value IS NOT NULL
+		UNION SELECT source FROM edges JOIN locked ON target=locked.id
+	) SELECT id FROM locked ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 func providerURL(value string) bool {

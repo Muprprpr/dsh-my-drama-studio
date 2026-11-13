@@ -65,7 +65,7 @@ type Service struct {
 	mu              sync.Mutex
 	projects        map[string]*project
 	provider        providerRegistry
-	humanWriteCheck func(context.Context, string, string, []string) (bool, error)
+	humanWriteCheck func(context.Context, string, string, []string, []string) (bool, error)
 	wake            chan struct{}
 	pollInterval    time.Duration
 	pollTimeout     time.Duration
@@ -175,6 +175,9 @@ func (s *Service) open(ctx context.Context, directory string, create bool) (*pro
 		err = migrateTaskFields(ctx, tx)
 	}
 	if err == nil {
+		err = repairVideoReferences(ctx, tx)
+	}
+	if err == nil {
 		_, err = tx.ExecContext(ctx, `INSERT INTO canvas_meta VALUES(1,?) ON CONFLICT DO NOTHING`, uuid.NewString())
 	}
 	if err == nil {
@@ -257,7 +260,7 @@ func (s *Service) Execute(ctx context.Context, r Request) (any, error) {
 		if err := decodeData(r.Data, &struct{}{}); err != nil {
 			return nil, err
 		}
-	case "update_node", "delete_node", "update_edge", "delete_edge":
+	case "update_node", "delete_node", "update_edge", "delete_edge", "canvas_delete", "canvas_restore":
 		if r.Actor != "human" {
 			return nil, humanWriteOnly
 		}
@@ -285,11 +288,11 @@ func (s *Service) Execute(ctx context.Context, r Request) (any, error) {
 	case "query":
 		return p.query(ctx, r)
 	case "append":
-		return p.append(ctx, r)
+		return s.append(ctx, p, r)
 	case "connected_sessions":
 		ids, err := boundSessionIDs(ctx, p.db)
 		return connectedSessionsResult{SessionIDs: ids}, err
-	case "update_node", "delete_node", "update_edge", "delete_edge":
+	case "update_node", "delete_node", "update_edge", "delete_edge", "canvas_delete", "canvas_restore":
 		return s.humanWrite(ctx, p, r)
 	case "permission":
 		return p.permission(ctx, r)

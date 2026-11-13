@@ -6,7 +6,7 @@ import {
   Button, IconChevronDownOutlineRegular, IconPanelLeftOutlineRegular, Menu, MenuItemButton, StateDot, Switch, Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import shellStyle from './studio-shell.css'
-import { generateT2V, generateI2V, generateR2V, generateV2V, initialize, mediaURL, operation, providerRequest, subscribe } from './studio-api.js'
+import { generateT2V, generateI2V, generateR2V, generateV2V, initialize, mediaURL, operation, providerRequest, subscribe, uploadMedia } from './studio-api.js'
 
 const kind = 'drama-canvas'
 const tabId = 'dsh-my-drama-studio.canvas'
@@ -207,7 +207,7 @@ function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
     const controller = new AbortController()
     subscribe(ticket, session.status.eventSeq, controller.signal, batch => {
       if (typeof batch.aiRunning === 'boolean') {
-        setActivity({ ticket, running: batch.aiRunning })
+        setActivity({ ticket, running: batch.aiRunning, nodeIds: batch.agentLockedNodeIds ?? [] })
         return
       }
       if (!batch.events.length || batch.events.some(event => event.type === 'binding' || event.type === 'permission')) {
@@ -244,7 +244,6 @@ function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
       setRevision(value => value + 1)
       return result
     } catch (failure) {
-      if (failure.status === 423) throw new Error('AI 工作期间提交的操作已被拒绝。', { cause: failure })
       if (failure.status === 409) {
         setRevision(value => value + 1)
         throw new Error('画布内容已变化。请先查看最新内容，再决定如何保存。', { cause: failure })
@@ -273,8 +272,7 @@ function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
     ? view?.result : null
   const status = snapshot?.status ?? session?.status
   const aiRunning = activity?.ticket === ticket ? activity?.running : status?.aiRunning
-  const mutationReason = aiRunning === false ? '' : aiRunning === true
-    ? 'AI 工作中，暂不能修改或删除已有内容。' : '正在检查 AI 活动状态。'
+  const agentLockedNodeIds = activity && activity.ticket === ticket ? activity.nodeIds : status?.agentLockedNodeIds
   const issue = error || sessionError
   return <section className="drama-shell" data-testid="drama-canvas" data-session-id={sessionId}
     data-workspace-id={session?.status.workspaceId} data-canvas-id={session?.status.canvasId ?? undefined}>
@@ -287,11 +285,12 @@ function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
         <StateDot state="done" size={7} />{status.connectedSessions} 个会话
       </span>}
       {connected && aiRunning === true && <span className="drama-shell-connected drama-shell-activity"
-        role="status" title={mutationReason}>AI 工作中</span>}
+        role="status" title="正在保护本轮使用的节点和依赖">AI 工作中</span>}
     </header>
     <div className="drama-shell-body">
-      {connected && snapshot ? <CanvasViewport snapshot={snapshot} filters={filters}
-        setFilters={setFilters} append={append} mutate={mutate} mutationReason={mutationReason}
+      {connected && snapshot ? <CanvasViewport key={status.canvasId + ':' + sessionId} snapshot={snapshot} filters={filters}
+        setFilters={setFilters} append={append} mutate={mutate} agentLockedNodeIds={agentLockedNodeIds}
+        uploadFile={(type, file) => uploadMedia(ticket, type, file)}
         mediaURL={node => mediaURL(ticket, node)}
         generationProfiles={providerData?.profiles ?? []} generationDefaults={providerData?.generation}
         queryCanvas={queryCanvas} submitGeneration={submitGeneration} changeTask={changeTask} />

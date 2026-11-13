@@ -167,6 +167,7 @@
 }
 
 .drama-canvas-content .drama-edge-media { --xy-edge-stroke: var(--drama-accent); }
+.drama-canvas-content .react-flow__edge.selected .react-flow__edge-path { stroke-width: 3; }
 .drama-canvas-content .drama-edge-version .react-flow__edge-path { stroke-dasharray: 5 4; }
 .drama-canvas-content .react-flow__edge-text { fill: var(--drama-muted); }
 .drama-canvas-content .react-flow__edge-textbg { fill: var(--drama-fill); }
@@ -177,6 +178,34 @@
   background: var(--dsw-alias-bg-module-platform);
   border-radius: var(--dsw-radius-md);
 }
+.drama-v2-asset-picker {
+  display: grid;
+  gap: 12px;
+  width: min(460px, calc(100vw - 72px));
+}
+.drama-v2-asset-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+  align-content: start;
+  gap: 8px;
+  max-height: 48dvh;
+  overflow: auto;
+}
+.drama-v2-asset-option {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding: 5px;
+  color: inherit;
+  background: var(--dsw-alias-bg-layer-1);
+  border: 1px solid var(--dsw-alias-border-l3);
+  border-radius: 8px;
+  cursor: pointer;
+  text-align: left;
+}
+.drama-v2-asset-option:hover { border-color: var(--dsw-alias-link); }
+.drama-v2-asset-option :is(img, video) { width: 100%; aspect-ratio: 4 / 3; object-fit: contain; }
+.drama-v2-asset-option span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .drama-v2-preview :is(img, video) {
   display: block;
   max-inline-size: 100%;

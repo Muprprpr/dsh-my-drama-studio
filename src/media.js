@@ -1,5 +1,6 @@
-import { createReadStream } from 'node:fs'
-import { realpath, stat } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { createReadStream, createWriteStream } from 'node:fs'
+import { mkdir, realpath, stat, unlink } from 'node:fs/promises'
 import { extname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { StudioError } from './kernel.js'
@@ -11,6 +12,43 @@ const formats = {
   audio: { '.wav': 'audio/wav', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.ogg': 'audio/ogg' },
 }
 const assetPrefixes = { image: ['assets', 'images'], video: ['assets'], audio: ['assets', 'audio'] }
+const maxUploadBytes = 128 * 1024 * 1024
+
+export async function importMedia(req, workspacePath, type, name) {
+  const extension = typeof name === 'string' && extname(name).toLowerCase()
+  if (typeof type !== 'string' || !Object.hasOwn(formats, type) || !Object.hasOwn(formats[type], extension)) {
+    throw new StudioError(415, '请选择支持的图片、视频或音频文件')
+  }
+  const declaredSize = Number(req.headers['content-length'])
+  if (declaredSize > maxUploadBytes) throw new StudioError(413, '素材文件不能超过 128 MB')
+  const folders = type === 'video' ? ['assets', 'videos'] : assetPrefixes[type]
+  const base = await realpath(workspacePath)
+  let dir = base
+  for (const folder of folders) {
+    dir = resolve(dir, folder)
+    await mkdir(dir).catch(error => { if (error.code !== 'EEXIST') throw error })
+    if ((await realpath(dir)).toLowerCase() !== dir.toLowerCase()) {
+      throw new StudioError(409, '素材目录已重定向，请检查项目目录')
+    }
+  }
+  const filename = randomUUID() + extension
+  const file = resolve(dir, filename)
+  let bytes = 0
+  try {
+    await pipeline(req.iterator({ destroyOnReturn: false }), async function* (chunks) {
+      for await (const chunk of chunks) {
+        bytes += chunk.length
+        if (bytes > maxUploadBytes) throw new StudioError(413, '素材文件不能超过 128 MB')
+        yield chunk
+      }
+    }, createWriteStream(file, { flags: 'wx' }))
+    if (!bytes) throw new StudioError(400, '素材文件为空')
+  } catch (error) {
+    if (error.code !== 'EEXIST') await unlink(file).catch(() => {})
+    throw error
+  }
+  return { path: [...folders, filename].join('/'), title: name.split(/[\\/]/).at(-1).slice(0, 160) }
+}
 
 export async function streamMedia(req, res, workspacePath, node) {
   const path = node?.content.path

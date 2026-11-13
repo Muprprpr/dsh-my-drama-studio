@@ -29,8 +29,8 @@ async function startActivityCheck(ctx, token, check) {
         }
         chunks.push(chunk)
       }
-      const { workspaceId, sessionId, sessionIds } = JSON.parse(Buffer.concat(chunks).toString('utf8'))
-      const allowed = check(workspaceId, sessionId, sessionIds) === true
+      const { workspaceId, sessionId, sessionIds, nodeIds } = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      const allowed = check(workspaceId, sessionId, sessionIds, nodeIds) === true
       res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ allowed }))
     } catch (error) {
       console.error('[my-drama-studio] Agent activity check:', error.message)

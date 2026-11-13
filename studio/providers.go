@@ -186,7 +186,10 @@ func validateProfile(profile ProviderProfile) error {
 			return invalid("预设 ID 无效")
 		}
 	}
-	hasInput := profile.Mode == "i2v" || profile.Mode == "r2v"
+	hasInput := profile.Mode == "i2v" || profile.Mode == "r2v" || profile.Mode == "t2i" && profile.InputField != ""
+	if profile.Mode == "t2i" && (profile.InputField != "") != (profile.Limits.References["image"] > 0) {
+		return invalid("参考图需要配置图片输入字段和数量上限")
+	}
 	if profile.Provider == "replicate" && hasInput {
 		if !fieldName.MatchString(profile.InputField) || strings.Contains(strings.ToLower(profile.InputField), "prompt") ||
 			slices.Contains([]string{"duration", "aspect_ratio", "resolution", "seed", "generate_audio", "output_format"}, profile.InputField) {

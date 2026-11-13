@@ -106,11 +106,12 @@ async function verify(ctx, signal) {
   })
 
   const sessions = ctx.sessionController
-  async function holdTurn(sessionId, { fail = false, owner } = {}) {
+  async function holdTurn(sessionId, { fail = false, owner, nodeId } = {}) {
     const agent = owner ?? (await sessions.resolveAgent(sessionId)).agent
     assert.equal(agent?.status, 'idle')
     const startSeq = agent.session.snapshotEvents().at(-1)?.seq ?? -1
     const hold = { release: new EventTarget(), entered: false }
+    if (nodeId) script.push({ call: { id: randomUUID(), name: 'drama_query', args: { id: nodeId } } })
     script.push({ hold, fail })
     const content = [{ type: 'text', text: 'Hold this native turn for the Workspace edit check.' }]
     if (owner) {
@@ -307,22 +308,23 @@ async function verify(ctx, signal) {
     assert.equal(response.status, 423, JSON.stringify(await response.json()))
   }
   await op(rebound.ticket, 'update_node', edit(noteId, 1, 'Manual edit while idle'))
-  const turnA = await holdTurn(a)
+  const turnA = await holdTurn(a, { nodeId: noteId })
   assert.equal((await init(b)).status.aiRunning, true)
   assert.equal((await init(c)).status.aiRunning, false)
   await locked(rebound.ticket, 'update_node', edit(noteId, 2, 'Blocked from Session B'))
   const duringId = randomUUID()
   await op(rebound.ticket, 'append', { nodes: [note(duringId, 'Manual append while AI is active')] })
   await op(cBound.ticket, 'update_node', edit(otherId, 1, 'Other Workspace still editable'))
-  const turnB = await holdTurn(b)
+  await op(rebound.ticket, 'update_node', edit(duringId, 1, 'Independent edit while A uses another node'))
+  const turnB = await holdTurn(b, { nodeId: duringId })
   turnA.finish()
   assert.equal((await turnA.ending()).kind, 'completed')
   assert.equal(turnB.agent.status, 'running')
-  await locked(aBound.ticket, 'delete_node', { id: duringId, revision: 1 })
+  await locked(aBound.ticket, 'delete_node', { id: duringId, revision: 2 })
   assert.equal(sessions.cancel({ sessionId: b }).accepted, true)
   assert.deepEqual(await turnB.ending(), { kind: 'aborted', reason: { kind: 'user' } })
   assert.equal((await init(a)).status.aiRunning, false)
-  await op(aBound.ticket, 'delete_node', { id: duringId, revision: 1 })
+  await op(aBound.ticket, 'delete_node', { id: duringId, revision: 2 })
 
   const binding = await holdTurn(a)
   await op(aBound.ticket, 'disconnect')
@@ -332,7 +334,7 @@ async function verify(ctx, signal) {
   binding.finish()
   assert.equal((await binding.ending()).kind, 'completed')
 
-  const failed = await holdTurn(a, { fail: true })
+  const failed = await holdTurn(a, { fail: true, nodeId: noteId })
   await locked(rebound.ticket, 'update_node', edit(noteId, 2, 'Still blocked before failure'))
   failed.finish()
   assert.equal((await failed.ending()).kind, 'error')
@@ -347,6 +349,11 @@ async function verify(ctx, signal) {
     await workspace.attachSession(disposableId)
     await op((await init(disposableId)).ticket, 'bind')
     await holdTurn(disposableId, { owner: handle.agent })
+    const read = await ctx.tools.execute({
+      agent: handle.agent, callId: randomUUID(), name: 'drama_query', arguments: { id: noteId }, signal,
+    })
+    assert.equal(read.isError, false, JSON.stringify(read.content))
+    assert.ok((await init(b)).status.agentLockedNodeIds.includes(noteId))
     await locked(rebound.ticket, 'delete_node', { id: noteId, revision: 3 })
   } finally {
     await handle.dispose()
@@ -358,7 +365,7 @@ async function verify(ctx, signal) {
   await writeFile(statePath, JSON.stringify({
     sessionId: b, canvasId: rebound.status.canvasId, ticket: rebound.ticket, videoId: video.id, noteId,
   }))
-  await holdTurn(a)
+  await holdTurn(a, { nodeId: noteId })
   await locked(rebound.ticket, 'delete_node', { id: noteId, revision: 4 })
   console.info(`[drama-agent-fixture] PASS native Agent: overlapping turns, other Workspace isolation, cancel/error/dispose unlock, Agent update/delete rejected, held turn at restart (${nativeCalls} native tool calls)`)
 }
@@ -378,9 +385,10 @@ async function runFixture() {
   assert.equal(process.platform, 'win32', 'Requires the Windows Desktop DSH installation')
   const file = fileURLToPath(import.meta.url)
   const build = resolve(dirname(file), '..', 'dist')
-  const host = join(build, 'host.js')
-  await access(host)
-  await access(join(build, 'studio.exe'))
+  const sourceHost = join(build, 'host.js')
+  const sourceKernel = process.env.DRAMA_UIUX_STUDIO_EXE ?? join(build, 'studio.exe')
+  await access(sourceHost)
+  await access(sourceKernel)
   const installation = join(process.env.LOCALAPPDATA, 'Programs', 'DeepSeek Harness')
   const executable = join(installation, 'DeepSeek Harness.exe')
   const cli = join(installation, 'resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/cli.js')
@@ -388,6 +396,9 @@ async function runFixture() {
   const scratch = resolve(dirname(file), '..', '.runtime')
   await mkdir(scratch, { recursive: true })
   const root = await mkdtemp(join(scratch, 'drama-native-agent-'))
+  const host = join(root, 'host.js')
+  await copyFile(sourceHost, host)
+  await copyFile(sourceKernel, join(root, 'studio.exe'))
   const overlay = join(root, 'fixture.yml')
   const fixture = join(root, 'agent-fixture.mjs')
   await copyFile(file, fixture)
@@ -401,7 +412,7 @@ async function runFixture() {
       windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
       env: {
         ...process.env, ELECTRON_RUN_AS_NODE: '1', DSH_HOME: join(root, 'home'),
-        DSH_AGENTS_HOME: join(root, 'agents'), DSH_TELEMETRY_DISABLED: '1', DSH_TOOLS_MODE: 'native',
+        DSH_AGENTS_HOME: join(root, 'agents'), DSH_TELEMETRY_DISABLED: '1', DSH_TOOLS_MODE: 'native', DEEPSEEK_API_KEY: '',
       },
     })
     const exited = once(child, 'exit')

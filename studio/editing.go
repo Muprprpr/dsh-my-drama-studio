@@ -11,13 +11,13 @@ import (
 
 var (
 	humanWriteOnly      = &requestError{http.StatusForbidden, "只有通过 DSH Web 的人工操作可以修改已有节点或连线"}
-	workspaceBusy       = &requestError{http.StatusLocked, "AI 工作中。全部已连接会话空闲后可保存或删除。"}
+	workspaceBusy       = &requestError{http.StatusLocked, "节点或引用正在被使用，请等待相关任务结束。"}
 	activityUnavailable = &requestError{http.StatusServiceUnavailable, "无法核实 DSH Agent 活动，暂不能修改或删除。"}
 	revisionConflict    = &requestError{http.StatusConflict, "节点已更新，请重新打开编辑。"}
 )
 
 // SetHumanWriteCheck installs the private Host activity check before serving IPC.
-func (s *Service) SetHumanWriteCheck(check func(ctx context.Context, workspaceID, sessionID string, connected []string) (bool, error)) {
+func (s *Service) SetHumanWriteCheck(check func(ctx context.Context, workspaceID, sessionID string, connected, nodeIDs []string) (bool, error)) {
 	s.humanWriteCheck = check
 }
 
@@ -104,24 +104,11 @@ type editResult struct {
 }
 
 func (s *Service) humanWrite(ctx context.Context, p *project, r Request) (any, error) {
-	if s.humanWriteCheck == nil {
-		return nil, activityUnavailable
-	}
-	beforeCommit := func(tx *sql.Tx) error {
-		ids, err := boundSessionIDs(ctx, tx)
-		if err != nil {
-			return err
-		}
-		// The transaction holds SQLite's writer lock while the Host samples live
-		// native Agents for precisely these connected Sessions.
-		idle, err := s.humanWriteCheck(ctx, r.WorkspaceID, r.SessionID, ids)
-		if err != nil {
-			return activityUnavailable
-		}
-		if !idle {
-			return workspaceBusy
-		}
-		return nil
+	var affected []string
+	write := func(opID string, apply func(*sql.Tx, Status) (any, error)) (any, error) {
+		return p.writeChecked(ctx, r, opID, apply, func(tx *sql.Tx) error {
+			return s.checkCanvasMutation(ctx, tx, r, affected)
+		})
 	}
 	switch r.Action {
 	case "update_node":
@@ -129,17 +116,30 @@ func (s *Service) humanWrite(ctx context.Context, p *project, r Request) (any, e
 		if err := decodeData(r.Data, &args); err != nil {
 			return nil, err
 		}
-		return p.writeChecked(ctx, r, args.operation.ID, func(tx *sql.Tx, _ Status) (any, error) {
+		affected = []string{args.ID}
+		return write(args.operation.ID, func(tx *sql.Tx, _ Status) (any, error) {
 			return updateNode(ctx, tx, args)
-		}, beforeCommit)
+		})
 	case "delete_node":
 		var args nodeRevisionArgs
 		if err := decodeData(r.Data, &args); err != nil {
 			return nil, err
 		}
-		return p.writeChecked(ctx, r, args.operation.ID, func(tx *sql.Tx, _ Status) (any, error) {
-			return deleteNode(ctx, tx, args)
-		}, beforeCommit)
+		return write(args.operation.ID, func(tx *sql.Tx, _ Status) (any, error) {
+			result, ids, err := changeCanvas(ctx, tx, canvasChangeArgs{Nodes: []canvasNodeVersion{{ID: args.ID, Revision: args.Revision}}}, false)
+			affected = ids
+			return editResult{ID: args.ID, Revision: args.Revision + 1, EventSeq: result.EventSeq, Deleted: true, Tombstone: true}, err
+		})
+	case "canvas_delete", "canvas_restore":
+		var args canvasChangeArgs
+		if err := decodeData(r.Data, &args); err != nil {
+			return nil, err
+		}
+		return write(args.operation.ID, func(tx *sql.Tx, _ Status) (any, error) {
+			result, ids, err := changeCanvas(ctx, tx, args, r.Action == "canvas_restore")
+			affected = ids
+			return result, err
+		})
 	default:
 		var args changeEdgeArgs
 		if err := decodeData(r.Data, &args); err != nil {
@@ -149,10 +149,42 @@ func (s *Service) humanWrite(ctx context.Context, p *project, r Request) (any, e
 			(r.Action == "update_edge") != (args.NewSource != "") {
 			return nil, invalid("需要有效的引用来源、目标和替换来源")
 		}
-		return p.writeChecked(ctx, r, args.operation.ID, func(tx *sql.Tx, _ Status) (any, error) {
+		affected = []string{args.Target}
+		return write(args.operation.ID, func(tx *sql.Tx, _ Status) (any, error) {
 			return changeEdge(ctx, tx, args)
-		}, beforeCommit)
+		})
 	}
+}
+
+func (s *Service) checkCanvasMutation(ctx context.Context, tx *sql.Tx, r Request, nodeIDs []string) error {
+	if len(nodeIDs) == 0 {
+		return nil
+	}
+	locked, err := taskLockedNodes(ctx, tx)
+	if err != nil {
+		return err
+	}
+	for _, id := range nodeIDs {
+		if slices.Contains(locked, id) {
+			return workspaceBusy
+		}
+	}
+	if s.humanWriteCheck == nil {
+		return activityUnavailable
+	}
+	sessions, err := boundSessionIDs(ctx, tx)
+	if err != nil {
+		return err
+	}
+	// Sample native Agent access at commit while SQLite holds its writer lock.
+	allowed, err := s.humanWriteCheck(ctx, r.WorkspaceID, r.SessionID, sessions, nodeIDs)
+	if err != nil {
+		return activityUnavailable
+	}
+	if !allowed {
+		return workspaceBusy
+	}
+	return nil
 }
 
 func editableNode(ctx context.Context, tx *sql.Tx, id string, revision int64) (string, string, error) {
@@ -185,8 +217,8 @@ func updateNode(ctx context.Context, tx *sql.Tx, args updateNodeArgs) (editResul
 	}
 	preserveContentField(content, previous, "providerTaskId")
 	if args.ReferenceSources != nil {
-		if kind != "video" && kind != "shot" {
-			return editResult{}, invalid("只有视频和镜头支持在节点编辑中替换有序素材输入")
+		if kind != "video" && kind != "shot" && kind != "image" {
+			return editResult{}, invalid("只有图片、视频和镜头支持在节点编辑中替换有序输入")
 		}
 		setOrderedSources(content, *args.ReferenceSources)
 	} else {
@@ -209,7 +241,7 @@ func updateNode(ctx context.Context, tx *sql.Tx, args updateNodeArgs) (editResul
 		return editResult{}, err
 	}
 	if kind == "video" {
-		if err := validateVideo(ctx, tx, args.ID); err != nil {
+		if err := validateVideo(ctx, tx, args.ID, true); err != nil {
 			return editResult{}, err
 		}
 	}
@@ -275,10 +307,10 @@ func replaceReferences(ctx context.Context, tx *sql.Tx, target, kind string, pre
 		}
 		keep[source] = true
 		connected := slices.Contains(edges, source)
-		if connected && (kind == "video" || slices.Contains(previous, source)) {
+		if connected && kind == "shot" && slices.Contains(previous, source) {
 			continue
 		}
-		if err := validateMediaEdgeSource(ctx, tx, source, kind); err != nil {
+		if err := validateReferenceSource(ctx, tx, source, kind); err != nil {
 			return err
 		}
 		if !connected {
@@ -288,7 +320,7 @@ func replaceReferences(ctx context.Context, tx *sql.Tx, target, kind string, pre
 		}
 	}
 	for _, source := range edges {
-		if !keep[source] && (kind == "video" || slices.Contains(previous, source)) {
+		if !keep[source] && (kind == "video" || kind == "image" || slices.Contains(previous, source)) {
 			if _, err := tx.ExecContext(ctx, "DELETE FROM edges WHERE source=? AND target=?", source, target); err != nil {
 				return err
 			}
@@ -297,23 +329,16 @@ func replaceReferences(ctx context.Context, tx *sql.Tx, target, kind string, pre
 	return nil
 }
 
-func validateMediaEdgeSource(ctx context.Context, tx *sql.Tx, id, targetType string) error {
-	var kind, raw string
-	err := tx.QueryRowContext(ctx, "SELECT type,content FROM nodes WHERE id=? AND deleted=0", id).Scan(&kind, &raw)
-	if errors.Is(err, sql.ErrNoRows) {
-		return invalid("引用节点 %q 不存在于当前 Canvas 或已删除", id)
-	}
+func validateReferenceSource(ctx context.Context, tx *sql.Tx, id, targetType string) error {
+	kind, err := nodeType(ctx, tx, id)
 	if err != nil {
 		return err
 	}
-	var media struct{ Path, URL string }
-	if !isVideoMedia(kind) || (targetType == "image" && kind != "image") {
-		return invalid("有序素材输入只接受实际媒体")
+	if targetType == "image" && (kind == "image" || isTextNode(kind)) ||
+		targetType != "image" && isVideoMedia(kind) {
+		return nil
 	}
-	if json.Unmarshal([]byte(raw), &media) != nil || (media.Path == "" && media.URL == "") {
-		return invalid("素材输入必须引用已保存的媒体 URL 或相对文件")
-	}
-	return nil
+	return invalid("当前节点不接受 %s 类型的引用", kind)
 }
 
 func validateDependentVideos(ctx context.Context, tx *sql.Tx, id string) error {
@@ -323,22 +348,11 @@ func validateDependentVideos(ctx context.Context, tx *sql.Tx, id string) error {
 		return err
 	}
 	for _, target := range targets {
-		if err := validateVideo(ctx, tx, target); err != nil {
+		if err := validateVideo(ctx, tx, target, true); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-func deleteNode(ctx context.Context, tx *sql.Tx, args nodeRevisionArgs) (editResult, error) {
-	if _, _, err := editableNode(ctx, tx, args.ID, args.Revision); err != nil {
-		return editResult{}, err
-	}
-	if _, err := tx.ExecContext(ctx, "UPDATE nodes SET deleted=1,revision=revision+1 WHERE id=?", args.ID); err != nil {
-		return editResult{}, err
-	}
-	seq, err := addEvent(ctx, tx, "delete", []string{args.ID})
-	return editResult{ID: args.ID, Revision: args.Revision + 1, EventSeq: seq, Deleted: true, Tombstone: true}, err
 }
 
 func changeEdge(ctx context.Context, tx *sql.Tx, args changeEdgeArgs) (editResult, error) {
@@ -369,7 +383,7 @@ func changeEdge(ctx context.Context, tx *sql.Tx, args changeEdgeArgs) (editResul
 			return editResult{}, &requestError{http.StatusConflict, "新的引用连线已存在"}
 		}
 		if kind == "video" || slot >= 0 {
-			err = validateMediaEdgeSource(ctx, tx, args.NewSource, kind)
+			err = validateReferenceSource(ctx, tx, args.NewSource, kind)
 		} else {
 			_, err = nodeType(ctx, tx, args.NewSource)
 		}
@@ -396,7 +410,7 @@ func changeEdge(ctx context.Context, tx *sql.Tx, args changeEdgeArgs) (editResul
 		return editResult{}, err
 	}
 	if kind == "video" {
-		if err := validateVideo(ctx, tx, args.Target); err != nil {
+		if err := validateVideo(ctx, tx, args.Target, args.NewSource != ""); err != nil {
 			return editResult{}, err
 		}
 	}

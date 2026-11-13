@@ -5,6 +5,7 @@ export const modeLabels = {
   t2v: '文生视频 · T2V', i2v: '图生视频 · I2V', r2v: '参考生视频 · R2V', v2v: '视频转视频 · V2V', asset: '视频素材',
 }
 export const groupFields = [['episodeId', '集'], ['sceneId', '场'], ['shotId', '镜头']]
+export const textTypes = new Set(['script', 'shot', 'prompt', 'note'])
 export const mediaTypes = new Set(['image', 'video', 'audio'])
 export const assetFolders = { image: 'assets/images/', video: 'assets/videos/', audio: 'assets/audio/' }
 
@@ -57,11 +58,15 @@ export function resolveProfile(profiles, preferredId) {
 }
 
 export function referenceLimit(mode, kind, profile) {
-  if (mode === 'i2v') return kind === 'image' ? (profile?.limits?.lastFrame ? 2 : 1) : 0
+  if (mode === 'i2v') return kind === 'image' ? (!profile || profile.limits?.lastFrame ? 2 : 1) : 0
   if (mode === 'v2v') return kind === 'video' ? 1 : 0
   if (mode === 'r2v') {
     if (!profile) return 32
     return profile.limits?.references?.[kind] ?? 0
+  }
+  if (mode === 't2i') {
+    if (textTypes.has(kind)) return 32
+    if (kind === 'image') return profile ? profile.limits?.references?.image ?? 0 : 32
   }
   return mode === '' && kind === 'image' ? 32 : 0
 }

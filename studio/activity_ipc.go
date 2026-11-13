@@ -32,12 +32,13 @@ func (s *Service) ConfigureHostActivity(address, token string) error {
 			return http.ErrUseLastResponse
 		},
 	}
-	s.SetHumanWriteCheck(func(ctx context.Context, workspaceID, sessionID string, connected []string) (bool, error) {
+	s.SetHumanWriteCheck(func(ctx context.Context, workspaceID, sessionID string, connected, nodeIDs []string) (bool, error) {
 		body, err := json.Marshal(struct {
 			WorkspaceID string   `json:"workspaceId"`
 			SessionID   string   `json:"sessionId"`
 			SessionIDs  []string `json:"sessionIds"`
-		}{workspaceID, sessionID, connected})
+			NodeIDs     []string `json:"nodeIds"`
+		}{workspaceID, sessionID, connected, nodeIDs})
 		if err != nil {
 			return false, err
 		}

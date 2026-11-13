@@ -329,6 +329,17 @@ func (s *ProviderSettings) prepareChannel(input *GenerationInput, id string) err
 	}
 	profile.Mode, profile.Provider, profile.Channel = input.Mode, channel.Protocol, &channel
 	profile.Duration, profile.AspectRatio = profile.Defaults.Duration, profile.Defaults.AspectRatio
+	if input.Type == "image" {
+		if input.Params.Duration != 0 || input.Params.Resolution != "" || input.Params.GenerateAudio != nil {
+			return invalid("当前图片预设只支持覆盖画幅")
+		}
+		params, err := resolveVideoParams(profile, VideoParams{}, input.Params)
+		if err != nil {
+			return err
+		}
+		profile.AspectRatio = params.AspectRatio
+		input.Params = params
+	}
 	if input.Type == "video" {
 		if err := prepareVideoGeneration(input, &profile, s.data.Generation.VideoParams); err != nil {
 			return err

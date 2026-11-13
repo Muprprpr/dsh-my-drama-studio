@@ -1,7 +1,7 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { EventEmitter, once } from 'node:events'
 import { startKernel, StudioError } from './kernel.js'
-import { streamMedia } from './media.js'
+import { importMedia, streamMedia } from './media.js'
 import { registerTools } from './tools.js'
 import { openProfileSettings } from './profile-settings.js'
 
@@ -51,7 +51,7 @@ function sendJSON(res, status, value) {
   res.end(JSON.stringify(value))
 }
 
-function route(ctx, path, run, method = 'POST') {
+function route(ctx, path, run, method = 'POST', rawBody = false) {
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact', path,
     async handler(req, res) {
@@ -60,7 +60,7 @@ function route(ctx, path, run, method = 'POST') {
         if ('rejection' in admission) throw new StudioError(admission.rejection, 'DSH authentication required')
         if (admission.peer.id !== ctx.connection.browserPeer.id) throw new StudioError(403, 'DSH browser owner required')
         if (req.method !== method) throw new StudioError(405, 'Method not allowed')
-        const input = method === 'POST' ? await readJSON(req)
+        const input = method === 'POST' && !rawBody ? await readJSON(req)
           : Object.fromEntries(new URL(req.url, 'http://127.0.0.1').searchParams)
         const result = await run(input, admission.peer, req, res)
         if (!res.headersSent) sendJSON(res, 200, result)
@@ -74,20 +74,35 @@ function route(ctx, path, run, method = 'POST') {
   }))
 }
 
-const humanEdits = new Set(['update_node', 'delete_node', 'update_edge', 'delete_edge'])
+const humanEdits = new Set(['update_node', 'delete_node', 'update_edge', 'delete_edge', 'canvas_delete', 'canvas_restore'])
 const browserActions = new Set(['context', 'bind', 'disconnect', 'query', 'append', 'permission', 'submit_manual', 'tasks',
   'generateT2V', 'generateI2V', 'generateR2V', 'generateV2V', 'cancel_task', 'resume_task', ...humanEdits])
 
 export async function apply(ctx, config) {
-  function workspaceRunning(sessionIds, connected) {
+  const activity = new EventEmitter().setMaxListeners(0)
+  const agentDependencies = new Map()
+  function workspaceActivity(sessionIds, connected) {
     const members = new Set(sessionIds)
-    return connected.some(sessionId => members.has(sessionId) && ctx.agents.get(sessionId)?.status === 'running')
+    const active = connected.filter(id => members.has(id) && ctx.agents.get(id)?.status === 'running')
+    const agentLockedNodeIds = [...new Set(active.flatMap(id => [...(agentDependencies.get(id) ?? [])]))].sort()
+    return { aiRunning: active.length > 0, agentLockedNodeIds }
   }
 
-  function checkHumanWrite(workspaceId, sessionId, connected) {
-    // The Go transaction owns the binding snapshot. Sample the live registry without yielding.
+  function checkHumanWrite(workspaceId, sessionId, connected, nodeIds) {
     const members = ctx.workspaceRegistry.get(workspaceId)?.sessionIds
-    return Boolean(members?.includes(sessionId) && !workspaceRunning(members, connected))
+    if (!members?.includes(sessionId)) return false
+    const { agentLockedNodeIds } = workspaceActivity(members, connected)
+    const protectedIds = new Set(agentLockedNodeIds)
+    return Array.isArray(nodeIds) && nodeIds.every(id => !protectedIds.has(id))
+  }
+
+  function protectNodes(agent, ids) {
+    if (ctx.agents.get(agent.id) !== agent || agent.status !== 'running') return
+    const current = agentDependencies.get(agent.id) ?? new Set()
+    const count = current.size
+    for (const id of ids) if (typeof id === 'string' && id) current.add(id)
+    agentDependencies.set(agent.id, current)
+    if (count !== current.size) activity.emit('change', agent.id)
   }
 
   const kernel = await startKernel(ctx, checkHumanWrite)
@@ -95,12 +110,14 @@ export async function apply(ctx, config) {
   const signingKey = randomBytes(32)
   const lifetime = new AbortController()
   ctx.effect(() => () => lifetime.abort())
-  const activity = new EventEmitter().setMaxListeners(0)
-  function agentChanged({ agent }) {
+  ctx.on('agent/status', ({ agent, status }) => {
+    if (status === 'idle') agentDependencies.delete(agent.id)
     activity.emit('change', agent.id)
-  }
-  ctx.on('agent/status', agentChanged)
-  ctx.on('agent/disposed', agentChanged)
+  })
+  ctx.on('agent/disposed', ({ agent }) => {
+    agentDependencies.delete(agent.id)
+    activity.emit('change', agent.id)
+  })
 
   async function connectedSessions(sessionId, workspace, signal) {
     return (await kernel(sessionId, workspace, 'connected_sessions', {}, signal)).sessionIds
@@ -108,7 +125,7 @@ export async function apply(ctx, config) {
 
   async function addActivity(status, sessionId, workspace) {
     const connected = status.connected ? await connectedSessions(sessionId, workspace) : []
-    status.aiRunning = workspaceRunning(workspace.sessionIds, connected)
+    Object.assign(status, workspaceActivity(workspace.sessionIds, connected))
     return status
   }
 
@@ -152,7 +169,7 @@ export async function apply(ctx, config) {
     if (!browserActions.has(action)) throw new StudioError(400, 'Unknown Studio action')
     const { sessionId, workspace } = await verify(ticket, peer)
     const input = action === 'context' ? keys(data ?? {}) : keysData(data)
-    if (humanEdits.has(action)) return kernel(sessionId, workspace, action, input, undefined, 'human')
+    if (humanEdits.has(action) || action === 'append') return kernel(sessionId, workspace, action, input, undefined, 'human')
     const result = await kernel(sessionId, workspace, action, input)
     if (action === 'query') await addActivity(result.status, sessionId, workspace)
     else if (action === 'context' || action === 'bind' || action === 'disconnect') {
@@ -160,6 +177,13 @@ export async function apply(ctx, config) {
     }
     return result
   })
+
+  route(ctx, '/api/drama/upload', async (body, peer, req) => {
+    const { ticket, type, name } = keys(body, 'ticket', 'type', 'name')
+    const { sessionId, workspace } = await verify(ticket, peer)
+    if (!(await kernel(sessionId, workspace, 'context')).connected) throw new StudioError(403, '请先连接当前会话与画布')
+    return importMedia(req, workspace.path, type, name)
+  }, 'POST', true)
 
   route(ctx, '/api/drama/events', async (body, peer, _req, res) => {
     const { ticket, after: start } = keys(body, 'ticket', 'after')
@@ -196,10 +220,10 @@ export async function apply(ctx, config) {
           refreshActivity = false
           const connected = await connectedSessions(sessionId, workspace, signal)
           trackedSessions = new Set(connected)
-          const aiRunning = workspaceRunning(workspace.sessionIds, connected)
-          if (published !== aiRunning && !signal.aborted) {
-            await write(`data: ${JSON.stringify({ aiRunning })}\n\n`)
-            published = aiRunning
+          const frame = JSON.stringify(workspaceActivity(workspace.sessionIds, connected))
+          if (published !== frame && !signal.aborted) {
+            await write(`data: ${frame}\n\n`)
+            published = frame
           }
         }
         if (signal.aborted || refreshActivity) continue
@@ -238,7 +262,7 @@ export async function apply(ctx, config) {
     return streamMedia(req, res, workspace.path, nodes[0])
   }, 'GET')
 
-  registerTools(ctx, workspaceFor, kernel, keys)
+  registerTools(ctx, workspaceFor, kernel, keys, protectNodes)
   void recoverWorkspaces(ctx, kernel, lifetime.signal)
   console.info('[my-drama-studio] My Drama Studio Host loaded')
 }

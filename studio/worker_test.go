@@ -117,14 +117,19 @@ func TestGenerationRecoveryAndAppendAfterDisconnect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.SetHumanWriteCheck(func(context.Context, string, string, []string) (bool, error) { return true, nil })
-	edited := mustEdit(t, s, dir, "b", "update_node", updateNodeArgs{
+	s.SetHumanWriteCheck(func(context.Context, string, string, []string, []string) (bool, error) { return true, nil })
+	edit := updateNodeArgs{
 		nodeRevisionArgs: nodeRevisionArgs{operation: operation{ID: "edit-during-poll"}, ID: nodeID, Revision: 1},
-		ShotID:           "SH002", Content: json.RawMessage(`{"prompt":"稍后提交的另一份提示词。"}`),
-	})
-	mustEdit(t, s, dir, "b", "delete_node", nodeRevisionArgs{
-		operation: operation{ID: "delete-during-poll"}, ID: nodeID, Revision: edited.Revision,
-	})
+		ShotID:           "SH002", Content: json.RawMessage(`{"prompt":"A future shot."}`),
+	}
+	if _, err := editCall(s, dir, "b", "human", "update_node", edit); err != workspaceBusy {
+		t.Fatalf("active task source could be edited: %v", err)
+	}
+	if _, err := editCall(s, dir, "b", "human", "delete_node", nodeRevisionArgs{
+		operation: operation{ID: "delete-during-poll"}, ID: nodeID, Revision: 1,
+	}); err != workspaceBusy {
+		t.Fatalf("active task source could be deleted: %v", err)
+	}
 	if _, stored, err := scanTask(p.db.QueryRowContext(ctx, "SELECT "+taskColumns+" FROM tasks WHERE id=?", known.ID)); err != nil || stored != beforeEdit {
 		t.Fatalf("source edits modified stored task input: %v", err)
 	}
@@ -152,6 +157,11 @@ func TestGenerationRecoveryAndAppendAfterDisconnect(t *testing.T) {
 	if len(query.Nodes) != 1 || query.Nodes[0].BasedOn != nodeID || query.Nodes[0].CreatedBySession != "a" || query.Nodes[0].ShotID != "SH001" {
 		t.Fatalf("result node: %+v", query.Nodes)
 	}
+	s.SetHumanWriteCheck(func(context.Context, string, string, []string, []string) (bool, error) { return true, nil })
+	edited := mustEdit(t, s, dir, "b", "update_node", edit)
+	mustEdit(t, s, dir, "b", "delete_node", nodeRevisionArgs{
+		operation: operation{ID: "delete-after-poll"}, ID: nodeID, Revision: edited.Revision,
+	})
 	if source := exactNode(t, s, dir, "b", nodeID); !source.Deleted || source.ShotID != "SH002" {
 		t.Fatalf("task source archive lost provenance: %+v", source)
 	}
@@ -163,7 +173,7 @@ func TestGenerationRecoveryAndAppendAfterDisconnect(t *testing.T) {
 	if _, err := png.Decode(file); err != nil {
 		t.Fatalf("saved result could not be opened: %v", err)
 	}
-	t.Log("fixture only: pending, durable submitting and task ID, restart polling, original input and shot snapshot preserved after source edit/delete, downloaded real PNG bytes and appended result after Session disconnect")
+	t.Log("fixture only: pending, durable submitting and task ID, restart polling, source protected during polling, editable after completion, original input and shot snapshot preserved, downloaded real PNG bytes and appended result after Session disconnect")
 }
 
 func TestUncertainGenerationNeverResubmits(t *testing.T) {

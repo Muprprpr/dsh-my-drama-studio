@@ -18,7 +18,7 @@ export function IconButton({ icon: Icon, label, children, ...props }) {
 }
 
 export function CanvasToolbar({ filters, update, filterGroup, groups, collapsed, toggleGroup,
-  fit, arrange, add, setAddAnchor, tasksOpen, toggleTasks, activeTasks = 0,
+  fit, arrange, add, setAddAnchor, chooseAsset, tasksOpen, toggleTasks, activeTasks = 0,
 }) {
   const [popover, setPopover] = useState('')
   const root = useRef(null)
@@ -40,7 +40,10 @@ export function CanvasToolbar({ filters, update, filterGroup, groups, collapsed,
   return <div className="drama-v2-tools nodrag nopan nowheel" ref={root}>
     <div className="drama-v2-toolbar" role="toolbar" aria-label="画布工具">
       <Button ref={setAddAnchor} type="button" variant="primary" size="sm" aria-label="新增节点"
-        icon={<IconPlusOutlineRegular size={16} />} onClick={() => { setPopover(''); add() }}><span className="drama-v2-tool-text">新增</span></Button>
+        title="新增节点 · Shift+A" icon={<IconPlusOutlineRegular size={16} />}
+        onClick={() => { setPopover(''); add() }}><span className="drama-v2-tool-text">新增</span></Button>
+      <IconButton label="项目资产" icon={IconWorkspaceTreeOutlineRegular}
+        onClick={() => { setPopover(''); chooseAsset() }} />
       <IconButton label="搜索" icon={IconSearchOutlineRegular} onClick={() => open('search')} aria-expanded={popover === 'search'} />
       <IconButton label="筛选" icon={IconSlidersTwoOutlineRegular} onClick={() => open('filters')} aria-expanded={popover === 'filters'} />
       <div className="drama-v2-tool-divider" aria-hidden="true" />

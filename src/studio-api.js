@@ -28,6 +28,13 @@ export async function providerRequest(action, data = {}, signal) {
   return json(await post('providers', { action, data }, signal))
 }
 
+export async function uploadMedia(ticket, type, file, signal) {
+  const query = new URLSearchParams({ ticket, type, name: file.name })
+  return json(await fetch(`/api/drama/upload?${query}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file, signal,
+  }))
+}
+
 export async function initialize(sessionId, signal) {
   return json(await post('init', { sessionId }, signal))
 }

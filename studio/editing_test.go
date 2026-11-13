@@ -79,7 +79,7 @@ func TestHumanWriteChecksWorkspaceAtCommit(t *testing.T) {
 	var hold atomic.Bool
 	hold.Store(true)
 	entered, resume := make(chan struct{}), make(chan struct{})
-	s.SetHumanWriteCheck(func(ctx context.Context, workspaceID, sessionID string, ids []string) (bool, error) {
+	s.SetHumanWriteCheck(func(ctx context.Context, workspaceID, sessionID string, ids, _ []string) (bool, error) {
 		if workspaceID != "native-workspace" || sessionID != "b" || !slices.Equal(ids, []string{"a", "b"}) {
 			return false, fmt.Errorf("activity check received the wrong identities: %s/%s %v", workspaceID, sessionID, ids)
 		}
@@ -155,7 +155,7 @@ func TestHumanOrderedEdgesStayConsistent(t *testing.T) {
 	s := New(nil)
 	defer s.Close()
 	bindSession(t, s, dir, "a")
-	s.SetHumanWriteCheck(func(context.Context, string, string, []string) (bool, error) { return true, nil })
+	s.SetHumanWriteCheck(func(context.Context, string, string, []string, []string) (bool, error) { return true, nil })
 	first, second, video, shot, note := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
 	prompt := `{"mode":"i2v","prompt":"延续 @图片1 的动作。","mixedListOrder":[%q]}`
 	mustCall(t, s, dir, "a", "append", appendArgs{operation: operation{ID: "nodes"}, Nodes: []NodeInput{
@@ -194,10 +194,6 @@ func TestHumanOrderedEdgesStayConsistent(t *testing.T) {
 		Content:          json.RawMessage(`{"mode":"t2v","prompt":"演员穿过房间。"}`), ReferenceSources: &none,
 	})
 	mustEdit(t, s, dir, "a", "delete_node", nodeRevisionArgs{operation: operation{ID: "archive-image"}, ID: first, Revision: 1})
-	mustEdit(t, s, dir, "a", "update_node", updateNodeArgs{
-		nodeRevisionArgs: nodeRevisionArgs{operation: operation{ID: "edit-archived-reference"}, ID: shot, Revision: 1},
-		Content:          json.RawMessage(`{"description":"保留原参考"}`), ReferenceSources: &[]string{first},
-	})
 	if current := exactNode(t, s, dir, "a", first); !current.Deleted || !strings.Contains(string(current.Content), "one.png") {
 		t.Fatalf("referenced deletion lost media: %+v", current)
 	}
@@ -205,13 +201,13 @@ func TestHumanOrderedEdgesStayConsistent(t *testing.T) {
 		t.Fatal("append connected a new reference to archived media")
 	}
 	snapshot := mustCall(t, s, dir, "a", "query", nil).(queryResult)
-	if len(snapshot.Nodes) != 4 || !slices.Equal(snapshot.Edges, []Edge{{first, shot}, {note, shot}}) {
-		t.Fatalf("active query lost a retained source or showed a removed edge: %+v", snapshot)
+	if len(snapshot.Nodes) != 4 || !slices.Equal(snapshot.Edges, []Edge{{note, shot}}) {
+		t.Fatalf("active query showed removed nodes or edges: %+v", snapshot)
 	}
 	mustEdit(t, s, dir, "a", "delete_edge", changeEdgeArgs{
 		operation: operation{ID: "remove-editorial-edge"}, Source: note, Target: shot, Revision: 2,
 	})
-	if snapshot := mustCall(t, s, dir, "a", "query", nil).(queryResult); !slices.Equal(snapshot.Edges, []Edge{{first, shot}}) {
+	if snapshot := mustCall(t, s, dir, "a", "query", nil).(queryResult); len(snapshot.Edges) != 0 {
 		t.Fatalf("removed editorial edge is still returned: %+v", snapshot.Edges)
 	}
 }
@@ -240,7 +236,7 @@ func TestHumanWriteMigratesExistingCanvas(t *testing.T) {
 	}
 	s = New(nil)
 	defer s.Close()
-	s.SetHumanWriteCheck(func(context.Context, string, string, []string) (bool, error) { return true, nil })
+	s.SetHumanWriteCheck(func(context.Context, string, string, []string, []string) (bool, error) { return true, nil })
 	id := added.IDs[0]
 	if current := exactNode(t, s, dir, "a", id); current.Revision != 1 || current.Deleted {
 		t.Fatalf("legacy row was not migrated: %+v", current)

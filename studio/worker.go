@@ -43,7 +43,8 @@ type sourceGroup struct {
 
 type generationRequest struct {
 	GenerationInput
-	SourceGroup *sourceGroup `json:"sourceGroup,omitempty"`
+	SourceGroup   *sourceGroup `json:"sourceGroup,omitempty"`
+	SourceNodeIDs []string     `json:"sourceNodeIds,omitempty"`
 }
 
 func readSourceGroup(ctx context.Context, tx *sql.Tx, id string) (sourceGroup, error) {
@@ -477,7 +478,7 @@ func (p *project) complete(ctx context.Context, task Task, file string, group *s
 	if err != nil {
 		return err
 	}
-	result, err := appendNodes(ctx, tx, task.CreatedBySession, []NodeInput{node}, nil)
+	result, err := appendNodes(ctx, tx, task.CreatedBySession, []NodeInput{node}, nil, false)
 	if err != nil {
 		return err
 	}

@@ -352,6 +352,8 @@ function modelPayload(form, protocol) {
     image: optionalNumber(form.imageReferences),
     video: optionalNumber(form.videoReferences),
     audio: optionalNumber(form.audioReferences),
+  } : form.modes.includes('t2i') && form.inputField.trim() ? {
+    image: optionalNumber(form.imageReferences),
   } : undefined
   return {
     id: form.id,
@@ -469,6 +471,10 @@ function ModelForm({ original, channels, busy, onSave, onCancel, onError }) {
         onChange={value => change('arkFamily', value)} />}
       {protocol === 'replicate' && form.modes.some(mode => ['i2v', 'r2v'].includes(mode)) &&
         field('模型图片输入字段', 'inputField', { required: true })}
+      {protocol === 'replicate' && form.modes.includes('t2i') && <div className="drama-provider-fields">
+        {field('模型参考图输入字段', 'inputField', { placeholder: '纯文生图留空' })}
+        {form.inputField.trim() && field('最多参考图片', 'imageReferences', { type: 'number', min: 1, max: 32, placeholder: '1' })}
+      </div>}
       <div className="drama-provider-field">
         <label>模型扩展参数<textarea value={form.options} disabled={busy} rows={3}
           placeholder={'{ "steps": 4 }'} onChange={event => change('options', event.target.value)} /></label>
