@@ -13,7 +13,7 @@ import {
 } from './canvas-node.jsx'
 import { TaskStatus, taskActive } from './task-drawer.jsx'
 import { useNodeEditorPlacement } from './node-editor-placement.js'
-import { NodeParameterPopover } from './node-parameter-popover.jsx'
+import { DurationControl, NodeParameterPopover } from './node-parameter-popover.jsx'
 import cardStyle from './node-card.css'
 
 export { cardStyle }
@@ -190,14 +190,20 @@ function TaskDetail({ task, nodeId, locate }) {
 
 const generationFields = { duration: '时长（秒）', resolution: '分辨率', aspectRatio: '画幅', generateAudio: '生成音频' }
 
+function durationAllowed(profile, value) {
+  const limits = profile.limits ?? {}
+  return Number.isInteger(value) && value !== 0 && value >= -1 && value <= 3600 &&
+    (value > 0 || ['ark', 'byteplus'].includes(profile.provider)) &&
+    (!limits.durations?.length || limits.durations.includes(value)) &&
+    (!limits.durationMin || value >= limits.durationMin) && (!limits.durationMax || value <= limits.durationMax)
+}
+
 function modelValue(profile, key, defaults) {
   if (!profile?.parameters?.includes(key)) return undefined
   const limits = profile.limits ?? {}
   return [profile.defaults?.[key], defaults?.[key]].find(value => {
     if (value == null || value === '' || value === 0) return false
-    if (key === 'duration') return (value > 0 || ['ark', 'byteplus'].includes(profile.provider)) &&
-      (!limits.durations?.length || limits.durations.includes(value)) &&
-      (!limits.durationMin || value >= limits.durationMin) && (!limits.durationMax || value <= limits.durationMax)
+    if (key === 'duration') return durationAllowed(profile, value)
     if (key === 'resolution') return !limits.resolutions?.length ||
       limits.resolutions.some(item => item.toLowerCase() === String(value).toLowerCase())
     if (key === 'aspectRatio') return !limits.aspectRatios?.length || limits.aspectRatios.includes(value)
@@ -472,12 +478,16 @@ function generationParameters(value, profile, generationDefaults, mode) {
     const effective = selected || inherited
     const summary = fixed ? '继承首帧画幅' : effective == null || effective === ''
       ? label + ' · 默认' : format(effective)
-    const options = (choices[key] ?? []).map(item => ({ id: String(item), label: format(item) }))
+    const numeric = key === 'duration'
+    const durationStops = numeric ? [...new Set((choices.duration ?? []).filter(item => durationAllowed(profile, item)))]
+      .sort((a, b) => a - b) : []
+    const options = (numeric ? durationStops : choices[key] ?? []).map(item => ({ id: String(item), label: format(item) }))
     if (selected && options.length && !options.some(item => item.id === selected)) {
       options.push({ id: selected, label: format(selected) })
     }
-    const numeric = key === 'duration'
-    return [{ key, label, selected, placeholder, summary, fixed, numeric, options,
+    return [{ key, label, selected, inherited, placeholder, summary, fixed, numeric, options, durationStops,
+      hasDurationStops: numeric && Boolean(choices.duration?.length),
+      acceptDuration: numeric ? value => durationAllowed(profile, value) : undefined,
       min: numeric ? profile.limits?.durationMin || (['ark', 'byteplus'].includes(profile.provider) ? -1 : 1) : undefined,
       max: numeric ? profile.limits?.durationMax || 3600 : undefined }]
   })
@@ -485,11 +495,13 @@ function generationParameters(value, profile, generationDefaults, mode) {
 
 function GenerationParams({ value, update, profile, generationDefaults, mode }) {
   return generationParameters(value, profile, generationDefaults, mode).filter(param => !param.fixed).map(param =>
-    param.options.length ? <MenuSelect key={param.key} label={param.label} value={param.selected}
+    param.numeric ? <div key={param.key} className="drama-node-field"><span>{param.label}</span>
+      <DurationControl param={param} update={next => update(param.key, next)} />
+    </div> : param.options.length ? <MenuSelect key={param.key} label={param.label} value={param.selected}
       items={[{ id: '', label: param.placeholder }, ...param.options]} onChange={next => update(param.key, next)} />
       : <label key={param.key} className="drama-node-field">{param.label}
-        <Input value={param.selected} placeholder={param.placeholder} type={param.numeric ? 'number' : 'text'}
-          min={param.min} max={param.max} onChange={event => update(param.key, event.target.value)} />
+        <Input value={param.selected} placeholder={param.placeholder}
+          onChange={event => update(param.key, event.target.value)} />
       </label>)
 }
 
@@ -936,17 +948,15 @@ function NodeEditor({
             : <NodeParameterPopover key={param.key} label={param.label} value={param.summary} disabled={blocked}
               open={openParameter === param.key} onToggle={() => setOpenParameter(current => current === param.key ? '' : param.key)}
               onClose={() => setOpenParameter(current => current === param.key ? '' : current)}>
-              {param.options.length ? <select aria-label={param.label} value={param.selected}
-                onChange={event => updateParam(param.key, event.target.value)}>
-                <option value="">{param.placeholder}</option>
-                {param.options.map(option => <option key={option.id} value={option.id}>{option.label}</option>)}
-              </select> : <Input aria-label={param.label} value={param.selected}
-                placeholder={param.placeholder} type={param.numeric ? 'number' : 'text'} min={param.min} max={param.max}
-                onChange={event => {
-                  if (event.currentTarget.validity.valid && (!param.numeric || event.target.value !== '0')) {
-                    updateParam(param.key, event.target.value)
-                  }
-                }} />}
+              {param.numeric ? <DurationControl param={param} update={next => updateParam(param.key, next)} />
+                : param.options.length ? <div className="drama-param-options" role="group" aria-label={param.label}>
+                  {[{ id: '', label: param.placeholder }, ...param.options].map(option =>
+                    <Button key={option.id} size="sm" variant={option.id === param.selected ? 'primary' : 'outline'}
+                      aria-pressed={option.id === param.selected} onClick={() => updateParam(param.key, option.id)}>
+                      {option.label}
+                    </Button>)}
+                </div> : <Input aria-label={param.label} value={param.selected} placeholder={param.placeholder}
+                  onChange={event => updateParam(param.key, event.target.value)} />}
             </NodeParameterPopover>)}
         </div>}
         <div ref={referenceArea}>

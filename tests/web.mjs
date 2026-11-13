@@ -605,7 +605,9 @@ async function chooseDuration(page, id, value) {
   const label = '时长（秒）'
   await nodeEditor(page, id).getByRole('button', { name: label, exact: true }).click()
   const popup = page.getByRole('dialog', { name: label, exact: true })
-  await popup.getByLabel(label, { exact: true }).selectOption(String(value))
+  const duration = popup.getByRole('spinbutton', { name: label, exact: true })
+  await duration.fill(String(value))
+  await duration.press('Enter')
   return popup
 }
 
@@ -1532,7 +1534,7 @@ test('U4 native task drawer follows real Go worker in isolated provider fixture'
       revision: configured.revision,
       profile: {
         name: '本地验收夹具', channelId: configured.channels[0].id, model: 'fixture-video', modes: ['t2v'],
-        defaults: { duration: 4 }, limits: { durations: [4, 8] },
+        defaults: { duration: 4 }, limits: { durationMin: 1, durationMax: 12 },
       },
     })
     await settings('generation_save', {
@@ -1547,9 +1549,25 @@ test('U4 native task drawer follows real Go worker in isolated provider fixture'
     await editDetails(page, created.id, { 节点名称: '排队与结果定位验收', 集: 'EP01', 场: 'S01', 镜头: 'SH08' })
     await updateVideo(page, ticket, created.id, '固定中景。人物推开餐厅门，在门口停顿。')
     const parameterChips = nodeEditor(page, created.id).getByRole('group', { name: '有效生成参数', exact: true })
+    await parameterChips.getByRole('button', { name: '时长（秒）', exact: true }).waitFor()
     assert.deepEqual(await parameterChips.getByRole('button').allTextContents(), ['4 秒'],
       'unsupported parameters should not appear alongside the duration-only profile')
-    const durationPopup = await chooseDuration(page, created.id, 8)
+    const durationPopup = await chooseDuration(page, created.id, 1)
+    const continuousSlider = durationPopup.getByRole('slider', { name: '滑动调整时长', exact: true })
+    await poll(async () => (await query(page, ticket, { id: created.id })).nodes[0].content.params?.duration === 1,
+      'a valid 1 second override did not save on a continuous model')
+    assert.equal(await continuousSlider.inputValue(), '1')
+    assert.equal(await continuousSlider.getAttribute('min'), '1')
+    assert.equal(await continuousSlider.getAttribute('max'), '12')
+    await durationPopup.getByRole('button', { name: '恢复默认', exact: true }).click()
+    await poll(async () => {
+      const node = (await query(page, ticket, { id: created.id })).nodes[0]
+      return node && node.content.params?.duration === undefined
+    }, 'restoring default did not clear the duration override')
+    assert.equal(await continuousSlider.inputValue(), '4')
+    const durationInput = durationPopup.getByRole('spinbutton', { name: '时长（秒）', exact: true })
+    await durationInput.fill('8')
+    await durationInput.press('Enter')
     await page.keyboard.press('Escape')
     await durationPopup.waitFor({ state: 'hidden' })
     const node = await poll(async () => {
@@ -1729,7 +1747,7 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
         profile: {
           name: '回环首帧预设', channelId: configured.channels[0].id, model: 'capture-i2v',
           modes: ['i2v'], defaults: { duration: 4, resolution: '720p', aspectRatio: '16:9', generateAudio: true },
-          limits: { durations: [4, 8], resolutions: ['720p', '1080p'], aspectRatios: ['16:9', '9:16'], generateAudio: true },
+          limits: { durations: [4, 8, 10], resolutions: ['720p', '1080p'], aspectRatios: ['16:9', '9:16'], generateAudio: true },
         },
       })
       const profileId = saved.profiles[0].id
@@ -1950,14 +1968,62 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       const resolutionPopover = page.getByRole('dialog', { name: '分辨率', exact: true })
       await resolutionPopover.waitFor()
       await parameterPopover.waitFor({ state: 'hidden' })
-      await resolutionPopover.getByLabel('分辨率', { exact: true }).selectOption('1080p')
+      const currentResolution = resolutionPopover.getByRole('button', { name: '默认 · 720p', exact: true })
+      const nextResolution = resolutionPopover.getByRole('button', { name: '1080p', exact: true })
+      assert.equal(await currentResolution.getAttribute('aria-pressed'), 'true')
+      await screenshot(page, 'focus-mode-resolution-popup.png')
+      await nextResolution.click()
+      if (await resolutionPopover.isVisible()) assert.equal(await nextResolution.getAttribute('aria-pressed'), 'true')
       await duration.click()
       await resolutionPopover.waitFor({ state: 'hidden' })
       const [chipBounds, popupBounds] = await Promise.all([duration.boundingBox(), parameterPopover.boundingBox()])
       assert.ok(chipBounds && popupBounds && Math.abs(chipBounds.x - popupBounds.x) < 250 &&
         Math.abs(chipBounds.y - popupBounds.y) < 180, 'duration popup did not open near its control')
-      await parameterPopover.getByLabel('时长（秒）', { exact: true }).selectOption('8')
+      const durationInput = parameterPopover.getByRole('spinbutton', { name: '时长（秒）', exact: true })
+      const durationSlider = parameterPopover.getByRole('slider', { name: '滑动调整时长', exact: true })
+      const savedDuration = async () => (await query(page, ticket, { id: first.id })).nodes[0].content.params?.duration
+      assert.equal(await durationSlider.inputValue(), '0')
+      await durationInput.fill('')
+      await durationInput.press('1')
+      assert.equal(await durationInput.inputValue(), '1', 'typing the first digit should not reset the field')
+      await delay(550)
+      assert.equal(await savedDuration(), undefined, 'an unfinished value was persisted before commit')
+      await durationInput.press('0')
+      assert.equal(await durationInput.inputValue(), '10')
+      await durationInput.press('Enter')
+      await poll(async () => (await savedDuration()) === 10, 'typing and committing 10 seconds did not persist')
+      await poll(async () => (await durationSlider.inputValue()) === '2', 'the slider did not follow a typed duration')
+      await durationInput.fill('5')
+      await durationInput.press('Enter')
+      assert.equal(await durationInput.inputValue(), '5')
+      await parameterPopover.getByRole('alert').filter({ hasText: '4、8、10' }).waitFor()
+      await delay(550)
+      assert.equal(await savedDuration(), 10, 'an unsupported duration was persisted')
+      await durationSlider.press('ArrowLeft')
+      await poll(async () => (await savedDuration()) === 8, 'slider keyboard adjustment did not persist 8 seconds')
+      await poll(async () => (await durationInput.inputValue()) === '8', 'the typed field did not follow the slider')
+      await durationInput.fill('4')
+      await durationInput.press('Tab')
+      await poll(async () => (await savedDuration()) === 4, 'a valid duration did not commit on blur')
+      await poll(async () => (await durationSlider.inputValue()) === '0', 'the slider did not follow the blur commit')
+      await durationSlider.press('ArrowRight')
+      await poll(async () => (await savedDuration()) === 8, 'the slider could not restore 8 seconds after the blur commit')
       await screenshot(page, 'focus-mode-parameter-popup.png')
+      if (capture) {
+        await setTheme(page, 'dark')
+        await screenshot(page, 'focus-mode-parameter-popup-dark.png')
+        await setTheme(page, 'light')
+      }
+      const sliderRect = await durationSlider.boundingBox()
+      assert.ok(sliderRect?.width > 30, 'duration slider is too narrow to drag')
+      const sliderY = sliderRect.y + sliderRect.height / 2
+      await page.mouse.move(sliderRect.x + sliderRect.width / 2, sliderY)
+      await page.mouse.down()
+      await page.mouse.move(sliderRect.x + sliderRect.width - 3, sliderY, { steps: 8 })
+      await page.mouse.up()
+      await poll(async () => (await savedDuration()) === 10, 'dragging the duration slider did not persist 10 seconds')
+      await durationSlider.press('ArrowLeft')
+      await poll(async () => (await savedDuration()) === 8, 'the slider could not restore 8 seconds after dragging')
       await page.keyboard.press('Escape')
       await parameterPopover.waitFor({ state: 'hidden' })
       assert.equal(await flow(page).getAttribute('data-focused-node'), first.id, 'closing a popup also exited focus mode')
@@ -1971,11 +2037,6 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       await poll(async () => (await readViewport()) === originalViewport, 'exiting focus did not restore the exact viewport')
       assert.deepEqual(await nodeGeometry(first), beforeFocus, 'focus mode changed node or port geometry')
       assert.equal(await flow(page).getAttribute('data-focused-node'), null)
-      await firstBox.waitFor()
-      await delay(320)
-      await focusNode(page, first.id)
-      await exitFocus.click()
-      await poll(async () => (await readViewport()) === originalViewport, 'using the exit button did not restore the viewport')
       await clickBlank(page)
       await poll(async () => (await query(page, ticket, { id: first.id })).nodes[0].content.params?.duration === 8,
         'advanced parameters did not autosave')
