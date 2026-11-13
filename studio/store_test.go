@@ -157,6 +157,36 @@ func TestWorkspaceIdentityConcurrencyAndRestart(t *testing.T) {
 	t.Log("three native identities share one Canvas, separate Workspace isolated, 2×50 retained, retry idempotent, WAL and initial revisions verified, restart and project copy preserved Canvas")
 }
 
+func TestImportedMediaMetadataPersistsAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	s := New(nil)
+	defer func() { _ = s.Close() }()
+	bindSession(t, s, dir, "a")
+	assetID := uuid.NewString() + ".MP4"
+	content := json.RawMessage(fmt.Sprintf(`{"assetId":%q,"path":%q,"canvasPosition":{"x":-13.5,"y":0},"title":"原始文件.MP4"}`,
+		assetID, "assets/videos/"+assetID))
+	appended := mustCall(t, s, dir, "a", "append", appendArgs{operation: operation{ID: "import"},
+		Nodes: []NodeInput{{Type: "video", Content: content}}}).(appendResult)
+	for _, raw := range []string{
+		`{"assetId":"../outside.mp4","path":"assets/videos/clip.mp4"}`,
+		fmt.Sprintf(`{"assetId":%q,"path":"assets/videos/another.mp4"}`, assetID),
+		`{"canvasPosition":{"x":null,"y":0}}`,
+		`{"canvasPosition":{"x":1e1000,"y":0}}`,
+	} {
+		if err := validateNode(NodeInput{Type: "video", Content: json.RawMessage(raw)}); err == nil {
+			t.Errorf("invalid media metadata accepted: %s", raw)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s = New(nil)
+	result := mustCall(t, s, dir, "a", "query", queryArgs{ID: appended.IDs[0]}).(queryResult)
+	if len(result.Nodes) != 1 || !bytes.Equal(result.Nodes[0].Content, content) {
+		t.Fatalf("imported media metadata was not restored: %+v", result.Nodes)
+	}
+}
+
 func TestAtomicReferencesAndVideoPrompt(t *testing.T) {
 	dir, other := t.TempDir(), t.TempDir()
 	s := New(nil)

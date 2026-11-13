@@ -11,17 +11,23 @@ const formats = {
   video: { '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime', '.m4v': 'video/mp4' },
   audio: { '.wav': 'audio/wav', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.ogg': 'audio/ogg' },
 }
-const assetPrefixes = { image: ['assets', 'images'], video: ['assets'], audio: ['assets', 'audio'] }
+const assetFolders = { image: ['assets', 'images'], video: ['assets', 'videos'], audio: ['assets', 'audio'] }
+const importedFilename = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9]+$/
 const maxUploadBytes = 128 * 1024 * 1024
 
+function mediaContentType(type, filename) {
+  if (typeof filename === 'string' && Object.hasOwn(formats, type)) {
+    return formats[type][extname(filename).toLowerCase()]
+  }
+}
+
 export async function importMedia(req, workspacePath, type, name) {
-  const extension = typeof name === 'string' && extname(name).toLowerCase()
-  if (typeof type !== 'string' || !Object.hasOwn(formats, type) || !Object.hasOwn(formats[type], extension)) {
+  if (!mediaContentType(type, name)) {
     throw new StudioError(415, '请选择支持的图片、视频或音频文件')
   }
   const declaredSize = Number(req.headers['content-length'])
   if (declaredSize > maxUploadBytes) throw new StudioError(413, '素材文件不能超过 128 MB')
-  const folders = type === 'video' ? ['assets', 'videos'] : assetPrefixes[type]
+  const folders = assetFolders[type]
   const base = await realpath(workspacePath)
   let dir = base
   for (const folder of folders) {
@@ -31,8 +37,8 @@ export async function importMedia(req, workspacePath, type, name) {
       throw new StudioError(409, '素材目录已重定向，请检查项目目录')
     }
   }
-  const filename = randomUUID() + extension
-  const file = resolve(dir, filename)
+  const assetId = randomUUID() + extname(name)
+  const file = resolve(dir, assetId)
   let bytes = 0
   try {
     await pipeline(req.iterator({ destroyOnReturn: false }), async function* (chunks) {
@@ -47,14 +53,25 @@ export async function importMedia(req, workspacePath, type, name) {
     if (error.code !== 'EEXIST') await unlink(file).catch(() => {})
     throw error
   }
-  return { path: [...folders, filename].join('/'), title: name.split(/[\\/]/).at(-1).slice(0, 160) }
+  return { assetId, type, path: [...folders, assetId].join('/'), title: name.split(/[\\/]/).at(-1).slice(0, 160) }
 }
 
-export async function streamMedia(req, res, workspacePath, node) {
-  const path = node?.content.path
-  const contentType = typeof path === 'string' && formats[node.type]?.[extname(path).toLowerCase()]
+export function importedMediaURL(ticket, type, assetId) {
+  return `/api/drama/media?${new URLSearchParams({ ticket, type, assetId })}`
+}
+
+export function streamImportedMedia(req, res, workspacePath, type, assetId) {
+  if (typeof assetId !== 'string' || !importedFilename.test(assetId) || !mediaContentType(type, assetId)) {
+    throw new StudioError(404, 'Media unavailable')
+  }
+  const folders = assetFolders[type]
+  return streamMedia(req, res, workspacePath, type, [...folders, assetId].join('/'), folders)
+}
+
+export async function streamMedia(req, res, workspacePath, type, path,
+  folders = type === 'video' ? ['assets'] : assetFolders[type]) {
+  const contentType = mediaContentType(type, path)
   if (!contentType || isAbsolute(path)) throw new StudioError(404, 'Media unavailable')
-  const folders = assetPrefixes[node.type]
   const expected = folders.join('/') + '/'
   if (!path.startsWith(expected)) throw new StudioError(404, 'Media unavailable')
 

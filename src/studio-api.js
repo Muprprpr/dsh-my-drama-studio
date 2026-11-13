@@ -30,9 +30,12 @@ export async function providerRequest(action, data = {}, signal) {
 
 export async function uploadMedia(ticket, type, file, signal) {
   const query = new URLSearchParams({ ticket, type, name: file.name })
-  return json(await fetch(`/api/drama/upload?${query}`, {
+  const uploaded = await json(await fetch(`/api/drama/upload?${query}`, {
     method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file, signal,
   }))
+  const { assetId, path, title } = uploaded
+  if (!assetId || uploaded.type !== type || !path) throw new Error('服务未返回完整素材信息')
+  return { assetId, path, title }
 }
 
 export async function initialize(sessionId, signal) {
@@ -94,6 +97,10 @@ export async function subscribe(ticket, after, signal, onBatch, onError) {
 }
 
 export function mediaURL(ticket, node) {
+  if (node.content.assetId) {
+    const query = new URLSearchParams({ ticket, type: node.type, assetId: node.content.assetId })
+    return `/api/drama/media?${query}`
+  }
   if (node.content.path) {
     const query = new URLSearchParams({ ticket, id: node.id })
     return `/api/drama/media?${query}`

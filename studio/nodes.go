@@ -562,16 +562,37 @@ func validateNode(n NodeInput) error {
 			return invalid("媒体 URL 必须是有效的 HTTP/HTTPS 地址")
 		}
 	}
+	var assetPath string
 	if raw, ok := content["path"]; ok {
-		var value string
 		prefix := map[string]string{"image": "assets/images/", "video": "assets/", "audio": "assets/audio/"}[n.Type]
-		if json.Unmarshal(raw, &value) != nil || !filepath.IsLocal(value) || strings.ContainsAny(value, "\\:") ||
-			!strings.HasPrefix(value, prefix) || path.Clean(value) != value || len(value) == len(prefix) {
+		if json.Unmarshal(raw, &assetPath) != nil || !filepath.IsLocal(assetPath) || strings.ContainsAny(assetPath, "\\:") ||
+			!strings.HasPrefix(assetPath, prefix) || path.Clean(assetPath) != assetPath || len(assetPath) == len(prefix) {
 			return invalid("媒体文件必须使用 %s 下的相对路径", prefix)
+		}
+	}
+	if raw, ok := content["assetId"]; ok {
+		var assetID string
+		if err := json.Unmarshal(raw, &assetID); err != nil || !importedAssetID.MatchString(assetID) {
+			return invalid("assetId 必须是导入素材的文件标识")
+		}
+		directory := map[string]string{"image": "assets/images", "video": "assets/videos", "audio": "assets/audio"}[n.Type]
+		if assetPath != directory+"/"+assetID {
+			return invalid("assetId 必须与素材路径对应")
+		}
+	}
+	if raw, ok := content["canvasPosition"]; ok {
+		var position struct {
+			X *float64 `json:"x"`
+			Y *float64 `json:"y"`
+		}
+		if err := json.Unmarshal(raw, &position); err != nil || position.X == nil || position.Y == nil {
+			return invalid("canvasPosition 必须包含有效的 x 和 y 坐标")
 		}
 	}
 	return nil
 }
+
+var importedAssetID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9]+$`)
 
 var mediaReference = regexp.MustCompile(`(?i)@(图片|视频|音频|文本|脚本|提示词|说明|image|video|audio|text|script|prompt|note)[ \t]*([0-9]+)|<<<(image|video|audio|text|script|prompt|note)_([0-9]+)>>>`)
 

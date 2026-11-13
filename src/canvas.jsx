@@ -26,12 +26,18 @@ const inEditor = event => event.target instanceof Element &&
 const groupOf = node => Object.fromEntries(groupFields.map(([field]) => [field, node[field] ?? '']))
 const groupFor = (node, filters) => Object.fromEntries(groupFields.map(([field]) => [field, node?.[field] ?? filters[field] ?? '']))
 function mediaKind(file) {
-  const type = file.type.split('/')[0]
-  if (mediaTypes.has(type)) return type
   if (/\.(mp4|mov|m4v|webm)$/i.test(file.name)) return 'video'
   if (/\.(wav|mp3|m4a|ogg)$/i.test(file.name)) return 'audio'
   if (/\.(png|jpe?g|webp|gif|avif|bmp)$/i.test(file.name)) return 'image'
   return ''
+}
+// Keep canvas file drags out of DSH's document-level composer attachment handlers.
+function isFileDrag(event) {
+  return event.currentTarget.contains(event.target) && event.dataTransfer?.types.includes('Files')
+}
+function isBlankCanvas(target) {
+  return target instanceof Element && (target.classList.contains('react-flow__pane') ||
+    target.closest('.drama-v2-canvas-empty') && !target.closest('button'))
 }
 const mutableSources = node => ['video', 'image', 'shot'].includes(node.type)
 
@@ -149,9 +155,13 @@ export function CanvasViewport({
   const dimensions = node => ({ id: node.id, width: 320,
     height: compact.includes(node.id) ? 88 : node.type === "image" || node.type === "video" ? 410 : 230 })
   const defaultPositions = layoutCanvas(ordered.map(dimensions), relations)
-  const placed = ordered.filter(node => positions[node.id]).map(node => ({ ...positions[node.id], ...dimensions(node) }))
+  const savedPosition = node => {
+    const point = node.content.canvasPosition
+    return positions[node.id] ?? (mediaTypes.has(node.type) && Number.isFinite(point?.x) && Number.isFinite(point?.y) ? point : undefined)
+  }
+  const placed = ordered.filter(node => savedPosition(node)).map(node => ({ ...savedPosition(node), ...dimensions(node) }))
   for (const node of ordered) {
-    if (positions[node.id]) continue
+    if (savedPosition(node)) continue
     const size = dimensions(node)
     defaultPositions[node.id] = availablePosition(defaultPositions[node.id], size, placed)
     placed.push({ ...defaultPositions[node.id], ...size })
@@ -193,7 +203,7 @@ export function CanvasViewport({
     return {
       id: node.id,
       type: 'drama',
-      position: positions[node.id] ?? defaultPositions[node.id],
+      position: savedPosition(node) ?? defaultPositions[node.id],
       selected: selected.includes(node.id),
       className: 'drama-flow-node' + (editorFocus?.id === node.id ? ' is-editor-focused' : ''),
       draggable: !lockReason(node.id),
@@ -499,16 +509,16 @@ export function CanvasViewport({
   }
 
   async function assignAsset(node, asset) {
-    const { path, url } = asset
+    const { path, url, assetId } = asset
     const title = nodeTitle(node)
     const defaultTitle = presets.find(preset => preset.type === node.type && (preset.mode ?? '') === videoMode(node))?.label
-    const content = { ...node.content, path, url, title: title && title !== defaultTitle ? title : asset.title || title }
+    const content = { ...node.content, path, url, assetId, title: title && title !== defaultTitle ? title : asset.title || title }
     await editWithHistory('update_node', { id: node.id, revision: node.revision, ...groupOf(node), content })
   }
 
   async function createAssetNode(asset, at, focus = false) {
-    const { path, url, title } = asset.content
-    const node = { id: crypto.randomUUID(), type: asset.type, content: { path, url, title }, ...groupFor(null, filters) }
+    const { path, url, title, assetId } = asset.content
+    const node = { id: crypto.randomUUID(), type: asset.type, content: { path, url, title, assetId }, ...groupFor(null, filters) }
     await appendWithHistory({ nodes: [node] })
     if (focus) revealNew([node])
     placeNew(node.id, at, focus)
@@ -835,6 +845,7 @@ export function CanvasViewport({
       nodes: list.map(({ data: { node }, position }) => {
         const content = { ...node.content }
         delete content.providerTaskId
+        delete content.canvasPosition
         if (node.type === 'video') delete content.textList
         return { id: node.id, type: node.type, content, position, ...groupOf(node) }
       }),
@@ -879,20 +890,41 @@ export function CanvasViewport({
   }
 
   function importFiles(files, at) {
+    if (writing.current) {
+      setEdgeError('画布正在保存，请稍后重试导入。')
+      return
+    }
+    const start = at ?? nextPosition()
+    const placed = graphNodes.map(graph => ({ ...dimensions(graph.data.node), ...graph.position }))
     void runCanvas(async () => {
       const items = []
+      const errors = []
       for (const file of files) {
         const type = mediaKind(file)
-        if (!mediaTypes.has(type)) continue
-        items.push({ id: crypto.randomUUID(), type, content: await uploadFile(type, file), ...groupFor(null, filters) })
+        if (!type) {
+          errors.push(`${file.name}：不支持的媒体格式`)
+          continue
+        }
+        try {
+          const asset = await uploadFile(type, file)
+          const id = crypto.randomUUID()
+          const size = dimensions({ id, type })
+          const point = { x: start.x + items.length * gapX, y: start.y }
+          const canvasPosition = at && !items.length ? point : availablePosition(point, size, placed)
+          placed.push({ ...canvasPosition, ...size })
+          items.push({ id, type, content: { ...asset, canvasPosition }, ...groupFor(null, filters) })
+        } catch (error) {
+          errors.push(`${file.name}：${error.message}`)
+        }
       }
-      if (!items.length) throw new Error('请选择支持的图片、视频或音频文件')
-      await appendWithHistory({ nodes: items })
-      revealNew(items)
-      const start = at ?? nextPosition()
-      items.forEach((node, index) => placeNew(node.id, { x: start.x + index * gapX, y: start.y }, items.length === 1))
-      setSelected(items.map(node => node.id))
-      setSelectedEdges([])
+      if (items.length) {
+        await appendWithHistory({ nodes: items })
+        revealNew(items)
+        setSelected(items.map(node => node.id))
+        setSelectedEdges([])
+        if (!at && items.length === 1) setFocusId(items[0].id)
+      }
+      if (errors.length) setEdgeError(`导入失败 · ${errors.join('；')}`)
     })
   }
 
@@ -968,18 +1000,26 @@ export function CanvasViewport({
         if (event.button === 0 && !inEditor(event) &&
             event.target instanceof Element && !event.target.closest('button, .nodrag')) surface.current?.focus({ preventScroll: true })
       }}
-      onDragOver={event => {
-        if (!event.currentTarget.contains(event.target)) return
-        if (event.dataTransfer.types.includes('Files')) {
-          event.preventDefault()
-          event.dataTransfer.dropEffect = 'copy'
-        }
-      }}
-      onDrop={event => {
-        if (!event.currentTarget.contains(event.target)) return
-        if (!event.dataTransfer.files.length) return
+      onDragEnterCapture={event => { if (isFileDrag(event)) event.stopPropagation() }}
+      onDragLeaveCapture={event => { if (isFileDrag(event)) event.stopPropagation() }}
+      onDragOverCapture={event => {
+        if (!isFileDrag(event)) return
         event.preventDefault()
-        importFiles([...event.dataTransfer.files], pointOnCanvas(event))
+        event.stopPropagation()
+        event.dataTransfer.dropEffect = isBlankCanvas(event.target) ? 'copy' : 'none'
+      }}
+      onDropCapture={event => {
+        if (!isFileDrag(event)) return
+        event.preventDefault()
+        event.stopPropagation()
+        if (!isBlankCanvas(event.target)) return
+        const at = flow.current?.screenToFlowPosition({ x: event.clientX, y: event.clientY }, { snapToGrid: false })
+        const files = [...event.dataTransfer.files]
+        if (at && files.length) {
+          setFocusId(null)
+          surface.current?.focus({ preventScroll: true })
+          importFiles(files, at)
+        }
       }}
       onDoubleClick={event => {
         if (event.target instanceof Element && event.target.classList.contains('react-flow__pane')) openPicker(event)

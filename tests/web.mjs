@@ -1716,6 +1716,50 @@ test('U5 native video editors retain ordered media and inline prompts', { timeou
   })
 })
 
+test('Canvas claims real file drags before the native composer', { timeout: 65_000, skip: !hasImage }, async () => {
+  await withWeb(async ({ page, context, records, home }) => {
+    const [record] = records
+    await select(page, record)
+    await open(page, record)
+    await sidebarMode(page, 'fullscreen').click()
+    const pane = flow(page).locator('.react-flow__pane')
+    const bounds = await pane.boundingBox()
+    const point = { x: Math.round(bounds.x + bounds.width * .45), y: Math.round(bounds.y + bounds.height * .35) }
+    await page.evaluate(({ x, y }) => {
+      if (!document.elementFromPoint(x, y)?.classList.contains('react-flow__pane')) {
+        throw new Error('Drop point is outside the blank canvas')
+      }
+      window.dramaFileDrag = { bubbled: [] }
+      for (const type of ['dragover', 'drop']) {
+        document.addEventListener(type, () => window.dramaFileDrag.bubbled.push(type), { once: true })
+      }
+      window.addEventListener('dragover', event => {
+        setTimeout(() => {
+          window.dramaFileDrag.over = [event.isTrusted, event.defaultPrevented, event.dataTransfer.dropEffect]
+        }, 0)
+      }, { capture: true, once: true })
+    }, point)
+    const cdp = await context.newCDPSession(page)
+    const data = { items: [], files: [resolve(imageAsset)], dragOperationsMask: 1 }
+    for (const type of ['dragEnter', 'dragOver', 'drop']) {
+      await cdp.send('Input.dispatchDragEvent', { type, ...point, data })
+    }
+    await cdp.detach()
+    await page.waitForFunction(() => window.dramaFileDrag.over)
+    assert.deepEqual(await page.evaluate(() => window.dramaFileDrag), { bubbled: [], over: [true, true, 'copy'] })
+    const ticket = await ticketFor(page, record.sessionId)
+    const node = await poll(async () => (await query(page, ticket)).nodes.find(item => item.content.assetId),
+      'Dropping a real PNG did not save an asset node')
+    assert.equal(node.type, 'image')
+    assert.equal(node.content.path, 'assets/images/' + node.content.assetId)
+    assert.ok(Number.isFinite(node.content.canvasPosition?.x) && Number.isFinite(node.content.canvasPosition?.y))
+    const original = await readFile(imageAsset)
+    assert.deepEqual(await readFile(join(home, record.workspaceName, node.content.path)), original)
+    assert.equal(node.content.url, undefined)
+    await card(page, node.id).locator('img').first().evaluate(image => image.decode())
+  })
+})
+
 test('Native canvas uploads media and sends the connected PNG to the configured video endpoint', {
   timeout: 125_000, skip: !hasImage || !hasVideo || !existsSync(projectImageAsset),
 }, async () => {

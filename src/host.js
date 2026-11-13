@@ -1,7 +1,7 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { EventEmitter, once } from 'node:events'
 import { startKernel, StudioError } from './kernel.js'
-import { importMedia, streamMedia } from './media.js'
+import { importedMediaURL, importMedia, streamImportedMedia, streamMedia } from './media.js'
 import { registerTools } from './tools.js'
 import { openProfileSettings } from './profile-settings.js'
 
@@ -182,7 +182,8 @@ export async function apply(ctx, config) {
     const { ticket, type, name } = keys(body, 'ticket', 'type', 'name')
     const { sessionId, workspace } = await verify(ticket, peer)
     if (!(await kernel(sessionId, workspace, 'context')).connected) throw new StudioError(403, '请先连接当前会话与画布')
-    return importMedia(req, workspace.path, type, name)
+    const asset = await importMedia(req, workspace.path, type, name)
+    return { ...asset, url: importedMediaURL(ticket, asset.type, asset.assetId) }
   }, 'POST', true)
 
   route(ctx, '/api/drama/events', async (body, peer, _req, res) => {
@@ -255,11 +256,17 @@ export async function apply(ctx, config) {
   })
 
   route(ctx, '/api/drama/media', async (body, peer, req, res) => {
-    const { ticket, id } = keys(body, 'ticket', 'id')
-    if (!id) throw new StudioError(400, 'Node id is required')
+    const { ticket, id, type, assetId } = keys(body, 'ticket', 'id', 'type', 'assetId')
     const { sessionId, workspace } = await verify(ticket, peer)
+    if (assetId !== undefined) {
+      if (id !== undefined || !type) throw new StudioError(400, 'Media type and asset id are required')
+      if (!(await kernel(sessionId, workspace, 'context')).connected) throw new StudioError(403, '请先连接当前会话与画布')
+      return streamImportedMedia(req, res, workspace.path, type, assetId)
+    }
+    if (!id || type !== undefined) throw new StudioError(400, 'Node id is required')
     const { nodes } = await kernel(sessionId, workspace, 'query', { id, limit: 1 })
-    return streamMedia(req, res, workspace.path, nodes[0])
+    const node = nodes[0]
+    return streamMedia(req, res, workspace.path, node?.type, node?.content.path)
   }, 'GET')
 
   registerTools(ctx, workspaceFor, kernel, keys, protectNodes)

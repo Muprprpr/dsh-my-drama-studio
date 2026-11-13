@@ -716,6 +716,7 @@ function NodeEditor({
 
   function buildEdit(form) {
     const next = { ...content }
+    if (!edit) delete next.canvasPosition
     const description = String(form.get('description') ?? '').trim()
     if (form.has('description')) next[textField] = description
     if (compact && !hasPrompt) next[textField] = metadata.description
@@ -729,6 +730,8 @@ function NodeEditor({
         if (value) next[field] = value
         else delete next[field]
       }
+      if (asset?.assetId) next.assetId = asset.assetId
+      else if (asset || next.path !== content.path) delete next.assetId
     }
     const ordered = supportsRefs ? references : []
     if (generation) {
