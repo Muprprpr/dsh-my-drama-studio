@@ -485,7 +485,7 @@ function GenerationParams({ value, update, profile, generationDefaults, mode }) 
 function NodeEditor({
   draft, append, mutate, mutationReason, media = [], queryCanvas, finish, close, mediaURL, index,
   generationProfiles, generationDefaults, node, actions, latest, resolvedMedia, rename, referenceFocus, uploadReference,
-  importFile, attachAsset, reportSaveError,
+  importFile, attachAsset, reportSaveError, clearSeed,
 }) {
   const { base, preset, seed, duplicate, edit, group } = draft
   const type = node.type
@@ -522,9 +522,10 @@ function NodeEditor({
   const previous = useRef({ mode: savedMode, ids: persistedRefs })
   const seedMode = type === 'image' ? 't2i' : type === 'video' ? mode : ''
   const seeded = seed && supportsRefs && referenceLimit(seedMode, seed.type) > 0
-  const [references, setReferences] = useState(() => [...new Set([
-    ...persistedRefs, ...(seeded ? [seed.id] : []),
+  const [references, setReferences] = useState(() => [...new Set([...persistedRefs,
+    ...(seeded && !edit ? [seed.id] : []),
   ])])
+  const [pendingSeed, setPendingSeed] = useState(seeded && edit && !persistedRefs.includes(seed.id) ? seed : null)
   const [extraMedia, setExtraMedia] = useState(() => seed ? [seed] : [])
   const available = new Map([...extraMedia, ...media, ...(index?.values() ?? [])]
     .filter(item => item.id !== node.id).map(item => [item.id, item]))
@@ -664,10 +665,11 @@ function NodeEditor({
   function changeMode(value) {
     if (compact) {
       const issue = value === 'asset'
-        ? (!isMedia(node) || references.length ? '切换素材模式前需要已有视频，并移除参考素材。' : '')
+        ? (references.length || prompt.trim() ? '切换到素材前，请清空提示词并移除参考素材。' : '')
         : referenceIssue(value, referenceKinds)
       if (issue) { setError(issue); return }
     }
+    if (pendingSeed && !referenceLimit(value, pendingSeed.type)) discardSeed()
     setMode(value)
     setProfileId('')
     setOverrides({})
@@ -681,8 +683,24 @@ function NodeEditor({
   }
 
   function attachReference(item) {
+    if (pendingSeed) discardSeed()
     setExtraMedia(current => [...current, item])
     setReferences(current => [...new Set([...current, item.id])])
+    markDirty()
+  }
+
+  function discardSeed() {
+    setPendingSeed(null)
+    clearSeed?.()
+  }
+
+  function updatePrompt(value) {
+    setPrompt(value)
+    if (value.trim() && pendingSeed && !pendingSeed.deleted &&
+        referenceLimit(referenceMode, pendingSeed.type, activeProfile) > 0) {
+      attachReference(pendingSeed)
+      setPendingSeed(null)
+    }
     markDirty()
   }
 
@@ -729,8 +747,9 @@ function NodeEditor({
         delete next.textList
       }
     } else if (type === 'video') {
-      if (!next.path && !next.url) throw new Error('请上传或选择视频素材。')
-      for (const key of ['mode', 'profileId', 'params', 'prompt', 'textList', 'mixedListOrder']) delete next[key]
+      if (compact) next.mode = 'asset'
+      else delete next.mode
+      for (const key of ['profileId', 'params', 'prompt', 'textList', 'mixedListOrder']) delete next[key]
     } else if (type === 'shot') {
       if (ordered.length) next.mixedListOrder = ordered
       else delete next.mixedListOrder
@@ -787,6 +806,7 @@ function NodeEditor({
       const result = await send('update_node', { ...payload, revision: revision.current }, committed.current)
       revision.current = result.revision
       committed.current = { ...committed.current, ...payload, revision: result.revision }
+      if (seed && payload.referenceSources.includes(seed.id)) clearSeed?.()
       state.savedVersion = version
       if (mounted.current && !state.pending && !state.error) {
         setDirty(false)
@@ -858,8 +878,10 @@ function NodeEditor({
 
   const effectiveNode = node.revision >= revision.current ? node : committed.current
   if (compact) {
-    const modeItems = Object.entries(modeLabels).filter(([id]) => id !== 'asset' || !generation)
-      .map(([id, label]) => ({ id, label: id === 'asset' ? '素材' : id.toUpperCase(), title: label }))
+    const modeItems = Object.entries(modeLabels).map(([id, label]) => ({
+      id, label: id === 'asset' ? '素材' : id.toUpperCase(), title: label,
+      disabled: id === 'asset' && (references.length > 0 || Boolean(prompt.trim())),
+    }))
     const shownError = error || (blocked ? mutationReason : '')
     return <form className={'drama-node-editor drama-node-creative ' + interactions} aria-label={formLabel}
       onSubmit={event => event.preventDefault()} onDoubleClick={preventCanvasDoubleClick}
@@ -874,7 +896,8 @@ function NodeEditor({
             : <MediaReferences compact mode={referenceMode} profile={activeProfile} media={available} mediaURL={mediaURL}
               resolvedMedia={resolvedMedia} queryCanvas={queryCanvas} nodeId={node.id} references={references}
               setReferences={changeReferences} onSelect={attachReference} uploadReference={uploadReference}
-              attachAsset={attachAsset} locate={actions.locate} preview={actions.preview} disabled={blocked} />}
+              attachAsset={attachAsset} locate={actions.locate} preview={actions.preview} disabled={blocked}
+              pendingSeed={pendingSeed} discardSeed={discardSeed} />}
         </div>
         <div className={'drama-node-creative-prompt' + (expanded ? ' is-expanded' : '')}>
           <textarea ref={promptInput} aria-label="提示词" name="prompt" rows={expanded ? 9 : 3}
@@ -882,10 +905,9 @@ function NodeEditor({
             onCompositionStart={() => { composingPrompt.current = true }}
             onCompositionEnd={event => {
               composingPrompt.current = false
-              setPrompt(event.currentTarget.value)
-              markDirty()
+              updatePrompt(event.currentTarget.value)
             }}
-            onChange={event => { setPrompt(event.target.value); if (!composingPrompt.current) markDirty() }} />
+            onChange={event => composingPrompt.current ? setPrompt(event.target.value) : updatePrompt(event.target.value)} />
           {(canExpand || expanded) && <Button size="sm" className="drama-node-prompt-expand" aria-expanded={expanded}
             aria-label={expanded ? '收起提示词' : '展开提示词'} title={expanded ? '收起提示词' : '展开提示词'}
             onClick={() => setExpanded(current => !current)}>
@@ -893,7 +915,8 @@ function NodeEditor({
           </Button>}
         </div>
       </>}
-      {shownError && <p className="drama-node-creative-status" role={error ? 'alert' : 'status'}>{shownError}</p>}
+      {(shownError || generation && prompt.trim() && !dirty && unavailable) &&
+        <p className="drama-node-creative-status" role={error ? 'alert' : 'status'}>{shownError || unavailable}</p>}
       <div className="drama-node-creative-controls">
         {type === 'video'
           ? <MenuSelect compact label="视频方式" value={mode} items={modeItems} onChange={changeMode} disabled={blocked} />
@@ -1099,7 +1122,7 @@ function ReferenceModeMenu({ disabled, choose }) {
 }
 
 function MediaReferences({ compact, mode, profile, media, mediaURL, resolvedMedia, queryCanvas, nodeId, references,
-  setReferences, onSelect, uploadReference, attachAsset, locate, preview, disabled }) {
+  setReferences, onSelect, uploadReference, attachAsset, locate, preview, disabled, pendingSeed, discardSeed }) {
   const [search, setSearch] = useState('')
   const [pickerOpen, setPickerOpen] = useState(false)
   const totalLimit = mode === 'r2v' ? profile?.limits?.maxReferences ?? 32 : 32
@@ -1161,6 +1184,10 @@ function MediaReferences({ compact, mode, profile, media, mediaURL, resolvedMedi
     const closePicker = () => { setPickerOpen(false); setSearch('') }
     return <>
       <div className="drama-node-reference-strip" aria-label={legend}>
+        {pendingSeed && !references.includes(pendingSeed.id) && <ReferenceSlot id={pendingSeed.id} item={pendingSeed}
+          asset={resolvedMedia?.get(pendingSeed.id) ?? pendingSeed}
+          title={slot + ' · ' + nodeName(pendingSeed) + '（填写提示词后连接）'} label={slot + ' · 待连接'} disabled={disabled}
+          index={0} count={1} mediaURL={mediaURL} locate={locate} preview={preview} remove={discardSeed} />}
         {!!references.length && <div className="drama-node-reference-track" onWheel={event => {
           const track = event.currentTarget
           if (!event.deltaX && track.scrollWidth > track.clientWidth) track.scrollLeft += event.deltaY

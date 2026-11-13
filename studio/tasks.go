@@ -142,7 +142,7 @@ func submissionNode(ctx context.Context, tx *sql.Tx, id string) (kind, snapshot 
 	if (kind != "image" && kind != "video") || json.Unmarshal([]byte(snapshot), &content) != nil {
 		return "", "", invalid("请选择图片或视频生成节点")
 	}
-	if kind == "video" && content.Mode == "" && (content.Path != "" || content.URL != "") {
+	if kind == "video" && (content.Mode == "asset" || content.Mode == "" && (content.Path != "" || content.URL != "")) {
 		return "", "", invalid("请选择视频生成草稿")
 	}
 	return kind, snapshot, nil

@@ -575,17 +575,111 @@ test('U1 native composer menu and Canvas shell', { timeout: 75_000 }, async () =
   })
 })
 
-async function pick(page, type, openPicker) {
+async function pick(page, name, ticket, type, openPicker) {
+  const before = new Set((await query(page, ticket, { type })).nodes.map(node => node.id))
   if (openPicker) await openPicker()
   else await panel(page).getByRole('toolbar', { name: '画布工具', exact: true })
     .getByRole('button', { name: '新增节点', exact: true }).click()
   const input = page.getByRole('textbox', { name: '查找节点类型', exact: true })
-  await input.fill(type)
+  await input.fill(name)
   await input.press('Enter')
-  const draft = draftCard(page).last()
-  await draft.waitFor()
-  return draft
+  const node = await poll(async () => (await query(page, ticket, { type })).nodes.find(node => !before.has(node.id)),
+    'selecting ' + name + ' did not create a persisted node')
+  await card(page, node.id).waitFor()
+  return node
 }
+
+const nodeEditor = (page, id) => card(page, id).getByRole('form', { name: '编辑节点', exact: true })
+
+async function editDetails(page, id, values) {
+  const heading = card(page, id).locator('.drama-node-heading strong')
+  await heading.dblclick()
+  const dialog = page.getByRole('dialog', { name: '节点详情', exact: true })
+  await dialog.waitFor()
+  for (const [field, value] of Object.entries(values)) await dialog.getByRole('textbox', { name: field, exact: true }).fill(value)
+  await dialog.getByRole('button', { name: '关闭节点详情', exact: true }).click()
+}
+
+async function updateVideo(page, ticket, id, prompt) {
+  await nodeEditor(page, id).getByRole('textbox', { name: '提示词', exact: true }).fill(prompt)
+  await poll(async () => (await query(page, ticket, { id })).nodes[0]?.content.prompt === prompt,
+    'video prompt did not persist')
+}
+
+test('New canvas nodes are persisted and usable immediately from the picker', { timeout: 75_000 }, async () => {
+  await withWeb(async ({ page, records }) => {
+    const [record] = records
+    await select(page, record)
+    await open(page, record)
+    const ticket = await ticketFor(page, record.sessionId)
+    await panel(page).getByRole('button', { name: '搜索', exact: true }).click()
+    const initialSearch = panel(page).getByRole('textbox', { name: '搜索节点', exact: true })
+    await initialSearch.fill('不会匹配新节点')
+    await initialSearch.press('Enter')
+    const image = await pick(page, '图片', ticket, 'image')
+    const picture = card(page, image.id)
+    await picture.getByRole('button', { name: '上传图片', exact: true }).waitFor()
+    const imagePrompt = '新建图片功能验收，室内自然光照亮木桌。'
+    await picture.getByRole('textbox', { name: '提示词', exact: true }).fill(imagePrompt)
+    await clickBlank(page)
+    await poll(async () => (await query(page, ticket, { id: image.id })).nodes[0]?.content.prompt === imagePrompt,
+      'editing an immediately-created image did not persist')
+    const video = await pick(page, 'i2v', ticket, 'video')
+    const target = card(page, video.id)
+    assert.equal(video.content.mode, 'i2v')
+    await target.getByRole('button', { name: '添加首帧', exact: true }).waitFor()
+    const prompt = '新建视频功能验收，镜头缓慢推近木桌，保持自然光。'
+    await target.getByRole('textbox', { name: '提示词', exact: true }).fill(prompt)
+    await clickBlank(page)
+    await poll(async () => (await query(page, ticket, { id: video.id })).nodes[0]?.content.prompt === prompt,
+      'editing an immediately-created video did not persist')
+    await dragReference(page, image.id, video.id)
+    const linked = await poll(async () => {
+      const snapshot = await query(page, ticket, { id: video.id })
+      return snapshot.edges.some(edge => edge.source === image.id && edge.target === video.id) && snapshot.nodes[0]
+    }, 'new image and video could not be connected through their canvas ports')
+    assert.deepEqual(linked.content.mixedListOrder, [image.id])
+    assert.equal(linked.content.textList, undefined)
+    await clickBlank(page)
+    await panel(page).getByRole('button', { name: '搜索', exact: true }).click()
+    const search = panel(page).getByRole('textbox', { name: '搜索节点', exact: true })
+    await search.fill('新建视频功能验收')
+    await search.press('Enter')
+    await picture.waitFor({ state: 'detached' })
+    await fit(page)
+    await target.locator('.drama-node-titlebar').click({ button: 'right' })
+    await page.getByRole('menuitem', { name: /^删除节点/u }).click()
+    const confirm = page.getByRole('dialog', { name: '删除节点', exact: true })
+    await confirm.getByRole('button', { name: '确认删除', exact: true }).click()
+    await target.waitFor({ state: 'detached' })
+    assert.equal((await query(page, ticket, { id: video.id })).nodes[0].deleted, true)
+    assert.equal((await query(page, ticket, { id: image.id })).nodes[0].content.prompt, imagePrompt)
+    const audio = await pick(page, '音频素材', ticket, 'audio')
+    await card(page, audio.id).getByRole('button', { name: '上传音频', exact: true }).waitFor()
+    await nodeEditor(page, audio.id).getByRole('button', { name: '保存修改', exact: true }).waitFor()
+    const standalone = await pick(page, '提示词笔记', ticket, 'prompt')
+    await nodeEditor(page, standalone.id).getByRole('textbox', { name: '提示词', exact: true }).fill('独立文本说明')
+    await nodeEditor(page, standalone.id).getByRole('button', { name: '保存修改', exact: true }).click()
+    await poll(async () => (await query(page, ticket, { id: standalone.id })).nodes[0]?.content.prompt === '独立文本说明',
+      'editing a new standalone prompt node did not persist')
+    await clickBlank(page)
+    await fit(page)
+    const successor = await pick(page, 'i2v', ticket, 'video', async () => {
+      await picture.hover()
+      await picture.getByRole('button', { name: '新增后继节点', exact: true }).click()
+    })
+    assert.deepEqual((await query(page, ticket, { id: successor.id })).edges, [])
+    await card(page, successor.id).getByRole('button', { name: /填写提示词后连接/u }).waitFor()
+    await updateVideo(page, ticket, successor.id, '以 @图片1 为首帧，保持自然光，固定镜头。')
+    await poll(async () => {
+      const snapshot = await query(page, ticket, { id: successor.id })
+      const [node] = snapshot.nodes
+      return snapshot.edges.some(edge => edge.source === image.id) && node?.content.mixedListOrder?.[0] === image.id &&
+        node.content.textList === undefined
+    }, 'the new successor did not connect its pending media after saving the inline prompt')
+    assert.equal((await operate(page, ticket, 'tasks', {})).tasks.length, 0)
+  })
+})
 
 async function inputLayoutTest(page, textarea) {
   const viewport = flow(page).locator('.react-flow__viewport')
@@ -663,12 +757,19 @@ async function fit(page) {
 
 async function dragReference(page, source, target) {
   await fit(page)
-  const from = await card(page, source).locator('.drama-port-output').boundingBox()
-  const to = await card(page, target).locator('.drama-port-input').boundingBox()
-  assert.ok(from && to, 'source and target handles must be present')
-  await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2)
+  const point = handle => handle.evaluate(element => {
+    const box = element.getBoundingClientRect()
+    const x = box.left + box.width / 2
+    const y = box.top + box.height / 2
+    const hit = document.elementFromPoint(x, y)
+    return { x, y, clickable: hit === element, hit: hit?.outerHTML.slice(0, 160) }
+  })
+  const from = await point(card(page, source).locator('.drama-port-output'))
+  const to = await point(card(page, target).locator('.drama-port-input'))
+  assert.ok(from.clickable && to.clickable, JSON.stringify({ from, to }))
+  await page.mouse.move(from.x, from.y)
   await page.mouse.down()
-  await page.mouse.move(to.x + to.width / 2, to.y + to.height / 2, { steps: 20 })
+  await page.mouse.move(to.x, to.y, { steps: 20 })
   await page.mouse.up()
 }
 
@@ -786,7 +887,7 @@ async function addExistingMedia(page, ticket, workspace) {
   return { imageId, videoId }
 }
 
-test('U2 U3 U5 node drafts, shared Sessions, media and native theme/layout', { timeout: 180_000 }, async () => {
+test('U2 U3 U5 new nodes, derived drafts, shared Sessions, media and native theme/layout', { timeout: 180_000 }, async () => {
   await withWeb(async ({ page, context, url, records, home }) => {
     const [a, b, c, other] = records
     await select(page, a)
@@ -810,11 +911,10 @@ test('U2 U3 U5 node drafts, shared Sessions, media and native theme/layout', { t
     assert.equal(await open(observer, b), canvasId)
 
     await page.bringToFront()
-    const draft = await pick(page, '镜头')
-    const create = draft.getByRole('form', { name: '新建节点', exact: true })
-    await create.waitFor()
+    const shot = await pick(page, '镜头', first, 'shot')
+    const create = nodeEditor(page, shot.id)
+    await create.getByText('名称与镜头', { exact: true }).click()
     const name = create.getByRole('textbox', { name: '节点名称', exact: true })
-    await poll(() => name.evaluate(element => document.activeElement === element), 'new shot did not autofocus its name')
     await name.fill('推门进入餐厅')
     await create.getByRole('textbox', { name: '集', exact: true }).fill('EP01')
     await create.getByRole('textbox', { name: '场', exact: true }).fill('S01')
@@ -823,7 +923,7 @@ test('U2 U3 U5 node drafts, shared Sessions, media and native theme/layout', { t
     await description.fill('中景固定机位。人物推门后停顿，视线落到桌角的黄色小鸭。')
     await screenshot(page, '20-after-new-shot.png')
     await assertCanvasLayout(page)
-    await create.getByRole('button', { name: '创建节点', exact: true }).click()
+    await create.getByRole('button', { name: '保存修改', exact: true }).click()
     await create.waitFor({ state: 'hidden' })
     const [original] = (await query(page, first, { q: '推门进入餐厅' })).nodes
     assert.ok(original?.id)
@@ -847,28 +947,37 @@ test('U2 U3 U5 node drafts, shared Sessions, media and native theme/layout', { t
     await flow(page).locator('.react-flow__edge.drama-edge-version').first().waitFor()
     await screenshot(page, '22-after-version-chain.png')
 
-    const newVideo = await pick(page, 't2v', async () => {
+    const newVideo = await pick(page, 't2v', first, 'video', async () => {
       const point = await dragCanvasBlank(page)
       await page.mouse.click(point.x, point.y, { button: 'right' })
     })
-    const videoPrompt = newVideo.getByRole('textbox', { name: '完整视频提示词', exact: true })
+    await card(page, newVideo.id).getByRole('button', { name: '派生版本', exact: true }).click()
+    const videoDraft = draftCard(page).last()
+    const videoPrompt = videoDraft.getByRole('textbox', { name: '完整视频提示词', exact: true })
     await videoPrompt.fill('完整视频提示词。她推开餐厅门，先停顿，再将视线落向桌角。\n镜头保持固定中景。')
     await inputLayoutTest(page, videoPrompt)
     await screenshot(page, '23-after-prompt-editor.png')
-    await newVideo.getByRole('button', { name: '取消', exact: true }).click()
-    await newVideo.waitFor({ state: 'hidden' })
+    await videoDraft.getByRole('button', { name: '取消', exact: true }).click()
+    await videoDraft.waitFor({ state: 'hidden' })
+    await fit(page)
+    await card(page, newVideo.id).locator('.drama-node-titlebar').click()
+    await page.keyboard.press('Delete')
+    await card(page, newVideo.id).waitFor({ state: 'detached' })
     assert.equal((await query(page, first, { type: 'video' })).nodes.length, 0)
 
     await fit(page)
     await card(page, revised.id).locator('.drama-node-titlebar').click({ button: 'right' })
     await page.getByRole('menuitem', { name: '复制 · Ctrl+C', exact: true }).waitFor()
     await page.keyboard.press('Escape')
-    await card(page, revised.id).hover()
-    await card(page, revised.id).getByRole('button', { name: '新增后继节点', exact: true }).click()
-    const successor = await pick(page, '备注', async () => {})
+    const successorNode = await pick(page, '备注', first, 'note', async () => {
+      await card(page, revised.id).hover()
+      await card(page, revised.id).getByRole('button', { name: '新增后继节点', exact: true }).click()
+    })
+    const successor = nodeEditor(page, successorNode.id)
+    await successor.getByText('名称与镜头', { exact: true }).click()
     await successor.getByRole('textbox', { name: '节点名称', exact: true }).fill('后继剪辑备忘')
     await successor.getByRole('textbox', { name: '正文', exact: true }).fill('将开门声留到镜头前半拍。')
-    await successor.getByRole('button', { name: '创建节点', exact: true }).click()
+    await successor.getByRole('button', { name: '保存修改', exact: true }).click()
     const note = await poll(async () => (await query(page, first, { q: '后继剪辑备忘' })).nodes[0], 'successor note not persisted')
     const references = await query(page, first)
     assert.ok(references.edges.some(edge => edge.source === revised.id && edge.target === note.id))
@@ -1114,6 +1223,10 @@ test('Native human CRUD follows live Workspace Agent activity', { timeout: 100_0
     assert.equal((await current(peer, bTicket, disposable.id)).deleted, true)
     assert.ok(!(await query(peer, bTicket)).nodes.some(node => node.id === disposable.id))
 
+    const unsaved = await edit(peer, original.id)
+    const draftText = 'AI 在保存前启动，这段未保存正文仍须保留。'
+    await body(unsaved).fill(draftText)
+
     let linkTarget = await current(peer, bTicket, linked.id)
     assert.equal((await mutation(peer, bTicket, 'update_edge', {
       source: source.id, target: linked.id, newSource: replacement.id, revision: linkTarget.revision,
@@ -1131,9 +1244,6 @@ test('Native human CRUD follows live Workspace Agent activity', { timeout: 100_0
     assert.equal((await status(peer, b)).autoGenerate, false)
     await nativeActivity(home, unbound, 'cancel')
 
-    const unsaved = await edit(peer, original.id)
-    const draftText = 'AI 在保存前启动，这段未保存正文仍须保留。'
-    await body(unsaved).fill(draftText)
     assert.equal(await nativeActivity(home, a, 'start'), 'running')
     await busy(peer).waitFor()
     assert.equal(await nativeActivity(home, a, 'query', original.id), 'running')
@@ -1168,10 +1278,12 @@ test('Native human CRUD follows live Workspace Agent activity', { timeout: 100_0
     await card(page, original.id).locator('.drama-node-titlebar').click({ button: 'right' })
     assert.ok(await page.getByRole('menuitem', { name: /^删除节点/u }).isDisabled())
     await page.keyboard.press('Escape')
-    const addition = await pick(page, '备注')
+    const added = await pick(page, '备注', aTicket, 'note')
+    const addition = nodeEditor(page, added.id)
+    await addition.getByText('名称与镜头', { exact: true }).click()
     await addition.getByRole('textbox', { name: '节点名称', exact: true }).fill('AI 工作时人工新增')
     await addition.getByRole('textbox', { name: '正文', exact: true }).fill('新增和阅读仍然可用。')
-    await addition.getByRole('button', { name: '创建节点', exact: true }).click()
+    await addition.getByRole('button', { name: '保存修改', exact: true }).click()
     await addition.waitFor({ state: 'hidden' })
     assert.equal((await query(peer, bTicket, { q: 'AI 工作时人工新增' })).nodes.length, 1)
 
@@ -1328,19 +1440,20 @@ test('U4 native task drawer follows real Go worker in isolated provider fixture'
     await select(page, a)
     await open(page, a)
     const ticket = await ticketFor(page, a.sessionId)
-    const draft = await pick(page, 't2v')
-    await draft.getByLabel('节点名称', { exact: true }).fill('排队与结果定位验收')
-    await draft.getByLabel('集', { exact: true }).fill('EP01')
-    await draft.getByLabel('场', { exact: true }).fill('S01')
-    await draft.getByLabel('镜头', { exact: true }).fill('SH08')
-    await draft.getByLabel('完整视频提示词', { exact: true }).fill('固定中景。人物推开餐厅门，在门口停顿。')
-    await draft.getByRole('button', { name: '时长（秒）', exact: true }).click()
+    const created = await pick(page, 't2v', ticket, 'video')
+    await editDetails(page, created.id, { 节点名称: '排队与结果定位验收', 集: 'EP01', 场: 'S01', 镜头: 'SH08' })
+    await updateVideo(page, ticket, created.id, '固定中景。人物推开餐厅门，在门口停顿。')
+    await nodeEditor(page, created.id).getByRole('button', { name: '生成设置', exact: true }).click()
+    const generationSettings = page.getByRole('dialog', { name: '生成设置', exact: true })
+    await generationSettings.getByRole('button', { name: '时长（秒）', exact: true }).click()
     await page.getByRole('menuitem', { name: '8', exact: true }).click()
-    await draft.getByRole('button', { name: '创建节点', exact: true }).click()
-    await draft.waitFor({ state: 'detached' })
-    const [node] = (await query(page, ticket, { q: '排队与结果定位验收' })).nodes
+    await generationSettings.getByRole('button', { name: '关闭生成设置', exact: true }).click()
+    const node = await poll(async () => {
+      const [current] = (await query(page, ticket, { id: created.id })).nodes
+      return current?.content.params?.duration === 8 && current
+    }, 'duration override on a new video node did not save')
     assert.equal(node.content.params.duration, 8)
-    assert.deepEqual(node.content.mixedListOrder, [])
+    assert.deepEqual(node.content.mixedListOrder ?? [], [])
     assert.equal(node.content.textList, undefined)
     const nodeId = node.id
     const source = card(page, nodeId)
@@ -1449,17 +1562,25 @@ test('U5 native video editors retain ordered media and inline prompts', { timeou
       ['v2v', '源视频验收', '保留 @视频1 的表演节奏，调整画面亮度。', '添加视频素材', [video]],
     ]
     for (const [mode, title, prompt, picker, references] of cases) {
-      const draft = await pick(page, mode)
-      await draft.getByLabel('节点名称', { exact: true }).fill(title)
-      await draft.getByLabel('完整视频提示词', { exact: true }).fill(prompt)
-      for (const ref of references) {
-        await draft.getByRole('button', { name: picker, exact: true }).click()
+      const created = await pick(page, mode, ticket, 'video')
+      await editDetails(page, created.id, { 节点名称: title })
+      await updateVideo(page, ticket, created.id, prompt)
+      const editor = nodeEditor(page, created.id)
+      for (const [index, ref] of references.entries()) {
+        const slot = mode === 'i2v' ? index === 0 ? '添加首帧' : '添加尾帧'
+          : mode === 'v2v' ? '添加源视频' : '添加参考素材'
+        await editor.getByRole('button', { name: slot, exact: true }).click()
+        await page.getByRole('dialog', { name: '添加参考素材', exact: true })
+          .getByRole('button', { name: picker, exact: true }).click()
         await page.getByRole('menuitem').filter({ hasText: ref.content.title }).click()
       }
-      await draft.getByRole('button', { name: '创建节点', exact: true }).click()
-      await draft.waitFor({ state: 'detached' })
+      await poll(async () => {
+        const [node] = (await query(page, ticket, { id: created.id })).nodes
+        return node?.content.mixedListOrder?.length === references.length
+      }, 'references were not persisted on the new ' + mode + ' video')
       const { nodes, edges } = await query(page, ticket)
-      const node = nodes.find(item => item.content.title === title)
+      const node = nodes.find(item => item.id === created.id)
+      assert.equal(node.content.title, title)
       assert.equal(node.content.mode, mode)
       assert.equal(node.content.prompt, prompt)
       assert.equal(node.content.textList, undefined)
@@ -1528,11 +1649,7 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
         if (!element.naturalWidth || !element.naturalHeight) throw new Error('Uploaded image did not decode')
       })
 
-      const emptyDraft = await pick(page, '图片')
-      await emptyDraft.getByRole('textbox', { name: '节点名称', exact: true }).fill('本地上传图片验收')
-      await emptyDraft.getByRole('button', { name: '创建节点', exact: true }).click()
-      const emptyImage = await poll(async () => (await query(page, ticket, { q: '本地上传图片验收' })).nodes[0],
-        'empty image node was not created')
+      const emptyImage = await pick(page, '图片', ticket, 'image')
       const uploadImage = page.waitForEvent('filechooser')
       await card(page, emptyImage.id).getByRole('button', { name: '上传图片', exact: true }).click()
       await (await uploadImage).setFiles(projectImageAsset)
@@ -1548,37 +1665,34 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
         return node.content.path && node.content.prompt === '保持原图构图，使用自然的室内光。'
       }, 'image prompt did not autosave without replacing the uploaded image')
 
-      const clipDraft = await pick(page, '视频素材')
-      const clipUpload = clipDraft.getByRole('button', { name: '上传视频', exact: true })
+      const clip = await pick(page, '视频素材', ticket, 'video')
+      const clipUpload = card(page, clip.id).getByRole('button', { name: '上传视频', exact: true })
       const chooser = page.waitForEvent('filechooser')
       await clipUpload.click()
       await (await chooser).setFiles(videoAsset)
-      await clipDraft.getByRole('button', { name: '上传视频', exact: true }).waitFor()
-      await clipDraft.getByRole('button', { name: '创建节点', exact: true }).click()
-      const clip = await poll(async () => (await query(page, ticket, { type: 'video' })).nodes.find(node => node.content.path),
-        'uploading a real MP4 did not create a persistent video')
+      await poll(async () => (await query(page, ticket, { id: clip.id })).nodes[0].content.path,
+        'uploading a real MP4 did not update the video asset node')
       await fit(page)
       await card(page, clip.id).locator('.drama-node-titlebar').click()
       assert.ok(await decodeVideoFrame(card(page, clip.id).locator('video')))
 
       const prompt = '以 @图片1 为首帧，保留小鸭轮廓。固定中景，停顿半秒后渐亮，保留室内环境声。'
       const formFor = node => card(page, node.id).getByRole('form', { name: '编辑节点', exact: true })
-      async function draftVideo(title, mode = 't2v') {
-        const draft = await pick(page, mode)
-        await draft.getByRole('textbox', { name: '节点名称', exact: true }).fill(title)
-        await draft.getByRole('textbox', { name: '完整视频提示词', exact: true }).fill(prompt.replace('以 @图片1 为首帧，', ''))
-        await draft.getByRole('button', { name: '创建节点', exact: true }).click()
-        return poll(async () => (await query(page, ticket, { q: title })).nodes.find(node => node.content.title === title),
-          'video draft was not saved: ' + title)
+      async function newVideo(title, mode = 't2v') {
+        const video = await pick(page, mode, ticket, 'video')
+        await editDetails(page, video.id, { 节点名称: title })
+        await updateVideo(page, ticket, video.id, prompt.replace('以 @图片1 为首帧，', ''))
+        return (await query(page, ticket, { id: video.id })).nodes[0]
       }
-      const first = await draftVideo('首帧连接验收甲')
-      const second = await draftVideo('首帧连接验收乙')
+      const first = await newVideo('首帧连接验收甲')
+      const second = await newVideo('首帧连接验收乙')
       await clickBlank(page)
       const edge = target => graphEdge(page, image.id, target.id)
       for (const target of [first, second]) {
+        await clickBlank(page)
         await dragReference(page, image.id, target.id)
         await poll(async () => (await query(page, ticket)).edges.some(item => item.source === image.id && item.target === target.id),
-          'canvas drag did not save the image reference')
+          'canvas drag did not save the image reference for ' + target.content.title)
         await edge(target).waitFor()
       }
 

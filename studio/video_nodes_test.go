@@ -1,6 +1,7 @@
 package studio
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -8,6 +9,64 @@ import (
 
 	"github.com/google/uuid"
 )
+
+func TestVideoAssetPlaceholderLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	s := New(nil)
+	defer s.Close()
+	bindSession(t, s, dir, "a")
+	s.SetHumanWriteCheck(func(context.Context, string, string, []string, []string) (bool, error) { return true, nil })
+	asset, image := uuid.NewString(), uuid.NewString()
+	_, err := editCall(s, dir, "a", "human", "append", appendArgs{
+		operation: operation{ID: "create-assets"},
+		Nodes: []NodeInput{
+			{ID: asset, Type: "video", Content: json.RawMessage(`{"mode":"asset","title":"视频素材"}`)},
+			{ID: image, Type: "image", Content: json.RawMessage(`{"path":"assets/images/frame.png"}`)},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node := exactNode(t, s, dir, "a", asset); node.Revision != 1 || !strings.Contains(string(node.Content), `"mode":"asset"`) {
+		t.Fatalf("video placeholder was not saved: %+v", node)
+	}
+	mustEdit(t, s, dir, "a", "update_node", updateNodeArgs{
+		nodeRevisionArgs: nodeRevisionArgs{operation: operation{ID: "attach-clip"}, ID: asset, Revision: 1},
+		Content:          json.RawMessage(`{"mode":"asset","path":"assets/videos/clip.mp4","title":"已有视频"}`),
+	})
+	for _, test := range []struct {
+		name, content, want string
+		sources             *[]string
+	}{
+		{name: "incoming media", content: `{"mode":"asset"}`, sources: &[]string{image}, want: "不能接入生成参考"},
+		{name: "inline prompt", content: `{"mode":"asset","prompt":"A scene"}`, want: "不能保存生成提示词"},
+		{name: "model profile", content: `{"mode":"asset","profileId":"profile"}`, want: "不能保存生成提示词"},
+		{name: "generation parameters", content: `{"mode":"asset","params":{"duration":5}}`, want: "不能保存生成提示词"},
+		{name: "legacy text list", content: `{"mode":"asset","textList":["script"]}`, want: "textList 必须为空"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := editCall(s, dir, "a", "human", "update_node", updateNodeArgs{
+				nodeRevisionArgs: nodeRevisionArgs{operation: operation{ID: test.name}, ID: asset, Revision: 2},
+				Content:          json.RawMessage(test.content),
+				ReferenceSources: test.sources,
+			})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("update returned %v, want %q", err, test.want)
+			}
+		})
+	}
+	result := mustCall(t, s, dir, "a", "query", queryArgs{ID: asset}).(queryResult)
+	if len(result.Edges) != 0 || len(result.Nodes) != 1 || result.Nodes[0].Revision != 2 ||
+		!strings.Contains(string(result.Nodes[0].Content), `"path":"assets/videos/clip.mp4"`) {
+		t.Fatalf("invalid updates altered the asset or graph: %+v", result)
+	}
+	for _, action := range []string{"submit_manual", "generateT2V"} {
+		_, err := call(s, dir, "a", action, map[string]any{"operationId": action, "nodeId": asset, "confirmed": true})
+		if err == nil || !strings.Contains(err.Error(), "请选择视频生成草稿") {
+			t.Fatalf("%s allowed asset submission: %v", action, err)
+		}
+	}
+}
 
 func TestVideoNodeMediaModes(t *testing.T) {
 	dir := t.TempDir()

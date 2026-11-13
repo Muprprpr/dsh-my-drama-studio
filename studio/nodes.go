@@ -646,6 +646,7 @@ func validateVideo(ctx context.Context, tx *sql.Tx, id string, draft bool) error
 	var data struct {
 		Prompt         string            `json:"prompt"`
 		Mode           string            `json:"mode"`
+		ProfileID      json.RawMessage   `json:"profileId"`
 		Path           string            `json:"path"`
 		URL            string            `json:"url"`
 		TextList       []json.RawMessage `json:"textList"`
@@ -685,6 +686,17 @@ func validateVideo(ctx context.Context, tx *sql.Tx, id string, draft bool) error
 	}
 	if err := rows.Err(); err != nil {
 		return err
+	}
+	if data.Mode == "asset" {
+		if len(media) != 0 || len(data.MixedListOrder) != 0 {
+			return invalid("视频素材节点不能接入生成参考")
+		}
+		if strings.TrimSpace(data.Prompt) != "" ||
+			len(data.ProfileID) != 0 && string(data.ProfileID) != "null" && string(data.ProfileID) != `""` ||
+			len(data.Params) != 0 && string(data.Params) != "null" {
+			return invalid("视频素材节点不能保存生成提示词、模型或参数")
+		}
+		return validateVideoDraftFields(raw)
 	}
 	isDraft := data.Path == "" && data.URL == "" || data.Mode != "" || len(media) > 0
 	if isDraft {

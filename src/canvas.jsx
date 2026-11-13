@@ -80,6 +80,7 @@ export function CanvasViewport({
   const [boxSelect, setBoxSelect] = useState(false)
   const [showMap, setShowMap] = useState(false)
   const [drafts, setDrafts] = useState([])
+  const videoSeeds = useRef(new Map())
   const [preview, setPreview] = useState(null)
   const [tasksOpen, setTasksOpen] = useState(false)
   const [selectedResults, setSelectedResults] = usePositions(`drama-results:${status.canvasId}:${status.sessionId}`)
@@ -178,13 +179,15 @@ export function CanvasViewport({
       uploadReference: file => createMedia(file, undefined, false),
       attachAsset: asset => asset.deleted || asset.id === draft.id ? createAssetNode(asset) : asset,
       reportSaveError: setEdgeError,
+      clearSeed: () => videoSeeds.current.delete(draft.id),
       finish: id => finishEdit(draft.id, id),
       close: () => draft.edit ? setSelected([]) : closeDraft(draft.id),
     }
   }
   const graphNodes = visible.map(node => {
+    const seed = index.get(videoSeeds.current.get(node.id)?.id) ?? videoSeeds.current.get(node.id)
     const draft = !node.deleted && selected.length === 1 && selected[0] === node.id
-      ? { id: node.id, base: node, edit: true, group: node } : null
+      ? { id: node.id, base: node, edit: true, group: node, seed: seed?.deleted ? undefined : seed } : null
     return {
       id: node.id,
       type: 'drama',
@@ -207,7 +210,10 @@ export function CanvasViewport({
   for (const draft of drafts) {
     const type = draft.preset?.type ?? draft.base?.type ?? 'shot'
     const node = { ...draft.group, ...draft.base, id: draft.id, type,
-      content: draft.base?.type === type ? draft.base.content : {} }
+      content: {
+        ...(draft.base?.type === type ? draft.base.content : {}),
+        ...(draft.preset?.mode ? { mode: draft.preset.mode } : {}),
+      } }
     const editor = editorFor(draft)
     graphNodes.push({ id: draft.id, type: 'drama', position: positions[draft.id] ?? draft.at, selected: selected.includes(draft.id),
       className: 'drama-flow-node', dragHandle: '.drama-node-card',
@@ -389,19 +395,34 @@ export function CanvasViewport({
     }
   }
 
+  function revealNew(items) {
+    const { id, q, taskStatus, type, createdBySession, offset, ...view } = filters
+    for (const [field] of groupFields) {
+      if (view[field] && items.some(node => node[field] !== view[field])) delete view[field]
+    }
+    if (type && items.every(node => node.type === type)) view.type = type
+    if (id || q || taskStatus || createdBySession || offset || view.type !== type ||
+        groupFields.some(([field]) => view[field] !== filters[field])) setFilters(view)
+    const groups = new Set(items.map(shotLabel))
+    setCollapsed(current => current.filter(group => !groups.has(group)))
+  }
+
   async function createMedia(file, at, focus = true) {
     const type = mediaKind(file)
     if (!mediaTypes.has(type)) throw new Error('请选择支持的图片、视频或音频文件')
     const content = await uploadFile(type, file)
     const node = { id: crypto.randomUUID(), type, content, ...groupFor(null, filters) }
     await appendWithHistory({ nodes: [node] })
+    if (focus) revealNew([node])
     placeNew(node.id, at, focus)
     return { ...node, revision: 1 }
   }
 
   async function assignAsset(node, asset) {
     const { path, url } = asset
-    const content = { ...node.content, path, url, title: nodeTitle(node) || asset.title }
+    const title = nodeTitle(node)
+    const defaultTitle = presets.find(preset => preset.type === node.type && (preset.mode ?? '') === videoMode(node))?.label
+    const content = { ...node.content, path, url, title: title && title !== defaultTitle ? title : asset.title || title }
     await editWithHistory('update_node', { id: node.id, revision: node.revision, ...groupOf(node), content })
   }
 
@@ -409,6 +430,7 @@ export function CanvasViewport({
     const { path, url, title } = asset.content
     const node = { id: crypto.randomUUID(), type: asset.type, content: { path, url, title }, ...groupFor(null, filters) }
     await appendWithHistory({ nodes: [node] })
+    if (focus) revealNew([node])
     placeNew(node.id, at, focus)
     return { ...node, revision: 1 }
   }
@@ -456,11 +478,8 @@ export function CanvasViewport({
     const at = positions[draftId] ?? draft?.at
     closeDraft(draftId)
     if (at) setPositions(current => ({ ...current, [id]: at }))
-    if (filters.id || filters.q || filters.taskStatus) {
-      const { id: _located, q: _query, taskStatus: _state, ...rest } = filters
-      setFilters({ ...rest, offset: 0 })
-    }
     if (draft) {
+      revealNew([{ ...groupFor(draft.base ?? draft.group, filters), type: draft.preset?.type ?? draft.base?.type }])
       selectNode(id)
       setFocusId(id)
     }
@@ -478,7 +497,28 @@ export function CanvasViewport({
 
   function choosePreset(preset) {
     const { at, seed } = picker
-    openEditor({ at, seed, preset, group: seed })
+    setPicker(null)
+    void runCanvas(async () => {
+      const id = crypto.randomUUID()
+      const { type, mode } = preset
+      const content = { title: preset.label, ...(mode ? { mode } : {}) }
+      const node = { id, type, content, ...groupFor(seed, filters) }
+      const edges = []
+      if (seed && type === 'video') videoSeeds.current.set(id, seed)
+      if (seed && type !== 'video' && type !== 'audio') {
+        edges.push({ source: seed.id, target: id })
+        if (type === 'shot' && seed.type === 'image') content.mixedListOrder = [seed.id]
+      }
+      try {
+        await appendWithHistory({ nodes: [node], edges })
+      } catch (failure) {
+        videoSeeds.current.delete(id)
+        throw failure
+      }
+      revealNew([node])
+      const source = seed && graphNodes.find(graph => graph.id === seed.id)?.position
+      placeNew(id, at ?? (source && { x: source.x + gapX, y: source.y }), true)
+    })
   }
 
   function linkPlan({ source, target, targetHandle }) {
@@ -642,8 +682,8 @@ export function CanvasViewport({
 
   function locate(id) {
     const node = index.get(id)
-    if (!node) setFilters({ id })
-    else setCollapsed(current => current.filter(group => group !== shotLabel(node)))
+    if (!nodes.some(node => node.id === id)) setFilters({ id })
+    else if (node) setCollapsed(current => current.filter(group => group !== shotLabel(node)))
     setSelected([id])
     setFocusId(id)
   }
@@ -746,6 +786,7 @@ export function CanvasViewport({
     await appendWithHistory({ nodes: nodesToAdd, edges: data.edges.map(edge => ({
       source: outgoing(edge.source), target: ids.get(edge.target),
     })) })
+    revealNew(nodesToAdd)
     const nudge = 36
     let shift = nudge
     while (data.nodes.some(node => graphNodes.some(graph => graph.position.x === node.position.x + shift
@@ -767,6 +808,7 @@ export function CanvasViewport({
       }
       if (!items.length) throw new Error('请选择支持的图片、视频或音频文件')
       await appendWithHistory({ nodes: items })
+      revealNew(items)
       const start = at ?? nextPosition()
       items.forEach((node, index) => placeNew(node.id, { x: start.x + index * gapX, y: start.y }, items.length === 1))
       setSelected(items.map(node => node.id))
@@ -950,6 +992,7 @@ export function CanvasViewport({
         items={[
           ...(lockReason(contextNode.id) ? [{ id: 'activity', type: 'label', text: lockReason(contextNode.id) }] : []),
           { id: 'rename', label: '重命名', disabled: Boolean(lockReason(contextNode.id)) },
+          { id: 'edit', label: '编辑节点' },
           { id: 'delete', label: '删除节点 · Delete', disabled: Boolean(lockReason(contextNode.id)), danger: true },
           { id: 'copy', label: '复制 · Ctrl+C' }, { id: 'duplicate', label: '复制为新节点 · Ctrl+D' },
           { id: 'references', label: '添加参考素材', disabled: Boolean(lockReason(contextNode.id)) ||
@@ -964,7 +1007,8 @@ export function CanvasViewport({
           else if (id === 'delete') openRemoval({ nodes: [node], edges: [] })
           else {
             setContextNode(null)
-            if (id === 'rename') renameNode(node.id)
+            if (id === 'edit') selectNode(node.id)
+            else if (id === 'rename') renameNode(node.id)
             else if (id === 'references') {
               selectNode(node.id)
               setReferenceFocus({ id: node.id, token: crypto.randomUUID() })
