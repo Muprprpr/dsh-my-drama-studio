@@ -13,6 +13,7 @@ import {
 } from './canvas-node.jsx'
 import { TaskStatus, taskActive } from './task-drawer.jsx'
 import { useNodeEditorPlacement } from './node-editor-placement.js'
+import { NodeParameterPopover } from './node-parameter-popover.jsx'
 import cardStyle from './node-card.css'
 
 export { cardStyle }
@@ -102,7 +103,7 @@ function SourceMedia({ node, url, openPreview, selected }) {
     {error ? <span role="status">无法播放音频</span>
       : <audio controls preload="none" src={url} aria-label={name} onError={() => setError(true)} />}
   </div>
-  return <div className={'drama-node-media' + (isImage ? '' : ' ' + interactions)} onDoubleClick={event => { event.preventDefault(); event.stopPropagation(); openPreview() }}>
+  return <div className="drama-node-media">
     <div className="drama-node-media-frame" data-media-type={node.type}>
       {error ? <div className="drama-node-media-placeholder" role="status">
         <NodeIcon type={node.type} size={21} /><span>{isImage ? '无法读取图片' : '无法播放视频'}</span>
@@ -123,7 +124,8 @@ function SourceMedia({ node, url, openPreview, selected }) {
             </Button>
           </Tooltip>
         </div>
-      </> : selected || enabled ? <video ref={videoRef} src={url} controls playsInline preload="metadata" aria-label={name}
+      </> : selected || enabled ? <video ref={videoRef} className={interactions} src={url} controls controlsList="nofullscreen" playsInline
+        preload="metadata" aria-label={name} onDoubleClick={event => { event.preventDefault(); event.stopPropagation() }}
         onLoadedData={() => setEnabled(true)}
         onError={() => setError(true)}
         onLoadedMetadata={event => {
@@ -190,14 +192,17 @@ const generationFields = { duration: '时长（秒）', resolution: '分辨率',
 
 function modelValue(profile, key, defaults) {
   if (!profile?.parameters?.includes(key)) return undefined
-  const value = profile.defaults?.[key] ?? defaults?.[key]
   const limits = profile.limits ?? {}
-  if (key === 'duration' && (limits.durations?.length && !limits.durations.includes(value) ||
-    limits.durationMin && value < limits.durationMin || limits.durationMax && value > limits.durationMax)) return undefined
-  if (key === 'resolution' && limits.resolutions?.length && !limits.resolutions.some(item =>
-    item.toLowerCase() === value?.toLowerCase())) return undefined
-  if (key === 'aspectRatio' && limits.aspectRatios?.length && !limits.aspectRatios.includes(value)) return undefined
-  return value
+  return [profile.defaults?.[key], defaults?.[key]].find(value => {
+    if (value == null || value === '' || value === 0) return false
+    if (key === 'duration') return (value > 0 || ['ark', 'byteplus'].includes(profile.provider)) &&
+      (!limits.durations?.length || limits.durations.includes(value)) &&
+      (!limits.durationMin || value >= limits.durationMin) && (!limits.durationMax || value <= limits.durationMax)
+    if (key === 'resolution') return !limits.resolutions?.length ||
+      limits.resolutions.some(item => item.toLowerCase() === String(value).toLowerCase())
+    if (key === 'aspectRatio') return !limits.aspectRatios?.length || limits.aspectRatios.includes(value)
+    return true
+  })
 }
 
 function inheritsFirstFrameRatio(profile, mode) {
@@ -316,9 +321,9 @@ function referenceReady(item, resolvedMedia) {
 
 export function GraphNode({ data, selected }) {
   const { node, draft, editor, compact, mediaURL, index, edges, tasks = [], generationProfiles = [],
-    generationDefaults, resolvedMedia, rename, referenceFocus, selectedResult, actions = {} } = data
+    generationDefaults, resolvedMedia, rename, referenceFocus, selectedResult, isFocused, actions = {} } = data
   const compactEditor = draft?.edit && (node.type === 'image' || node.type === 'video')
-  const panelRef = useNodeEditorPlacement(node.id, Boolean(compactEditor && editor))
+  const panelRef = useNodeEditorPlacement(node.id, Boolean(compactEditor && editor), Boolean(isFocused))
   const latest = tasks[0]
   const mode = videoMode(node)
   const mediaKind = mediaTypes.has(node.type)
@@ -350,10 +355,7 @@ export function GraphNode({ data, selected }) {
     <header className="drama-node-titlebar">
       <span className="drama-node-type-icon" title={nodeLabels[node.type]}><NodeIcon type={node.type} /></span>
       <div className="drama-node-heading">
-        <strong title={title} onDoubleClick={event => {
-          event.stopPropagation()
-          if (saved && !locked && !node.deleted) (actions.rename ?? actions.edit)?.(node)
-        }}>{title}</strong>
+        <strong title={title}>{title}</strong>
         <span className="drama-node-caption" title={fieldLabel(node)}>{mode ? modeLabels[mode] : nodeLabels[node.type]}
           {fieldLabel(node) && ' · ' + fieldLabel(node)}</span>
       </div>
@@ -408,7 +410,7 @@ export function GraphNode({ data, selected }) {
       className={'drama-node-editor-panel' + (compactEditor ? ' is-creative' : '')}>
       <NodeEditor draft={draft} {...editor} node={node} index={index} resolvedMedia={resolvedMedia} rename={rename} referenceFocus={referenceFocus}
         mediaURL={mediaURL} generationProfiles={generationProfiles} generationDefaults={generationDefaults}
-        actions={actions} latest={latest} />
+        actions={actions} latest={latest} isFocused={isFocused} />
     </div>}
   </article>
 }
@@ -456,37 +458,45 @@ function inlineReferenceIssue(prompt, kinds) {
   return ''
 }
 
-function GenerationParams({ value, update, profile, generationDefaults, mode }) {
+function generationParameters(value, profile, generationDefaults, mode) {
   const choices = { duration: profile?.limits?.durations, resolution: profile?.limits?.resolutions,
     aspectRatio: profile?.limits?.aspectRatios, generateAudio: ['true', 'false'] }
-  return Object.entries(generationFields).map(([key, label]) => {
-    if (key === 'aspectRatio' && inheritsFirstFrameRatio(profile, mode)) return null
+  return Object.entries(generationFields).flatMap(([key, label]) => {
     const selected = value[key] ?? ''
-    if (!profile?.parameters?.includes(key)) return null
+    if (!profile?.parameters?.includes(key)) return []
+    const fixed = key === 'aspectRatio' && inheritsFirstFrameRatio(profile, mode)
     const inherited = modelValue(profile, key, generationDefaults)
-    const placeholder = inherited == null ? '继承默认值' :
-      key === 'generateAudio' ? (inherited ? '继承：开启' : '继承：关闭') : '继承：' + inherited
-    const options = (choices[key] ?? []).map(item => ({
-      id: String(item), label: key === 'generateAudio' ? (item === 'true' ? '开启' : '关闭') : String(item),
-    }))
-    if (selected && options.length && !options.some(item => item.id === selected)) options.push({ id: selected, label: selected })
-    if (options.length) {
-      return <MenuSelect key={key} label={label} value={selected}
-        items={[{ id: '', label: placeholder }, ...options]} onChange={next => update(key, next)} />
+    const format = entry => key === 'generateAudio' ? (String(entry) === 'true' ? '音频开' : '音频关') :
+      key === 'duration' ? (String(entry) === '-1' ? '自动时长' : entry + ' 秒') : String(entry)
+    const placeholder = inherited == null ? '模型默认' : '默认 · ' + format(inherited)
+    const effective = selected || inherited
+    const summary = fixed ? '继承首帧画幅' : effective == null || effective === ''
+      ? label + ' · 默认' : format(effective)
+    const options = (choices[key] ?? []).map(item => ({ id: String(item), label: format(item) }))
+    if (selected && options.length && !options.some(item => item.id === selected)) {
+      options.push({ id: selected, label: format(selected) })
     }
-    return <label key={key} className="drama-node-field">{label}
-      <Input value={selected} placeholder={placeholder} type={key === 'duration' ? 'number' : 'text'}
-        min={key === 'duration' ? profile?.limits?.durationMin ?? -1 : undefined}
-        max={key === 'duration' ? profile?.limits?.durationMax ?? 3600 : undefined}
-        onChange={event => update(key, event.target.value)} />
-    </label>
+    const numeric = key === 'duration'
+    return [{ key, label, selected, placeholder, summary, fixed, numeric, options,
+      min: numeric ? profile.limits?.durationMin || (['ark', 'byteplus'].includes(profile.provider) ? -1 : 1) : undefined,
+      max: numeric ? profile.limits?.durationMax || 3600 : undefined }]
   })
+}
+
+function GenerationParams({ value, update, profile, generationDefaults, mode }) {
+  return generationParameters(value, profile, generationDefaults, mode).filter(param => !param.fixed).map(param =>
+    param.options.length ? <MenuSelect key={param.key} label={param.label} value={param.selected}
+      items={[{ id: '', label: param.placeholder }, ...param.options]} onChange={next => update(param.key, next)} />
+      : <label key={param.key} className="drama-node-field">{param.label}
+        <Input value={param.selected} placeholder={param.placeholder} type={param.numeric ? 'number' : 'text'}
+          min={param.min} max={param.max} onChange={event => update(param.key, event.target.value)} />
+      </label>)
 }
 
 function NodeEditor({
   draft, append, mutate, mutationReason, media = [], queryCanvas, finish, close, mediaURL, index,
   generationProfiles, generationDefaults, node, actions, latest, resolvedMedia, rename, referenceFocus, uploadReference,
-  importFile, attachAsset, reportSaveError,
+  importFile, attachAsset, reportSaveError, isFocused,
 }) {
   const { base, preset, seed, duplicate, edit, group } = draft
   const type = node.type
@@ -509,9 +519,11 @@ function NodeEditor({
   const [overrides, setOverrides] = useState(() => parameterValues(content))
   const [metadata, setMetadata] = useState(() => nodeMetadata(base))
   const [settings, setSettings] = useState('')
-  const [expanded, setExpanded] = useState(false)
-  const [canExpand, setCanExpand] = useState(false)
+  const [promptOpen, setPromptOpen] = useState(false)
+  const [openParameter, setOpenParameter] = useState('')
   const promptInput = useRef(null)
+  const promptExpand = useRef(null)
+  const promptScroll = useRef(0)
   const composingPrompt = useRef(false)
   const generation = type === 'image' || type === 'video' && mode !== 'asset'
   const hasPrompt = type === 'prompt' || generation
@@ -612,16 +624,6 @@ function NodeEditor({
     return () => cancelAnimationFrame(frame)
   }, [rename, edit, compact])
 
-  useLayoutEffect(() => {
-    if (!compact || expanded || !promptInput.current) return
-    const input = promptInput.current
-    const measure = () => setCanExpand(input.scrollHeight > input.clientHeight + 1)
-    measure()
-    const observer = new ResizeObserver(measure)
-    observer.observe(input)
-    return () => observer.disconnect()
-  }, [compact, expanded, prompt])
-
   useEffect(() => {
     if (!referenceFocus) return
     const frame = requestAnimationFrame(() => {
@@ -641,6 +643,7 @@ function NodeEditor({
   const referenceMode = type === 'image' ? 't2i' : type === 'video' ? mode : ''
   const currentProfiles = profileCandidates(generationProfiles, referenceMode)
   const activeProfile = resolveProfile(currentProfiles, profileId)
+  const parameters = generationParameters(overrides, activeProfile, generationDefaults, mode)
   const formLabel = edit ? '编辑节点' : duplicate ? '复制为新节点' : base ? '另存为新版本' : '新建节点'
   const choices = [{ id: '', label: '使用默认预设' },
     ...(profileId && !currentProfiles.some(item => item.id === profileId) ? [{ id: profileId, label: '原预设不可用' }] : []),
@@ -863,6 +866,25 @@ function NodeEditor({
     markDirty()
   }
 
+  function closePrompt() {
+    if (composingPrompt.current) return
+    setPromptOpen(false)
+    void flushAutosave()
+    requestAnimationFrame(() => {
+      promptExpand.current?.focus({ preventScroll: true })
+      if (promptInput.current) promptInput.current.scrollTop = promptScroll.current
+    })
+  }
+
+  const promptEvents = {
+    onCompositionStart: () => { composingPrompt.current = true },
+    onCompositionEnd: event => {
+      composingPrompt.current = false
+      updatePrompt(event.currentTarget.value)
+    },
+    onChange: event => composingPrompt.current ? setPrompt(event.target.value) : updatePrompt(event.target.value),
+  }
+
   const effectiveNode = node.revision >= revision.current ? node : committed.current
   if (compact) {
     const modeItems = Object.entries(modeLabels).map(([id, label]) => ({
@@ -874,10 +896,59 @@ function NodeEditor({
       onSubmit={event => event.preventDefault()} onDoubleClick={preventCanvasDoubleClick}
       onKeyDown={event => {
         if (!event.currentTarget.contains(event.target)) return
-        if (event.key === 'Escape' && !settings && !event.nativeEvent.isComposing && event.keyCode !== 229) close()
+        if (event.key === 'Escape' && !settings && !promptOpen && !openParameter &&
+            !composingPrompt.current && !event.nativeEvent.isComposing && event.keyCode !== 229) {
+          if (isFocused) return
+          close()
+        }
         stopCanvasKeys(event)
       }}>
       {generation && <>
+        <div className="drama-node-creative-prompt">
+          <textarea ref={promptInput} aria-label="提示词" name="prompt" rows={3}
+            placeholder={type === 'video' ? '描述镜头、动作与声音…' : '描述要生成的画面…'} value={prompt} disabled={blocked}
+            {...promptEvents} />
+          <Button ref={promptExpand} size="sm" className="drama-node-prompt-expand" aria-haspopup="dialog" aria-expanded={promptOpen}
+            aria-label="展开提示词" title="展开提示词" onClick={() => {
+              promptScroll.current = promptInput.current?.scrollTop ?? 0
+              setOpenParameter('')
+              setPromptOpen(true)
+            }}>
+            <IconFullscreenOutlineRegular size={14} />
+          </Button>
+        </div>
+        <div className="drama-node-creative-controls">
+          {type === 'video'
+            ? <MenuSelect compact label="视频方式" value={mode} items={modeItems} placeholder="选择方式"
+              onChange={changeMode} disabled={blocked} />
+            : <span className="drama-node-creative-mode" title="图片生成">T2I</span>}
+          <MenuSelect compact label="生成预设" value={profileId} disabled={blocked || type === 'video' && !mode}
+            items={profileId ? choices : [{ id: '', label: activeProfile ? '默认 · ' + activeProfile.name : '选择模型',
+              title: activeProfile?.model }, ...choices.slice(1)]}
+            onChange={changeProfile} />
+          <Button size="sm" className="drama-node-creative-settings" aria-label="节点详情" aria-haspopup="dialog"
+            title="节点详情" icon={<IconSlidersTwoOutlineRegular size={15} />}
+            onClick={() => setSettings('metadata')} />
+        </div>
+        {parameters.length > 0 && <div className="drama-node-parameter-chips" role="group" aria-label="有效生成参数">
+          {parameters.map(param => param.fixed
+            ? <span className="drama-focus-param-chip is-fixed" key={param.key} title={param.label}>{param.summary}</span>
+            : <NodeParameterPopover key={param.key} label={param.label} value={param.summary} disabled={blocked}
+              open={openParameter === param.key} onToggle={() => setOpenParameter(current => current === param.key ? '' : param.key)}
+              onClose={() => setOpenParameter(current => current === param.key ? '' : current)}>
+              {param.options.length ? <select aria-label={param.label} value={param.selected}
+                onChange={event => updateParam(param.key, event.target.value)}>
+                <option value="">{param.placeholder}</option>
+                {param.options.map(option => <option key={option.id} value={option.id}>{option.label}</option>)}
+              </select> : <Input aria-label={param.label} value={param.selected}
+                placeholder={param.placeholder} type={param.numeric ? 'number' : 'text'} min={param.min} max={param.max}
+                onChange={event => {
+                  if (event.currentTarget.validity.valid && (!param.numeric || event.target.value !== '0')) {
+                    updateParam(param.key, event.target.value)
+                  }
+                }} />}
+            </NodeParameterPopover>)}
+        </div>}
         <div ref={referenceArea}>
           {(!mode || mode === 't2v') && type === 'video' ? <ReferenceModeMenu disabled={blocked} choose={changeMode} />
             : <MediaReferences compact mode={referenceMode} profile={activeProfile} media={available} mediaURL={mediaURL}
@@ -885,73 +956,51 @@ function NodeEditor({
               setReferences={changeReferences} onSelect={attachReference} uploadReference={uploadReference}
               attachAsset={attachAsset} locate={actions.locate} preview={actions.preview} disabled={blocked} />}
         </div>
-        <div className={'drama-node-creative-prompt' + (expanded ? ' is-expanded' : '')}>
-          <textarea ref={promptInput} aria-label="提示词" name="prompt" rows={expanded ? 9 : 3}
-            placeholder={type === 'video' ? '描述镜头、动作与声音…' : '描述要生成的画面…'} value={prompt} disabled={blocked}
-            onCompositionStart={() => { composingPrompt.current = true }}
-            onCompositionEnd={event => {
-              composingPrompt.current = false
-              updatePrompt(event.currentTarget.value)
-            }}
-            onChange={event => composingPrompt.current ? setPrompt(event.target.value) : updatePrompt(event.target.value)} />
-          {(canExpand || expanded) && <Button size="sm" className="drama-node-prompt-expand" aria-expanded={expanded}
-            aria-label={expanded ? '收起提示词' : '展开提示词'} title={expanded ? '收起提示词' : '展开提示词'}
-            onClick={() => setExpanded(current => !current)}>
-            <IconChevronDownOutlineRegular size={13} />
-          </Button>}
-        </div>
+        {promptOpen && <Modal open title="编辑提示词" closeLabel="关闭提示词编辑器" onClose={closePrompt}
+          className="drama-node-prompt-dialog" contentClassName="drama-node-prompt-dialog-content" backdropBlur={false}
+          footer={<>
+            <span className="drama-node-prompt-save-status" role="status">
+              {mutationReason || error || (saving || dirty ? '正在保存…' : '已保存')}
+            </span>
+            <Button size="sm" variant="primary" onClick={closePrompt}>完成编辑</Button>
+          </>}>
+          <textarea aria-label="提示词" data-modal-autofocus value={prompt} disabled={blocked}
+            className={'drama-node-prompt-dialog-input ' + interactions} {...promptEvents} />
+        </Modal>}
       </>}
-      {(shownError || generation && (prompt.trim() || references.length > 0) && !dirty && unavailable) &&
-        <p className="drama-node-creative-status" role={error ? 'alert' : 'status'}>{shownError || unavailable}</p>}
-      <div className="drama-node-creative-controls">
-        {type === 'video'
-          ? <MenuSelect compact label="视频方式" value={mode} items={modeItems} placeholder="选择方式"
-            onChange={changeMode} disabled={blocked} />
-          : <span className="drama-node-creative-mode" title="图片生成">T2I</span>}
-        {generation && <MenuSelect compact label="生成预设" value={profileId} disabled={blocked || type === 'video' && !mode}
-          items={profileId ? choices : [{ id: '', label: activeProfile ? '默认 · ' + activeProfile.name : '选择模型',
-            title: activeProfile?.model }, ...choices.slice(1)]}
-          onChange={changeProfile} />}
-        <Button size="sm" className="drama-node-creative-settings" aria-label="生成设置" aria-haspopup="dialog"
-          title="生成设置" icon={<IconSlidersTwoOutlineRegular size={15} />}
-          onClick={() => setSettings(generation ? 'generation' : 'metadata')} />
+      {!generation && <div className="drama-node-creative-controls">
+        <MenuSelect compact label="视频方式" value={mode} items={modeItems} placeholder="选择方式"
+          onChange={changeMode} disabled={blocked} />
+        <Button size="sm" aria-haspopup="dialog" onClick={() => setSettings('metadata')}>节点详情</Button>
+      </div>}
+      <div className="drama-node-creative-footer">
+        {(shownError || generation && (prompt.trim() || references.length > 0) && !dirty && unavailable) &&
+          <p className="drama-node-creative-status" role={error ? 'alert' : 'status'}>{shownError || unavailable}</p>}
         {generation && <GenerateControl node={effectiveNode} profile={savedProfile} generationDefaults={generationDefaults}
           actions={actions} unavailable={unavailable} latest={latest} />}
       </div>
-      {settings && <Modal open title={settings === 'generation' ? '生成设置' : '节点详情'}
-        closeLabel={settings === 'generation' ? '关闭生成设置' : '关闭节点详情'}
+      {settings && <Modal open title="节点详情" closeLabel="关闭节点详情"
         backdropBlur={false} onClose={() => setSettings('')}>
         <fieldset className="drama-node-settings drama-node-dialog-fields" disabled={blocked}>
-          {settings === 'generation' ? <>
-            <div className="drama-node-parameter-fields">
-              <GenerationParams value={overrides} profile={activeProfile} generationDefaults={generationDefaults} mode={mode}
-                update={updateParam} />
-            </div>
-            {!activeProfile?.parameters?.length && <p className="drama-node-dialog-summary">
-              {type === 'video' && !mode ? '请选择视频生成方式。' : '当前模型没有可调整的生成参数。'}
-            </p>}
-            <Button size="sm" className="drama-node-details-link" onClick={() => setSettings('metadata')}>名称与镜头</Button>
-            <TaskDetail task={latest} nodeId={node.id} locate={actions.locate} />
-          </> : <>
-            <label className="drama-node-field">节点名称
-              <Input data-modal-autofocus value={metadata.title} onChange={event => updateMetadata('title', event.target.value)} />
+          <label className="drama-node-field">节点名称
+            <Input data-modal-autofocus value={metadata.title} onChange={event => updateMetadata('title', event.target.value)} />
+          </label>
+          <div className="drama-node-group-fields">{groupFields.map(([field, label]) =>
+            <label className="drama-node-field" key={field}>{label}
+              <Input value={metadata[field]} onChange={event => updateMetadata(field, event.target.value)} />
+            </label>)}</div>
+          {assetNode && <>
+            <label className="drama-node-field">项目内素材路径
+              <Input value={metadata.path} onChange={event => updateMetadata('path', event.target.value)} />
             </label>
-            <div className="drama-node-group-fields">{groupFields.map(([field, label]) =>
-              <label className="drama-node-field" key={field}>{label}
-                <Input value={metadata[field]} onChange={event => updateMetadata(field, event.target.value)} />
-              </label>)}</div>
-            {assetNode && <>
-              <label className="drama-node-field">项目内素材路径
-                <Input value={metadata.path} onChange={event => updateMetadata('path', event.target.value)} />
-              </label>
-              <label className="drama-node-field">素材网址
-                <Input value={metadata.url} onChange={event => updateMetadata('url', event.target.value)} />
-              </label>
-            </>}
-            {!generation && <label className="drama-node-field">正文
-              <textarea rows={3} value={metadata.description} onChange={event => updateMetadata('description', event.target.value)} />
-            </label>}
+            <label className="drama-node-field">素材网址
+              <Input value={metadata.url} onChange={event => updateMetadata('url', event.target.value)} />
+            </label>
           </>}
+          {!generation && <label className="drama-node-field">正文
+            <textarea rows={3} value={metadata.description} onChange={event => updateMetadata('description', event.target.value)} />
+          </label>}
+          <TaskDetail task={latest} nodeId={node.id} locate={actions.locate} />
         </fieldset>
       </Modal>}
     </form>
@@ -961,7 +1010,10 @@ function NodeEditor({
     Boolean(referenceMode && referenceMode !== 't2v') || references.length > 0)
   return <form ref={formRef} className={'drama-node-editor ' + interactions} onSubmit={save} aria-label={formLabel}
     onChange={() => setDirty(true)} onKeyDown={event => {
-      if (event.key === 'Escape' && !event.nativeEvent.isComposing && event.keyCode !== 229) close()
+      if (event.key === 'Escape' && !event.nativeEvent.isComposing && event.keyCode !== 229) {
+        if (isFocused) return
+        close()
+      }
       stopCanvasKeys(event)
     }} onDoubleClick={preventCanvasDoubleClick}>
     <div className="drama-node-editor-fields">

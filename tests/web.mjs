@@ -592,12 +592,21 @@ async function pick(page, name, ticket, type, openPicker) {
 const nodeEditor = (page, id) => card(page, id).getByRole('form', { name: '编辑节点', exact: true })
 
 async function editDetails(page, id, values) {
-  const heading = card(page, id).locator('.drama-node-heading strong')
-  await heading.dblclick()
+  const target = card(page, id)
+  await target.hover()
+  await target.getByRole('button', { name: '重命名', exact: true }).click()
   const dialog = page.getByRole('dialog', { name: '节点详情', exact: true })
   await dialog.waitFor()
   for (const [field, value] of Object.entries(values)) await dialog.getByRole('textbox', { name: field, exact: true }).fill(value)
   await dialog.getByRole('button', { name: '关闭节点详情', exact: true }).click()
+}
+
+async function chooseDuration(page, id, value) {
+  const label = '时长（秒）'
+  await nodeEditor(page, id).getByRole('button', { name: label, exact: true }).click()
+  const popup = page.getByRole('dialog', { name: label, exact: true })
+  await popup.getByLabel(label, { exact: true }).selectOption(String(value))
+  return popup
 }
 
 async function updateVideo(page, ticket, id, prompt) {
@@ -887,6 +896,19 @@ async function dragNode(page, id) {
   const after = await state()
   assert.notEqual(after.position, before.position, JSON.stringify({ hit, before, during, after }))
   assert.equal(after.viewport, before.viewport, 'title drag moved the viewport')
+}
+
+async function focusNode(page, id) {
+  const title = card(page, id).locator('.drama-node-heading strong')
+  const point = await poll(() => title.evaluate(element => {
+    const box = element.getBoundingClientRect()
+    const x = box.x + box.width / 2
+    const y = box.y + box.height / 2
+    return document.elementFromPoint(x, y) === element && { x, y }
+  }), 'the node title was not visible for focus')
+  await page.mouse.dblclick(point.x, point.y)
+  await poll(async () => (await flow(page).getAttribute('data-focused-node')) === id,
+    'double-clicking the node title did not open focus mode')
 }
 
 async function ensureZoomScreenshot(url, home, record, context) {
@@ -1524,11 +1546,12 @@ test('U4 native task drawer follows real Go worker in isolated provider fixture'
     await chooseVideoMode(page, ticket, created.id, 't2v')
     await editDetails(page, created.id, { 节点名称: '排队与结果定位验收', 集: 'EP01', 场: 'S01', 镜头: 'SH08' })
     await updateVideo(page, ticket, created.id, '固定中景。人物推开餐厅门，在门口停顿。')
-    await nodeEditor(page, created.id).getByRole('button', { name: '生成设置', exact: true }).click()
-    const generationSettings = page.getByRole('dialog', { name: '生成设置', exact: true })
-    await generationSettings.getByRole('button', { name: '时长（秒）', exact: true }).click()
-    await page.getByRole('menuitem', { name: '8', exact: true }).click()
-    await generationSettings.getByRole('button', { name: '关闭生成设置', exact: true }).click()
+    const parameterChips = nodeEditor(page, created.id).getByRole('group', { name: '有效生成参数', exact: true })
+    assert.deepEqual(await parameterChips.getByRole('button').allTextContents(), ['4 秒'],
+      'unsupported parameters should not appear alongside the duration-only profile')
+    const durationPopup = await chooseDuration(page, created.id, 8)
+    await page.keyboard.press('Escape')
+    await durationPopup.waitFor({ state: 'hidden' })
     const node = await poll(async () => {
       const [current] = (await query(page, ticket, { id: created.id })).nodes
       return current?.content.params?.duration === 8 && current
@@ -1695,7 +1718,8 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
         name: '回环请求验收', protocol: 'custom-rest', baseUrl: 'http://127.0.0.1:' + endpoint.address().port,
         advanced: {
           submitUrl: '/jobs', submitMethod: 'POST', auth: 'none',
-          fields: { firstFrame: 'input.first_frame', duration: 'input.duration' },
+          fields: { firstFrame: 'input.first_frame', duration: 'input.duration', resolution: 'input.resolution',
+            aspectRatio: 'input.aspect_ratio', generateAudio: 'input.generate_audio' },
           taskIdPath: 'id', queryUrl: '/jobs/{taskId}', statusPath: 'status',
           statusMap: { done: 'completed', error: 'failed' }, outputUrlPath: 'url',
         },
@@ -1704,7 +1728,8 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
         revision: configured.revision,
         profile: {
           name: '回环首帧预设', channelId: configured.channels[0].id, model: 'capture-i2v',
-          modes: ['i2v'], defaults: { duration: 4 }, limits: { durations: [4, 8] },
+          modes: ['i2v'], defaults: { duration: 4, resolution: '720p', aspectRatio: '16:9', generateAudio: true },
+          limits: { durations: [4, 8], resolutions: ['720p', '1080p'], aspectRatios: ['16:9', '9:16'], generateAudio: true },
         },
       })
       const profileId = saved.profiles[0].id
@@ -1756,7 +1781,13 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
         'uploading a real MP4 did not update the video asset node')
       await fit(page)
       await card(page, clip.id).locator('.drama-node-titlebar').click()
-      assert.ok(await decodeVideoFrame(card(page, clip.id).locator('video')))
+      const player = card(page, clip.id).locator('video')
+      assert.ok(await decodeVideoFrame(player))
+      await player.dblclick({ position: { x: 20, y: 18 } })
+      assert.equal(await page.evaluate(() => Boolean(document.fullscreenElement)), false)
+      assert.equal(await flow(page).getAttribute('data-focused-node'), null)
+      assert.equal(await page.getByRole('dialog').count(), 0)
+      await player.evaluate(element => element.pause())
 
       const prompt = '以 @图片1 为首帧，保留小鸭轮廓。固定中景，停顿半秒后渐亮，保留室内环境声。'
       const formFor = node => card(page, node.id).getByRole('form', { name: '编辑节点', exact: true })
@@ -1781,10 +1812,10 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
 
       const firstBox = card(page, first.id).locator('.drama-node-titlebar')
       const nodeGeometry = node => card(page, node.id).evaluate(element => {
-        const box = element.getBoundingClientRect()
         const handle = selector => {
-          const rect = element.querySelector(selector).getBoundingClientRect()
-          return [Math.round(rect.left - box.left), Math.round(rect.top - box.top)]
+          const handle = element.querySelector(selector)
+          const style = getComputedStyle(handle)
+          return [handle.offsetLeft, handle.offsetTop, style.transform]
         }
         return {
           transform: element.closest('.react-flow__node').style.transform,
@@ -1808,7 +1839,7 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
             candidate.clientHeight > 0 && candidate.scrollHeight > candidate.clientHeight + 1 &&
             /^(auto|scroll)$/u.test(getComputedStyle(candidate).overflowY)) }
       })
-      assert.ok(editorGeometry.height >= 160 && editorGeometry.height <= 240, JSON.stringify(editorGeometry))
+      assert.ok(editorGeometry.height >= 160 && editorGeometry.height <= 270, JSON.stringify(editorGeometry))
       assert.ok(Math.abs(editorGeometry.width - editorGeometry.nodeWidth) <= 6, JSON.stringify(editorGeometry))
       assert.ok(editorGeometry.top >= editorGeometry.cardBottom, 'editor did not open below the node card')
       assert.ok(editorGeometry.bottom <= editorGeometry.canvasBottom, 'the lower panel is clipped by the canvas')
@@ -1818,11 +1849,13 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       assert.equal(await editor.getByRole('textbox', { name: /搜索/u }).count(), 0)
       const modeButton = editor.getByRole('button', { name: '视频方式', exact: true })
       const modelButton = editor.getByRole('button', { name: '生成预设', exact: true })
-      const settingsButton = editor.getByRole('button', { name: '生成设置', exact: true })
       const generateButton = editor.getByRole('button', { name: '生成…', exact: true })
-      const controlLine = await Promise.all([modeButton, modelButton, settingsButton, generateButton].map(control => control.boundingBox()))
+      const parameters = editor.getByRole('group', { name: '有效生成参数', exact: true })
+      assert.deepEqual(await parameters.getByRole('button').allTextContents(), ['4 秒', '720p', '16:9', '音频开'])
+      const controlLine = await Promise.all([modeButton, modelButton].map(control => control.boundingBox()))
       const centers = controlLine.map(box => box.y + box.height / 2)
-      assert.ok(Math.max(...centers) - Math.min(...centers) < 4, 'generation controls are not on one line')
+      assert.ok(Math.max(...centers) - Math.min(...centers) < 4, 'the mode and model controls are not on one line')
+      assert.ok((await generateButton.boundingBox()).y > centers[0], 'generation action did not follow the compact controls')
       const thumbnail = editor.getByRole('button', { name: /^首帧 · /u }).locator('img')
       await thumbnail.evaluate(async image => {
         await image.decode()
@@ -1842,32 +1875,111 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
         return element.clientHeight / Number.parseFloat(style.lineHeight)
       })
       assert.ok(promptHeight >= 2 && promptHeight <= 4, 'the prompt editor did not open at its compact height')
-      const longPrompt = Array.from({ length: 6 }, () => prompt).join('\n')
-      await promptBox.fill(longPrompt)
+      const longPrompt = Array.from({ length: 100 }, (_, index) => String(index + 1) + ' ' + prompt).join('\n')
       const collapsedHeight = await promptBox.evaluate(element => element.offsetHeight)
       await editor.getByRole('button', { name: '展开提示词', exact: true }).click()
-      assert.ok(await promptBox.evaluate(element => element.offsetHeight) > collapsedHeight,
-        'expanding a long prompt did not grow the textarea')
-      await editor.getByRole('button', { name: '收起提示词', exact: true }).click()
+      const promptDialog = page.getByRole('dialog', { name: '编辑提示词', exact: true })
+      const expandedPrompt = promptDialog.getByRole('textbox', { name: '提示词', exact: true })
+      await expandedPrompt.waitFor()
+      assert.ok(await expandedPrompt.evaluate(element => element.offsetHeight) > collapsedHeight,
+        'the full prompt dialog did not provide a larger editing surface')
+      await page.context().grantPermissions(['clipboard-read', 'clipboard-write'])
+      await page.evaluate(text => navigator.clipboard.writeText(text), longPrompt)
+      await expandedPrompt.press('Control+a')
+      await expandedPrompt.press('Control+v')
+      assert.equal(await expandedPrompt.inputValue(), longPrompt)
+      assert.ok(await expandedPrompt.evaluate(element => element.scrollHeight > element.clientHeight),
+        'the 100-line prompt could not scroll inside the editor')
+      await expandedPrompt.evaluate(element => { element.scrollTop = 0 })
+      await expandedPrompt.hover()
+      await page.mouse.wheel(0, 480)
+      await poll(() => expandedPrompt.evaluate(element => element.scrollTop > 0), 'the prompt dialog did not scroll')
+      await screenshot(page, 'expanded-prompt-editor.png')
+      await page.keyboard.press('Escape')
+      await promptDialog.waitFor({ state: 'hidden' })
       assert.equal(await promptBox.evaluate(element => element.offsetHeight), collapsedHeight)
-      assert.deepEqual(await nodeGeometry(first), zoomedGeometry, 'expanding the prompt moved the node or its handles')
-      await promptBox.fill(prompt + '。')
+      assert.equal(await promptBox.inputValue(), longPrompt)
+      await poll(async () => (await query(page, ticket, { id: first.id })).nodes[0].content.prompt === longPrompt,
+        'closing the full prompt dialog lost the long edit')
+      assert.deepEqual(await nodeGeometry(first), zoomedGeometry, 'the prompt dialog moved the node or its handles')
+      await editor.getByRole('button', { name: '展开提示词', exact: true }).click()
+      await expandedPrompt.fill(prompt)
+      await poll(async () => (await query(page, ticket, { id: first.id })).nodes[0].content.prompt === prompt,
+        'changing the expanded prompt did not autosave')
+      await expandedPrompt.press('End')
+      const inputSession = await page.context().newCDPSession(page)
+      try {
+        // Chromium dispatches the same composition/input events used by the OS input method.
+        await inputSession.send('Input.imeSetComposition', { text: '草', selectionStart: 1, selectionEnd: 1 })
+        assert.equal(await expandedPrompt.inputValue(), prompt + '草')
+        await delay(550)
+        assert.equal((await query(page, ticket, { id: first.id })).nodes[0].content.prompt, prompt,
+          'an uncommitted IME composition leaked into the saved prompt')
+        await inputSession.send('Input.insertText', { text: '。' })
+        await poll(async () => (await query(page, ticket, { id: first.id })).nodes[0].content.prompt === prompt + '。',
+          'the committed IME composition did not save')
+      } finally {
+        await inputSession.detach()
+      }
+      await promptDialog.getByRole('button', { name: '完成编辑', exact: true }).click()
+      await promptDialog.waitFor({ state: 'hidden' })
       await promptBox.press('End')
       await promptBox.press('Backspace')
       assert.equal(await promptBox.inputValue(), prompt)
       assert.ok(!(await query(page, ticket, { id: first.id })).nodes[0].deleted)
       await modelButton.click()
       await page.getByRole('menuitem', { name: '回环首帧预设', exact: true }).click()
-      assert.equal(await editor.getByRole('button', { name: '时长（秒）', exact: true }).count(), 0)
-      await settingsButton.click()
-      const parameterPopover = page.getByRole('dialog', { name: '生成设置', exact: true })
-      await parameterPopover.getByRole('button', { name: '时长（秒）', exact: true }).click()
-      await page.getByRole('menuitem', { name: '8', exact: true }).click()
-      await screenshot(page, 'compact-editor-settings.png')
-      await parameterPopover.getByRole('button', { name: '关闭生成设置', exact: true }).click()
+      const viewport = flow(page).locator('.react-flow__viewport')
+      const readViewport = () => viewport.evaluate(element => element.style.transform)
+      await fit(page)
+      const originalViewport = await readViewport()
+      const beforeFocus = await nodeGeometry(first)
+      await focusNode(page, first.id)
+      const exitFocus = page.getByRole('button', { name: '退出聚焦', exact: true })
+      await exitFocus.waitFor()
+      assert.equal(await flow(page).getAttribute('data-focused-node'), first.id)
+      await poll(async () => (await readViewport()) !== originalViewport, 'focus mode did not center the selected node')
+      const focusedGeometry = await nodeGeometry(first)
+      assert.deepEqual(focusedGeometry, beforeFocus, 'focus mode moved the node or its handles')
+      const duration = editor.getByRole('button', { name: '时长（秒）', exact: true })
+      await duration.click()
+      const parameterPopover = page.getByRole('dialog', { name: '时长（秒）', exact: true })
+      await parameterPopover.waitFor()
+      const resolution = editor.getByRole('button', { name: '分辨率', exact: true })
+      await resolution.click()
+      const resolutionPopover = page.getByRole('dialog', { name: '分辨率', exact: true })
+      await resolutionPopover.waitFor()
+      await parameterPopover.waitFor({ state: 'hidden' })
+      await resolutionPopover.getByLabel('分辨率', { exact: true }).selectOption('1080p')
+      await duration.click()
+      await resolutionPopover.waitFor({ state: 'hidden' })
+      const [chipBounds, popupBounds] = await Promise.all([duration.boundingBox(), parameterPopover.boundingBox()])
+      assert.ok(chipBounds && popupBounds && Math.abs(chipBounds.x - popupBounds.x) < 250 &&
+        Math.abs(chipBounds.y - popupBounds.y) < 180, 'duration popup did not open near its control')
+      await parameterPopover.getByLabel('时长（秒）', { exact: true }).selectOption('8')
+      await screenshot(page, 'focus-mode-parameter-popup.png')
+      await page.keyboard.press('Escape')
+      await parameterPopover.waitFor({ state: 'hidden' })
+      assert.equal(await flow(page).getAttribute('data-focused-node'), first.id, 'closing a popup also exited focus mode')
+      await editor.getByRole('button', { name: '展开提示词', exact: true }).click()
+      await promptDialog.waitFor()
+      await page.keyboard.press('Escape')
+      await promptDialog.waitFor({ state: 'hidden' })
+      assert.equal(await flow(page).getAttribute('data-focused-node'), first.id, 'closing the full prompt editor also exited focus mode')
+      await page.keyboard.press('Escape')
+      await exitFocus.waitFor({ state: 'hidden' })
+      await poll(async () => (await readViewport()) === originalViewport, 'exiting focus did not restore the exact viewport')
+      assert.deepEqual(await nodeGeometry(first), beforeFocus, 'focus mode changed node or port geometry')
+      assert.equal(await flow(page).getAttribute('data-focused-node'), null)
+      await firstBox.waitFor()
+      await delay(320)
+      await focusNode(page, first.id)
+      await exitFocus.click()
+      await poll(async () => (await readViewport()) === originalViewport, 'using the exit button did not restore the viewport')
       await clickBlank(page)
       await poll(async () => (await query(page, ticket, { id: first.id })).nodes[0].content.params?.duration === 8,
         'advanced parameters did not autosave')
+      assert.equal((await query(page, ticket, { id: first.id })).nodes[0].content.params.resolution, '1080p')
       await poll(async () => {
         const [node] = (await query(page, ticket, { id: first.id })).nodes
         return node.content.prompt === prompt && node.content.profileId === profileId
@@ -1902,6 +2014,19 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
         return panelBox.bottom <= nodeBox.top && panelBox.top >= canvasBox.top
       }), 'the flipped editor is clipped or overlaps its own card')
       await screenshot(page, 'compact-editor-flipped.png')
+      const edgeViewport = await readViewport()
+      await focusNode(page, first.id)
+      await exitFocus.waitFor()
+      await poll(() => editorPanel.evaluate(panel => {
+        const box = panel.getBoundingClientRect()
+        const card = panel.closest('article').getBoundingClientRect()
+        const canvas = panel.closest('.drama-flow').getBoundingClientRect()
+        return box.top >= card.bottom && card.top >= canvas.top && box.bottom <= canvas.bottom
+      }), 'focus did not bring the edge node and its editor into view')
+      assert.deepEqual(await nodeGeometry(first), geometryAfterDrag)
+      await exitFocus.click()
+      await poll(async () => (await readViewport()) === edgeViewport, 'focus did not restore the edge viewport')
+      await clickBlank(page)
       await fit(page)
       await card(page, second.id).locator('.drama-node-titlebar').click()
       await formFor(second).waitFor()
@@ -1993,6 +2118,7 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       assert.equal(restored.content.prompt, prompt)
       assert.equal(restored.content.profileId, profileId)
       assert.equal(restored.content.params.duration, 8)
+      assert.equal(restored.content.params.resolution, '1080p')
       assert.deepEqual(restored.content.mixedListOrder, [image.id])
       assert.ok(!restored.content.textList?.length)
       assert.ok(reloaded.edges.some(item => item.source === image.id && item.target === first.id))
@@ -2015,6 +2141,9 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       assert.equal(payload.model, 'capture-i2v')
       assert.equal(payload.prompt, prompt)
       assert.equal(payload.input.duration, 8)
+      assert.equal(payload.input.resolution, '1080p')
+      assert.equal(payload.input.aspect_ratio, '16:9')
+      assert.equal(payload.input.generate_audio, true)
       assert.match(payload.input.first_frame, /^data:image\/png;base64,/u)
       assert.ok(Buffer.from(payload.input.first_frame.split(',')[1], 'base64').equals(png),
         'upstream image bytes differed from the uploaded PNG')
@@ -2023,7 +2152,7 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       assert.equal(failure.resultNodeId, undefined)
       assert.deepEqual((await query(page, ticket, { id: first.id })).nodes[0].content, restored.content)
       assert.equal(received.length, 1, 'the deliberate rejection should not be retried')
-      console.info(`Compact editor PASS: ${editorGeometry.width}×${editorGeometry.height} CSS px, inline autosave, edge placement, advanced settings and real PNG request`)
+      console.info(`Node editor PASS: ${editorGeometry.width}×${editorGeometry.height} CSS px, prompt/IME autosave, focus/viewport, parameter popover and real PNG request`)
     })
   } finally {
     await new Promise(resolve => endpoint.close(resolve))

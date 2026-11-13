@@ -4,7 +4,7 @@ import { useStoreApi } from '@xyflow/react'
 const gap = 7
 const margin = 8
 
-export function useNodeEditorPlacement(nodeId, enabled) {
+export function useNodeEditorPlacement(nodeId, enabled, focused = false) {
   const panelRef = useRef(null)
   const flow = useStoreApi()
 
@@ -28,7 +28,7 @@ export function useNodeEditorPlacement(nodeId, enabled) {
       const above = anchor.top - bounds.top - margin
       const below = bounds.bottom - anchor.bottom - margin
       const height = editor.height + gap * zoom
-      panel.dataset.placement = below < height && above > below ? 'above' : 'below'
+      panel.dataset.placement = !focused && below < height && above > below ? 'above' : 'below'
 
       const left = bounds.left + margin
       const right = bounds.right - margin - editor.width
@@ -59,7 +59,7 @@ export function useNodeEditorPlacement(nodeId, enabled) {
       delete panel.dataset.placement
       panel.style.removeProperty('--drama-editor-shift')
     }
-  }, [flow, nodeId, enabled])
+  }, [flow, nodeId, enabled, focused])
 
   return panelRef
 }

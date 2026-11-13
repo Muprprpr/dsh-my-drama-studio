@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { Background, MarkerType, MiniMap, ReactFlow, SelectionMode } from '@xyflow/react'
-import { Button, Input, Menu, Modal, IconPlusOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Background, MarkerType, MiniMap, ReactFlow, SelectionMode, getViewportForBounds } from '@xyflow/react'
+import { Button, Input, Menu, Modal, IconPlusOutlineRegular, isBehindModal, observeComposition } from '@deepseek-ai/dsh-client-ui-primitives'
 import { CanvasCorners, CanvasPicker, CanvasToolbar, IconButton } from './canvas-tools.jsx'
 import flowStyle from '@xyflow/react/dist/style.css'
 import canvasStyle from './canvas.css'
@@ -16,6 +16,9 @@ const nodeTypes = { drama: GraphNode }
 const emptyPositions = {}
 const grid = [12, 12]
 const gapX = 412
+const minZoom = 0.15
+const maxZoom = 2
+const focusDuration = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 280
 const clipboardType = 'web application/x-dsh-drama-nodes+json'
 const edgeId = ({ source, target }) => JSON.stringify([source, target])
 const inEditor = event => event.target instanceof Element &&
@@ -93,6 +96,7 @@ export function CanvasViewport({
   const [removing, setRemoving] = useState(false)
   const [removalError, setRemovalError] = useState('')
   const [focusId, setFocusId] = useState(null)
+  const [editorFocus, setEditorFocus] = useState(null)
   const [edgeError, setEdgeError] = useState('')
   const flow = useRef(null)
   const addAnchor = useRef(null)
@@ -104,6 +108,7 @@ export function CanvasViewport({
   const latestRevisions = useRef(new Map())
   const writing = useRef(false)
   const latestLocks = useRef(new Set())
+  const focusOrigin = useRef(null)
 
   useEffect(() => {
     if (rename && !selected.includes(rename.id)) setRename(null)
@@ -190,12 +195,12 @@ export function CanvasViewport({
       type: 'drama',
       position: positions[node.id] ?? defaultPositions[node.id],
       selected: selected.includes(node.id),
-      className: 'drama-flow-node',
+      className: 'drama-flow-node' + (editorFocus?.id === node.id ? ' is-editor-focused' : ''),
       draggable: !lockReason(node.id),
       dragHandle: '.drama-node-card',
       ariaLabel: nodeTitle(node) || nodeLabels[node.type],
       data: {
-        node, compact: compact.includes(node.id),
+        node, compact: compact.includes(node.id), isFocused: editorFocus?.id === node.id,
         actions: node.deleted ? { preview: setPreview, locate } : { ...actions, mutationReason: lockReason(node.id) },
         draft, editor: draft && editorFor(draft), rename: rename?.id === node.id ? rename.token : undefined,
         referenceFocus: referenceFocus?.id === node.id ? referenceFocus.token : undefined,
@@ -251,6 +256,77 @@ export function CanvasViewport({
     frame = requestAnimationFrame(fit)
     return () => cancelAnimationFrame(frame)
   }, [focusId, index, drafts])
+
+  useEffect(() => {
+    if (!editorFocus) return
+    let frame
+    let attempts = 0
+    function fitEditor() {
+      const instance = flow.current
+      const { card } = editorFocus
+      const canvas = surface.current?.getBoundingClientRect()
+      const box = card.getBoundingClientRect()
+      if (!focusOrigin.current || !instance || !canvas?.width || !canvas.height || !box.width || !box.height) return
+      const panel = card.querySelector('.drama-node-editor-panel')?.getBoundingClientRect()
+      if (!panel?.height && ++attempts < 12) {
+        frame = requestAnimationFrame(fitEditor)
+        return
+      }
+      const zoom = instance.getZoom()
+      const origin = instance.screenToFlowPosition({ x: box.left, y: box.top }, { snapToGrid: false })
+      const content = {
+        ...origin,
+        width: Math.max(box.width, panel?.width ?? 0) / zoom,
+        height: (box.height + (panel?.height ?? 0)) / zoom + (panel ? 7 : 0),
+      }
+      const next = getViewportForBounds(content, canvas.width, canvas.height, minZoom, 1.55, {
+        x: '26px', top: '56px', bottom: '48px',
+      })
+      void instance.setViewport(next, { duration: focusDuration(), interpolate: 'linear' })
+    }
+    frame = requestAnimationFrame(fitEditor)
+    return () => cancelAnimationFrame(frame)
+  }, [editorFocus])
+
+  function focusEditor(event, graph) {
+    if (!flow.current || graph.id.startsWith('draft-') || graph.data.node.deleted || !(event.target instanceof Element)) return
+    if (event.target.closest('button, input, textarea, select, a, video, audio, [contenteditable], [role="button"], .drama-node-editor-panel, .react-flow__handle')) return
+    const card = event.target.closest('.drama-node-card')
+    if (!card) return
+    event.preventDefault()
+    focusOrigin.current ??= flow.current.getViewport()
+    setFocusId(null)
+    selectNode(graph.id)
+    setEditorFocus({ id: graph.id, card })
+    surface.current?.focus({ preventScroll: true })
+  }
+
+  function exitEditorFocus() {
+    const origin = focusOrigin.current
+    if (!origin) return
+    focusOrigin.current = null
+    setEditorFocus(null)
+    void flow.current?.setViewport(origin, { duration: focusDuration(), interpolate: 'linear' })
+    surface.current?.focus({ preventScroll: true })
+  }
+
+  useEffect(() => {
+    if (!editorFocus) return
+    const canvas = surface.current
+    const document = canvas.ownerDocument
+    const composition = observeComposition(document)
+    function escapeFromBody(event) {
+      if (event.target !== document.body || event.key !== 'Escape' || event.defaultPrevented ||
+          composition.guards(event) || isBehindModal(canvas) || picker || contextNode || contextEdge) return
+      event.preventDefault()
+      exitEditorFocus()
+    }
+    document.addEventListener('keydown', escapeFromBody)
+    return () => {
+      document.removeEventListener('keydown', escapeFromBody)
+      composition.dispose()
+    }
+  }, [editorFocus, picker, contextNode, contextEdge])
 
   function applyNodeChanges(changes) {
     const moves = changes.filter(change => change.type === 'position' && change.position && !lockReason(change.id))
@@ -835,7 +911,14 @@ export function CanvasViewport({
   function canvasKeys(event) {
     if (!event.currentTarget.contains(event.target)) return
     if (event.isDefaultPrevented() || event.isComposing || event.nativeEvent.isComposing ||
-        event.keyCode === 229 || inEditor(event) || removal || assetPicker || preview) return
+        event.keyCode === 229 || removal || assetPicker || preview) return
+    if (event.key === 'Escape' && editorFocus && !picker && !contextNode && !contextEdge) {
+      event.preventDefault()
+      event.stopPropagation()
+      exitEditorFocus()
+      return
+    }
+    if (inEditor(event)) return
     const key = event.key.toLowerCase()
     const command = event.ctrlKey || event.metaKey
     if (command && ['a', 'c', 'd', 'z', 'y'].includes(key)) {
@@ -871,6 +954,7 @@ export function CanvasViewport({
   return <div className="drama-canvas-content">
     <style>{flowStyle + '\n' + canvasStyle + '\n' + cardStyle}</style>
     <div ref={surface} className="drama-flow" role="region" aria-label="创作节点画布" tabIndex={0}
+      data-focused-node={editorFocus?.id}
       onKeyDown={canvasKeys} onPaste={paste}
       onPointerDownCapture={event => {
         if (!event.currentTarget.contains(event.target)) return
@@ -896,6 +980,7 @@ export function CanvasViewport({
       <ReactFlow nodes={graphNodes} edges={graphEdges} nodeTypes={nodeTypes}
         onInit={instance => { flow.current = instance }}
         onNodesChange={applyNodeChanges} onConnect={connect} onConnectEnd={connectEnd} isValidConnection={canLink}
+        onNodeDoubleClick={focusEditor}
         onEdgesChange={changes => {
           const choices = changes.filter(change => change.type === 'select')
           if (choices.length) setSelectedEdges(current => {
@@ -943,7 +1028,7 @@ export function CanvasViewport({
         onReconnectStart={(_event, edge) => { reconnecting.current = edge }}
         onReconnect={reconnect}
         onReconnectEnd={() => { reconnecting.current = null }}
-        deleteKeyCode={null} panActivationKeyCode="Space" minZoom={0.15} maxZoom={2} zoomOnDoubleClick={false}
+        deleteKeyCode={null} panActivationKeyCode="Space" minZoom={minZoom} maxZoom={maxZoom} zoomOnDoubleClick={false}
         autoPanOnNodeFocus={false}
         snapToGrid snapGrid={grid} multiSelectionKeyCode={['Shift', 'Control', 'Meta']} selectionOnDrag={boxSelect}
         selectionMode={SelectionMode.Partial} panOnDrag={!boxSelect}>
@@ -964,6 +1049,8 @@ export function CanvasViewport({
         toggleBox={() => setBoxSelect(value => !value)} selected={selected}
         compact={selected.every(id => compact.includes(id))} toggleCompact={() => toggleCompact(selected)} />
       <div className="drama-v2-pager nodrag nopan nowheel">
+        {editorFocus && <Button type="button" size="sm" variant="outline" title="退出聚焦 · Esc"
+          onClick={exitEditorFocus}>退出聚焦</Button>}
         {filters.id && <Button type="button" size="sm" variant="ghost" onClick={() => setFilters({})}>清除定位</Button>}
         <span>{visible.length} 个节点{selected.length ? ` · 已选 ${selected.length}` : ''}</span>
         {offset > 0 && <Button type="button" size="sm" variant="ghost"
