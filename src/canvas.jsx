@@ -498,7 +498,8 @@ export function CanvasViewport({
     void runCanvas(async () => {
       const id = crypto.randomUUID()
       const { type, mode } = preset
-      const content = { title: preset.label, ...(mode ? { mode } : {}) }
+      const content = { title: preset.label }
+      if (type === 'video') content.mode = seed && mode === '' ? defaultVideoInputMode(seed.type) : mode
       const node = { id, type, content, ...groupFor(seed, filters) }
       const edges = []
       if (seed && type !== 'audio') {
@@ -510,6 +511,14 @@ export function CanvasViewport({
       const source = seed && graphNodes.find(graph => graph.id === seed.id)?.position
       placeNew(id, at ?? (source && { x: source.x + gapX, y: source.y }), true)
     })
+  }
+
+  function defaultVideoInputMode(kind) {
+    const preferred = { image: 'i2v', video: 'v2v', audio: 'r2v' }[kind]
+    const configured = mode => profileCandidates(generationProfiles, mode).filter(profile => profile.configured)
+    if (preferred !== 'r2v' && !configured(preferred).length &&
+        configured('r2v').some(profile => referenceLimit('r2v', kind, profile) > 0)) return 'r2v'
+    return preferred
   }
 
   function linkPlan({ source, target, targetHandle }) {
@@ -532,9 +541,7 @@ export function CanvasViewport({
       if (!mediaTypes.has(from.type)) return { error: '视频节点只接受图片、视频或音频输入' }
       const mode = videoMode(to)
       if (mode === 'asset') return { error: '请先为视频节点选择生成方式' }
-      let nextMode = mode === 't2v' ? ({ image: 'i2v', video: 'v2v', audio: 'r2v' })[from.type] : mode
-      const configured = candidate => profileCandidates(generationProfiles, candidate).filter(profile => profile.configured)
-      if (mode === 't2v' && !configured(nextMode).length && configured('r2v').length) nextMode = 'r2v'
+      const nextMode = !mode || mode === 't2v' ? defaultVideoInputMode(from.type) : mode
       const profile = resolveProfile(profileCandidates(generationProfiles, nextMode), nextMode === mode ? content.profileId : undefined)
       const count = kind => kinds.filter(item => item === kind).length
       if (kinds.length > (profile?.limits?.maxReferences || 32) ||
@@ -971,9 +978,9 @@ export function CanvasViewport({
         presets={presets.filter(item => {
           if (!picker.seed) return true
           if (item.type !== 'video') return item.type !== 'image' || picker.seed.type === 'image' || textTypes.has(picker.seed.type)
-          if (!mediaTypes.has(picker.seed.type)) return false
-          const profile = resolveProfile(profileCandidates(generationProfiles, item.mode))
-          return referenceLimit(item.mode, picker.seed.type, profile) > 0
+          if (item.mode === 'asset' || !mediaTypes.has(picker.seed.type)) return false
+          const mode = defaultVideoInputMode(picker.seed.type)
+          return referenceLimit(mode, picker.seed.type, resolveProfile(profileCandidates(generationProfiles, mode))) > 0
         })}
         close={() => setPicker(null)} />}
       {contextNode && index.has(contextNode.id) && <Menu open portal compact

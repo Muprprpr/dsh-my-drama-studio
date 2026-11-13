@@ -606,6 +606,15 @@ async function updateVideo(page, ticket, id, prompt) {
     'video prompt did not persist')
 }
 
+async function chooseVideoMode(page, ticket, id, mode) {
+  await nodeEditor(page, id).getByRole('button', { name: '视频方式', exact: true }).click()
+  await page.getByRole('menuitem', { name: mode.toUpperCase(), exact: true }).click()
+  return poll(async () => {
+    const [node] = (await query(page, ticket, { id })).nodes
+    return node?.content.mode === mode && node
+  }, 'changing the video mode did not persist: ' + mode)
+}
+
 test('New canvas nodes are persisted and usable immediately from the picker', { timeout: 75_000 }, async () => {
   await withWeb(async ({ page, records, url }) => {
     const [record] = records
@@ -633,10 +642,33 @@ test('New canvas nodes are persisted and usable immediately from the picker', { 
     await clickBlank(page)
     await poll(async () => (await query(page, ticket, { id: image.id })).nodes[0]?.content.prompt === imagePrompt,
       'editing an immediately-created image did not persist')
-    const video = await pick(page, 'i2v', ticket, 'video')
+    const video = await pick(page, '视频生成', ticket, 'video', async () => {
+      await panel(page).getByRole('toolbar', { name: '画布工具', exact: true })
+        .getByRole('button', { name: '新增节点', exact: true }).click()
+      const picker = page.locator('.drama-v2-picker-list')
+      await picker.getByText('视频生成', { exact: true }).waitFor()
+      await picker.getByText('视频素材', { exact: true }).waitFor()
+      assert.equal(await picker.getByText('视频生成', { exact: true }).count(), 1)
+      assert.equal(await picker.getByText(/T2V|I2V|R2V|V2V/u).count(), 0)
+    })
     const target = card(page, video.id)
-    assert.equal(video.content.mode, 'i2v')
-    await target.getByRole('button', { name: '添加首帧', exact: true }).waitFor()
+    assert.equal(video.content.mode ?? '', '', 'new video should start without a selected generation mode')
+    const editorMode = nodeEditor(page, video.id).getByRole('button', { name: '视频方式', exact: true })
+    await editorMode.getByText('选择方式', { exact: true }).waitFor()
+    await editorMode.click()
+    for (const mode of ['T2V', 'I2V', 'R2V', 'V2V']) await page.getByRole('menuitem', { name: mode, exact: true }).waitFor()
+    await page.keyboard.press('Escape')
+    const unconfigured = await pick(page, '视频生成', ticket, 'video')
+    await updateVideo(page, ticket, unconfigured.id, '先写提示词，之后选择生成方式。')
+    const [unconfiguredStored] = (await query(page, ticket, { id: unconfigured.id })).nodes
+    assert.equal(unconfiguredStored.content.mode, '', 'editing a prompt unexpectedly selected a generation mode')
+    const missingMode = await request(page, 'operation', { ticket, action: 'generateT2V', data: {
+      operationId: randomUUID(), nodeId: unconfigured.id, confirmed: true,
+    } })
+    assert.equal(missingMode.status, 400, JSON.stringify(missingMode.body))
+    assert.match(missingMode.body.error, /生成方式/u)
+    const submit = nodeEditor(page, unconfigured.id).getByRole('button', { name: '生成…', exact: true })
+    assert.ok(await submit.isDisabled(), 'generation was enabled without a selected mode')
     await clickBlank(page)
     await dragReference(page, image.id, video.id)
     async function assertBlankMediaLink(id) {
@@ -645,6 +677,7 @@ test('New canvas nodes are persisted and usable immediately from the picker', { 
         return snapshot.edges.some(edge => edge.source === image.id && edge.target === id) && snapshot.nodes[0]
       }, 'video media link was not persisted before the prompt was written')
       assert.equal((linked.content.prompt ?? '').trim(), '')
+      assert.equal(linked.content.mode, 'i2v')
       assert.deepEqual(linked.content.mixedListOrder, [image.id])
       assert.equal(linked.content.textList, undefined)
       return linked
@@ -683,12 +716,13 @@ test('New canvas nodes are persisted and usable immediately from the picker', { 
       'editing a new standalone prompt node did not persist')
     await clickBlank(page)
     await fit(page)
-    const successor = await pick(page, 'i2v', ticket, 'video', async () => {
+    const successor = await pick(page, '视频生成', ticket, 'video', async () => {
       await picture.hover()
       await picture.getByRole('button', { name: '新增后继节点', exact: true }).click()
     })
     await assertBlankMediaLink(successor.id)
-    const pickerVideo = await pick(page, 'i2v', ticket, 'video')
+    const pickerVideo = await pick(page, '视频生成', ticket, 'video')
+    await chooseVideoMode(page, ticket, pickerVideo.id, 'i2v')
     const editor = nodeEditor(page, pickerVideo.id)
     await editor.getByRole('button', { name: '添加首帧', exact: true }).click()
     const references = page.getByRole('dialog', { name: '添加参考素材', exact: true })
@@ -712,6 +746,7 @@ test('New canvas nodes are persisted and usable immediately from the picker', { 
     await flow(page).waitFor()
     await assertBlankMediaLink(successor.id)
     await assertBlankMediaLink(pickerVideo.id)
+    assert.equal((await query(page, ticket, { id: unconfigured.id })).nodes[0].content.mode, '')
     assert.deepEqual((await query(page, ticket, { id: pickerVideo.id })).edges,
       [{ source: image.id, target: pickerVideo.id }])
     assert.equal((await operate(page, ticket, 'tasks', {})).tasks.length, 0)
@@ -984,10 +1019,11 @@ test('U2 U3 U5 new nodes, derived drafts, shared Sessions, media and native them
     await flow(page).locator('.react-flow__edge.drama-edge-version').first().waitFor()
     await screenshot(page, '22-after-version-chain.png')
 
-    const newVideo = await pick(page, 't2v', first, 'video', async () => {
+    const newVideo = await pick(page, '视频生成', first, 'video', async () => {
       const point = await dragCanvasBlank(page)
       await page.mouse.click(point.x, point.y, { button: 'right' })
     })
+    await chooseVideoMode(page, first, newVideo.id, 't2v')
     await card(page, newVideo.id).getByRole('button', { name: '派生版本', exact: true }).click()
     const videoDraft = draftCard(page).last()
     const videoPrompt = videoDraft.getByRole('textbox', { name: '完整视频提示词', exact: true })
@@ -1484,7 +1520,8 @@ test('U4 native task drawer follows real Go worker in isolated provider fixture'
     await select(page, a)
     await open(page, a)
     const ticket = await ticketFor(page, a.sessionId)
-    const created = await pick(page, 't2v', ticket, 'video')
+    const created = await pick(page, '视频生成', ticket, 'video')
+    await chooseVideoMode(page, ticket, created.id, 't2v')
     await editDetails(page, created.id, { 节点名称: '排队与结果定位验收', 集: 'EP01', 场: 'S01', 镜头: 'SH08' })
     await updateVideo(page, ticket, created.id, '固定中景。人物推开餐厅门，在门口停顿。')
     await nodeEditor(page, created.id).getByRole('button', { name: '生成设置', exact: true }).click()
@@ -1606,7 +1643,8 @@ test('U5 native video editors retain ordered media and inline prompts', { timeou
       ['v2v', '源视频验收', '保留 @视频1 的表演节奏，调整画面亮度。', '添加视频素材', [video]],
     ]
     for (const [mode, title, prompt, picker, references] of cases) {
-      const created = await pick(page, mode, ticket, 'video')
+      const created = await pick(page, '视频生成', ticket, 'video')
+      await chooseVideoMode(page, ticket, created.id, mode)
       await editDetails(page, created.id, { 节点名称: title })
       await updateVideo(page, ticket, created.id, prompt)
       const editor = nodeEditor(page, created.id)
@@ -1723,7 +1761,8 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       const prompt = '以 @图片1 为首帧，保留小鸭轮廓。固定中景，停顿半秒后渐亮，保留室内环境声。'
       const formFor = node => card(page, node.id).getByRole('form', { name: '编辑节点', exact: true })
       async function newVideo(title, mode = 't2v') {
-        const video = await pick(page, mode, ticket, 'video')
+        const video = await pick(page, '视频生成', ticket, 'video')
+        await chooseVideoMode(page, ticket, video.id, mode)
         await editDetails(page, video.id, { 节点名称: title })
         await updateVideo(page, ticket, video.id, prompt.replace('以 @图片1 为首帧，', ''))
         return (await query(page, ticket, { id: video.id })).nodes[0]

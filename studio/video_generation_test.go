@@ -1,6 +1,7 @@
 package studio
 
 import (
+	"context"
 	"encoding/json"
 	"reflect"
 	"strings"
@@ -8,6 +9,48 @@ import (
 
 	"github.com/google/uuid"
 )
+
+func TestVideoSubmissionDistinguishesUnsetModeFromLegacyMode(t *testing.T) {
+	dir := t.TempDir()
+	s := New(providerFixture{})
+	defer s.Close()
+	bindSession(t, s, dir, "a")
+	s.SetHumanWriteCheck(func(context.Context, string, string, []string, []string) (bool, error) { return true, nil })
+	unset, legacy := uuid.NewString(), uuid.NewString()
+	const prompt = "A smooth camera move."
+	_, err := editCall(s, dir, "a", "human", "append", appendArgs{
+		operation: operation{ID: "append-video-modes"},
+		Nodes: []NodeInput{
+			{ID: unset, Type: "video", Content: json.RawMessage(`{"mode":"","prompt":"` + prompt + `"}`)},
+			{ID: legacy, Type: "video", Content: json.RawMessage(`{"prompt":"` + prompt + `"}`)},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range []string{"submit_manual", "generateT2V"} {
+		request := map[string]any{"operationId": "unset-" + action, "nodeId": unset, "confirmed": true}
+		if _, err := call(s, dir, "a", action, request); err == nil || !strings.Contains(err.Error(), "选择视频生成方式") {
+			t.Fatalf("%s with unset mode returned %v", action, err)
+		}
+	}
+	if tasks := tasksIn(t, s, dir, "a"); len(tasks) != 0 {
+		t.Fatalf("unset mode created tasks: %+v", tasks)
+	}
+	mustCall(t, s, dir, "a", "generateT2V",
+		map[string]any{"operationId": "legacy-mode", "nodeId": legacy, "confirmed": true})
+	mustEdit(t, s, dir, "a", "update_node", updateNodeArgs{
+		nodeRevisionArgs: nodeRevisionArgs{operation: operation{ID: "select-mode"}, ID: unset, Revision: 1},
+		Content:          json.RawMessage(`{"mode":"t2v","prompt":"` + prompt + `"}`),
+	})
+	mustCall(t, s, dir, "a", "generateT2V",
+		map[string]any{"operationId": "chosen-mode", "nodeId": unset, "confirmed": true})
+	tasks := tasksIn(t, s, dir, "a")
+	if len(tasks) != 2 || tasks[0].NodeID != unset || tasks[0].Mode != "t2v" ||
+		tasks[1].NodeID != legacy || tasks[1].Mode != "t2v" {
+		t.Fatalf("unexpected submitted modes: %+v", tasks)
+	}
+}
 
 func TestVideoGenerationEntryPointsAndSnapshots(t *testing.T) {
 	channel := VideoChannel{ID: "fixture", Name: "Fixture", Protocol: "custom-rest", BaseURL: "https://fixture.example", Advanced: &CustomREST{

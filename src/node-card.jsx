@@ -222,7 +222,7 @@ function GenerateControl({ node, profile, generationDefaults, actions, unavailab
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
 
-  if (!actions.submitGeneration || !mode || mode === 'asset') return null
+  if (!actions.submitGeneration || !['image', 'video'].includes(node.type) || mode === 'asset') return null
   async function submit() {
     if (!profile?.configured || busy || unavailable) return
     setBusy(true)
@@ -332,7 +332,7 @@ export function GraphNode({ data, selected }) {
   const source = node.basedOn && index?.get(node.basedOn)
   const saved = !node.id.startsWith('draft-')
   const locked = Boolean(actions.mutationReason)
-  const generationNode = node.type === 'image' || mode && mode !== 'asset'
+  const generationNode = node.type === 'image' || node.type === 'video' && mode !== 'asset'
   const ordered = referenceIds(node)
   const pending = generationNode && ordered.some(id => !referenceReady(index?.get(id), resolvedMedia))
   const configured = Boolean(textValue(node.content, 'prompt')) ||
@@ -360,7 +360,8 @@ export function GraphNode({ data, selected }) {
       {node.deleted ? <Tag tone="neutral">已删除</Tag>
         : latest ? <TaskStatus status={latest.status} phase={latest.phase} taskId={latest.id} />
         : mediaKind && <Tag tone={pending ? 'warning' : 'neutral'}>
-          {pending ? '等待素材' : url ? '已完成' : configured ? '待生成' : '空节点'}
+          {pending ? '等待素材' : url ? '已完成' : configured
+            ? (node.type === 'video' && !mode ? '待选方式' : '待生成') : '空节点'}
         </Tag>}
     </header>
     {compact && saved ? <div className="drama-node-compact-content">
@@ -654,6 +655,7 @@ function NodeEditor({
     taskActive(latest ?? {}) && '此节点正在生成。',
     saving && '正在保存修改。',
     dirty && (compact ? error || '正在保存修改。' : '请先保存修改。'),
+    type === 'video' && !mode && '请选择视频生成方式。',
     !prompt.trim() && !hasTextRef && (type === 'video' ? '生成前请填写完整视频提示词。' : '请填写提示词。'),
     referenceItems.some(item => !referenceReady(item, resolvedMedia)) && '等待上游素材。',
     issue,
@@ -877,7 +879,7 @@ function NodeEditor({
       }}>
       {generation && <>
         <div ref={referenceArea}>
-          {mode === 't2v' && type === 'video' ? <ReferenceModeMenu disabled={blocked} choose={changeMode} />
+          {(!mode || mode === 't2v') && type === 'video' ? <ReferenceModeMenu disabled={blocked} choose={changeMode} />
             : <MediaReferences compact mode={referenceMode} profile={activeProfile} media={available} mediaURL={mediaURL}
               resolvedMedia={resolvedMedia} queryCanvas={queryCanvas} nodeId={node.id} references={references}
               setReferences={changeReferences} onSelect={attachReference} uploadReference={uploadReference}
@@ -903,9 +905,10 @@ function NodeEditor({
         <p className="drama-node-creative-status" role={error ? 'alert' : 'status'}>{shownError || unavailable}</p>}
       <div className="drama-node-creative-controls">
         {type === 'video'
-          ? <MenuSelect compact label="视频方式" value={mode} items={modeItems} onChange={changeMode} disabled={blocked} />
+          ? <MenuSelect compact label="视频方式" value={mode} items={modeItems} placeholder="选择方式"
+            onChange={changeMode} disabled={blocked} />
           : <span className="drama-node-creative-mode" title="图片生成">T2I</span>}
-        {generation && <MenuSelect compact label="生成预设" value={profileId} disabled={blocked}
+        {generation && <MenuSelect compact label="生成预设" value={profileId} disabled={blocked || type === 'video' && !mode}
           items={profileId ? choices : [{ id: '', label: activeProfile ? '默认 · ' + activeProfile.name : '选择模型',
             title: activeProfile?.model }, ...choices.slice(1)]}
           onChange={changeProfile} />}
@@ -924,7 +927,9 @@ function NodeEditor({
               <GenerationParams value={overrides} profile={activeProfile} generationDefaults={generationDefaults} mode={mode}
                 update={updateParam} />
             </div>
-            {!activeProfile?.parameters?.length && <p className="drama-node-dialog-summary">当前模型没有可调整的生成参数。</p>}
+            {!activeProfile?.parameters?.length && <p className="drama-node-dialog-summary">
+              {type === 'video' && !mode ? '请选择视频生成方式。' : '当前模型没有可调整的生成参数。'}
+            </p>}
             <Button size="sm" className="drama-node-details-link" onClick={() => setSettings('metadata')}>名称与镜头</Button>
             <TaskDetail task={latest} nodeId={node.id} locate={actions.locate} />
           </> : <>
@@ -952,7 +957,8 @@ function NodeEditor({
     </form>
   }
 
-  const showReferences = supportsRefs && (referenceMode !== 't2v' || references.length > 0)
+  const showReferences = supportsRefs && (type !== 'video' ||
+    Boolean(referenceMode && referenceMode !== 't2v') || references.length > 0)
   return <form ref={formRef} className={'drama-node-editor ' + interactions} onSubmit={save} aria-label={formLabel}
     onChange={() => setDirty(true)} onKeyDown={event => {
       if (event.key === 'Escape' && !event.nativeEvent.isComposing && event.keyCode !== 229) close()
@@ -965,7 +971,7 @@ function NodeEditor({
         </label>}
         {!edit && assetNode && <AssetSources type={type} queryCanvas={queryCanvas} asset={asset}
           importFile={importFile} onSelect={setAssetSource} />}
-        {type === 'video' && <MenuSelect label="视频方式" value={mode} onChange={changeMode}
+        {type === 'video' && <MenuSelect label="视频方式" value={mode} placeholder="选择方式" onChange={changeMode}
           items={Object.entries(modeLabels).map(([id, label]) => ({ id, label }))} />}
         {hasPrompt && <label className="drama-node-field">{type === 'video' ? '完整视频提示词' : '提示词'}
           <textarea name="prompt" rows={4} value={prompt} onChange={event => setPrompt(event.target.value)} />
@@ -982,7 +988,8 @@ function NodeEditor({
               items={['i2v', 'r2v', 'v2v'].map(id => ({ id, label: modeLabels[id] }))} />}
         </div>}
         {generation && <>
-          <MenuSelect label="生成预设" value={profileId} onChange={changeProfile} items={choices} />
+          <MenuSelect label="生成预设" value={profileId} onChange={changeProfile} items={choices}
+            disabled={type === 'video' && !mode} />
           {activeProfile && <span className="drama-node-caption">
             {[activeProfile.model, ...paramSummary(activeProfile, generationDefaults, undefined, mode)].join(' · ')}
           </span>}
