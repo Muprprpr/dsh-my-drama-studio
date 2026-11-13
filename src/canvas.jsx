@@ -267,17 +267,24 @@ export function CanvasViewport({
       const canvas = surface.current?.getBoundingClientRect()
       const box = card.getBoundingClientRect()
       if (!focusOrigin.current || !instance || !canvas?.width || !canvas.height || !box.width || !box.height) return
-      const panel = card.querySelector('.drama-node-editor-panel')?.getBoundingClientRect()
-      if (!panel?.height && ++attempts < 12) {
+      const panel = card.querySelector('.drama-node-editor-panel')
+      const panelBox = panel?.getBoundingClientRect()
+      if (!panelBox?.height && ++attempts < 12) {
         frame = requestAnimationFrame(fitEditor)
         return
       }
       const zoom = instance.getZoom()
       const origin = instance.screenToFlowPosition({ x: box.left, y: box.top }, { snapToGrid: false })
+      const centered = panel?.classList.contains('is-creative')
+      const panelWidth = centered
+        ? Number.parseFloat(getComputedStyle(panel).getPropertyValue('--drama-editor-ideal-width'))
+        : (panelBox?.width ?? 0) / zoom
+      const width = Math.max(box.width / zoom, panelWidth)
       const content = {
         ...origin,
-        width: Math.max(box.width, panel?.width ?? 0) / zoom,
-        height: (box.height + (panel?.height ?? 0)) / zoom + (panel ? 7 : 0),
+        x: centered ? origin.x - (width - box.width / zoom) / 2 : origin.x,
+        width,
+        height: (box.height + (panelBox?.height ?? 0)) / zoom + (panel ? 7 : 0),
       }
       const next = getViewportForBounds(content, canvas.width, canvas.height, minZoom, 1.55, {
         x: '26px', top: '56px', bottom: '48px',

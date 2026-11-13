@@ -1719,6 +1719,7 @@ test('U5 native video editors retain ordered media and inline prompts', { timeou
 test('Native canvas uploads media and sends the connected PNG to the configured video endpoint', {
   timeout: 125_000, skip: !hasImage || !hasVideo || !existsSync(projectImageAsset),
 }, async () => {
+  const profileName = '回环首帧预设 · 长模型名称也保留参数与设置按钮'
   const received = []
   const endpoint = createHTTPServer(async (req, res) => {
     const chunks = []
@@ -1745,7 +1746,7 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       const saved = await settings('provider_save', {
         revision: configured.revision,
         profile: {
-          name: '回环首帧预设', channelId: configured.channels[0].id, model: 'capture-i2v',
+          name: profileName, channelId: configured.channels[0].id, model: 'capture-i2v',
           modes: ['i2v'], defaults: { duration: 4, resolution: '720p', aspectRatio: '16:9', generateAudio: true },
           limits: { durations: [4, 8, 10], resolutions: ['720p', '1080p'], aspectRatios: ['16:9', '9:16'], generateAudio: true },
         },
@@ -1850,30 +1851,54 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       const editorGeometry = await editor.evaluate(element => {
         const box = element.getBoundingClientRect()
         const node = element.closest('article')
+        const cardBox = node.getBoundingClientRect()
         const canvas = element.closest('.drama-flow').getBoundingClientRect()
+        const prompt = element.querySelector('textarea[name="prompt"]')
         return { height: element.offsetHeight, width: element.offsetWidth, nodeWidth: node.offsetWidth,
-          top: box.top, bottom: box.bottom, cardBottom: node.getBoundingClientRect().bottom, canvasBottom: canvas.bottom,
+          top: box.top, bottom: box.bottom, cardBottom: cardBox.bottom, canvasBottom: canvas.bottom,
+          centerOffset: Math.abs(box.left + box.width / 2 - cardBox.left - cardBox.width / 2),
+          leftMargin: box.left - canvas.left, rightMargin: canvas.right - box.right,
+          promptWidth: prompt.offsetWidth, promptRowWidth: prompt.parentElement.clientWidth,
           scrolling: [element, ...element.querySelectorAll('div, fieldset')].some(candidate =>
             candidate.clientHeight > 0 && candidate.scrollHeight > candidate.clientHeight + 1 &&
             /^(auto|scroll)$/u.test(getComputedStyle(candidate).overflowY)) }
       })
       assert.ok(editorGeometry.height >= 160 && editorGeometry.height <= 270, JSON.stringify(editorGeometry))
-      assert.ok(Math.abs(editorGeometry.width - editorGeometry.nodeWidth) <= 6, JSON.stringify(editorGeometry))
+      assert.ok(Math.abs(editorGeometry.width - 480) <= 4 && editorGeometry.width > editorGeometry.nodeWidth * 1.4,
+        JSON.stringify(editorGeometry))
+      assert.ok(editorGeometry.centerOffset <= 2, 'the wide editor is not centered under its card')
+      assert.ok(editorGeometry.leftMargin >= 0 && editorGeometry.rightMargin >= 0, 'the wide editor is horizontally clipped')
+      assert.equal(editorGeometry.promptWidth, editorGeometry.promptRowWidth, 'the prompt does not fill its available width')
       assert.ok(editorGeometry.top >= editorGeometry.cardBottom, 'editor did not open below the node card')
       assert.ok(editorGeometry.bottom <= editorGeometry.canvasBottom, 'the lower panel is clipped by the canvas')
       assert.equal(editorGeometry.scrolling, false, 'the compact editor has a vertical scrollbar')
       assert.equal(await editor.getByRole('button', { name: '保存修改', exact: true }).count(), 0)
       assert.equal(await editor.getByRole('button', { name: '取消', exact: true }).count(), 0)
       assert.equal(await editor.getByRole('textbox', { name: /搜索/u }).count(), 0)
-      const modeButton = editor.getByRole('button', { name: '视频方式', exact: true })
       const modelButton = editor.getByRole('button', { name: '生成预设', exact: true })
       const generateButton = editor.getByRole('button', { name: '生成…', exact: true })
-      const parameters = editor.getByRole('group', { name: '有效生成参数', exact: true })
-      assert.deepEqual(await parameters.getByRole('button').allTextContents(), ['4 秒', '720p', '16:9', '音频开'])
-      const controlLine = await Promise.all([modeButton, modelButton].map(control => control.boundingBox()))
+      const parameterButtons = form => form.getByRole('group', { name: '有效生成参数', exact: true }).getByRole('button')
+      const toolbarBoxes = async form => {
+        const controls = [
+          ...['视频方式', '生成预设', '节点详情'].map(name => form.getByRole('button', { name, exact: true })),
+          ...await parameterButtons(form).all(),
+        ]
+        const boxes = await Promise.all(controls.map(control => control.boundingBox()))
+        assert.ok(boxes.every(Boolean), 'every toolbar control must be visible')
+        return boxes
+      }
+      assert.deepEqual(await parameterButtons(editor).allTextContents(), ['4 秒', '720p', '16:9', '音频开'])
+      const controlLine = await toolbarBoxes(editor)
       const centers = controlLine.map(box => box.y + box.height / 2)
-      assert.ok(Math.max(...centers) - Math.min(...centers) < 4, 'the mode and model controls are not on one line')
+      assert.ok(Math.max(...centers) - Math.min(...centers) < 4,
+        'video mode, model, parameters, and node details should share one row at regular width')
+      assert.ok(await modelButton.getByText('默认 · ' + profileName, { exact: true }).evaluate(label =>
+        label.scrollWidth > label.clientWidth && getComputedStyle(label).textOverflow === 'ellipsis'),
+      'the long model name should truncate to leave room for the parameters')
       assert.ok((await generateButton.boundingBox()).y > centers[0], 'generation action did not follow the compact controls')
+      await editor.getByRole('button', { name: '节点详情', exact: true }).click()
+      const details = page.getByRole('dialog', { name: '节点详情', exact: true })
+      await details.getByRole('button', { name: '关闭节点详情', exact: true }).click()
       const thumbnail = editor.getByRole('button', { name: /^首帧 · /u }).locator('img')
       await thumbnail.evaluate(async image => {
         await image.decode()
@@ -1946,7 +1971,7 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       assert.equal(await promptBox.inputValue(), prompt)
       assert.ok(!(await query(page, ticket, { id: first.id })).nodes[0].deleted)
       await modelButton.click()
-      await page.getByRole('menuitem', { name: '回环首帧预设', exact: true }).click()
+      await page.getByRole('menuitem', { name: profileName, exact: true }).click()
       const viewport = flow(page).locator('.react-flow__viewport')
       const readViewport = () => viewport.evaluate(element => element.style.transform)
       await fit(page)
@@ -2082,7 +2107,8 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
         const box = panel.getBoundingClientRect()
         const card = panel.closest('article').getBoundingClientRect()
         const canvas = panel.closest('.drama-flow').getBoundingClientRect()
-        return box.top >= card.bottom && card.top >= canvas.top && box.bottom <= canvas.bottom
+        return box.top >= card.bottom && card.top >= canvas.top && box.bottom <= canvas.bottom &&
+          box.left >= canvas.left - 1 && box.right <= canvas.right + 1
       }), 'focus did not bring the edge node and its editor into view')
       assert.deepEqual(await nodeGeometry(first), geometryAfterDrag)
       await exitFocus.click()
@@ -2213,6 +2239,72 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       assert.equal(failure.resultNodeId, undefined)
       assert.deepEqual((await query(page, ticket, { id: first.id })).nodes[0].content, restored.content)
       assert.equal(received.length, 1, 'the deliberate rejection should not be retried')
+
+      await sidebarMode(page, 'push').click()
+      await resizeRightbar(page, 465)
+      const narrow = await pick(page, '视频生成', ticket, 'video')
+      await chooseVideoMode(page, ticket, narrow.id, 'i2v')
+      const narrowPanel = card(page, narrow.id).locator('.drama-node-editor-panel')
+      await narrowPanel.waitFor()
+      const narrowNodeGeometry = await nodeGeometry(narrow)
+      await flow(page).focus()
+      await page.keyboard.press('.')
+      await delay(280)
+      const zoomIn = flow(page).getByRole('button', { name: '放大', exact: true })
+      await zoomIn.click()
+      await delay(180)
+      await poll(() => narrowPanel.evaluate(panel => {
+        const box = panel.getBoundingClientRect()
+        const canvas = panel.closest('.drama-flow').getBoundingClientRect()
+        return panel.offsetWidth < 480 && Math.abs(box.left - canvas.left - 8) < 1 &&
+          Math.abs(canvas.right - box.right - 8) < 1
+      }), 'zooming in did not constrain the editor to the narrow canvas with both margins')
+      const pan = await narrowPanel.evaluate(panel => {
+        const pane = panel.closest('.drama-flow').querySelector('.react-flow__pane')
+        const canvas = pane.getBoundingClientRect()
+        const dy = Math.ceil(canvas.top + 62 - panel.getBoundingClientRect().top)
+        if (dy <= 0) return null
+        for (const yy of [.8, .84, .88, .76, .72, .68]) {
+          const y = canvas.top + canvas.height * yy
+          if (y + dy >= canvas.bottom - 12) continue
+          for (const xx of [.2, .6, .8]) {
+            const x = canvas.left + canvas.width * xx
+            if (document.elementFromPoint(x, y) === pane) return { x, y, dy }
+          }
+        }
+        return { dy }
+      })
+      if (pan) {
+        assert.ok('x' in pan, 'no blank space to pan the narrow editor into view')
+        await flow(page).focus()
+        await page.keyboard.down('Space')
+        await page.mouse.move(pan.x, pan.y)
+        await page.mouse.down()
+        await page.mouse.move(pan.x, pan.y + pan.dy, { steps: 10 })
+        await page.mouse.up()
+        await page.keyboard.up('Space')
+      }
+      await poll(() => narrowPanel.evaluate(panel => {
+        const box = panel.getBoundingClientRect()
+        const canvas = panel.closest('.drama-flow').getBoundingClientRect()
+        return box.top >= canvas.top + 61 && box.bottom <= canvas.bottom
+      }), 'the narrow editor did not pan fully into view')
+      assert.deepEqual(await nodeGeometry(narrow), narrowNodeGeometry, 'the width clamp moved the node or its handles')
+      const narrowBounds = await narrowPanel.boundingBox()
+      const narrowToolbar = await toolbarBoxes(formFor(narrow))
+      assert.equal(narrowToolbar.length, 7, 'narrow editing hid supported controls')
+      assert.ok(narrowToolbar.every(box => box.x >= narrowBounds.x && box.y >= narrowBounds.y &&
+        box.x + box.width <= narrowBounds.x + narrowBounds.width && box.y + box.height <= narrowBounds.y + narrowBounds.height),
+        'the compact toolbar overflowed the narrow editor')
+      assert.ok(narrowToolbar.slice(3).some(box => box.y > narrowToolbar[0].y + narrowToolbar[0].height),
+        'the parameter controls did not wrap in the narrow editor')
+      const narrowDuration = formFor(narrow).getByRole('button', { name: '时长（秒）', exact: true })
+      await narrowDuration.click()
+      const narrowDurationPopover = page.getByRole('dialog', { name: '时长（秒）', exact: true })
+      await narrowDurationPopover.waitFor()
+      await page.keyboard.press('Escape')
+      await narrowDurationPopover.waitFor({ state: 'hidden' })
+      await screenshot(page, 'compact-editor-narrow.png')
       console.info(`Node editor PASS: ${editorGeometry.width}×${editorGeometry.height} CSS px, prompt/IME autosave, focus/viewport, parameter popover and real PNG request`)
     })
   } finally {

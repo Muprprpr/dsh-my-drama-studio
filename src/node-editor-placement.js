@@ -21,10 +21,12 @@ export function useNodeEditorPlacement(nodeId, enabled, focused = false) {
       frame = 0
       const bounds = canvas.getBoundingClientRect()
       const anchor = card.getBoundingClientRect()
-      const editor = panel.getBoundingClientRect()
-      if (!bounds.width || !bounds.height || !editor.height) return
+      if (!bounds.width || !bounds.height) return
 
       const zoom = flow.getState().transform[2]
+      const maxWidth = Math.max(1, (bounds.width - 2 * margin) / zoom)
+      panel.style.setProperty('--drama-editor-max-width', `${maxWidth}px`)
+      const editor = panel.getBoundingClientRect()
       const above = anchor.top - bounds.top - margin
       const below = bounds.bottom - anchor.bottom - margin
       const height = editor.height + gap * zoom
@@ -33,10 +35,9 @@ export function useNodeEditorPlacement(nodeId, enabled, focused = false) {
       const left = bounds.left + margin
       const right = bounds.right - margin - editor.width
       const anchorVisible = anchor.right > bounds.left && anchor.left < bounds.right
-      const target = !anchorVisible || right < left ? anchor.left : Math.min(right, Math.max(left, anchor.left))
-      const previousShift = Number.parseFloat(panel.style.getPropertyValue('--drama-editor-shift')) || 0
-      const originalLeft = editor.left - previousShift * zoom
-      panel.style.setProperty('--drama-editor-shift', `${(target - originalLeft) / zoom}px`)
+      const centered = anchor.left + (anchor.width - editor.width) / 2
+      const target = anchorVisible ? Math.max(left, Math.min(right, centered)) : centered
+      panel.style.setProperty('--drama-editor-shift', `${(target - centered) / zoom}px`)
     }
     function schedule() {
       if (!frame) frame = requestAnimationFrame(place)
@@ -58,6 +59,7 @@ export function useNodeEditorPlacement(nodeId, enabled, focused = false) {
       unsubscribe()
       delete panel.dataset.placement
       panel.style.removeProperty('--drama-editor-shift')
+      panel.style.removeProperty('--drama-editor-max-width')
     }
   }, [flow, nodeId, enabled, focused])
 

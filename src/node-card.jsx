@@ -74,7 +74,7 @@ function MenuSelect({ label, value, items, onChange, disabled = false, placehold
         aria-labelledby={compact ? undefined : id}
         aria-haspopup="menu" aria-expanded={open} disabled={disabled || items.length === 0}
         onClick={() => setOpen(current => !current)}>
-        <span title={selected?.title}>{selected?.label ?? placeholder}</span>
+        <span title={selected?.title ?? selected?.label}>{selected?.label ?? placeholder}</span>
         <IconChevronDownOutlineRegular size={14} />
       </Button>} />
   </div>
@@ -930,35 +930,39 @@ function NodeEditor({
           </Button>
         </div>
         <div className="drama-node-creative-controls">
-          {type === 'video'
-            ? <MenuSelect compact label="视频方式" value={mode} items={modeItems} placeholder="选择方式"
-              onChange={changeMode} disabled={blocked} />
-            : <span className="drama-node-creative-mode" title="图片生成">T2I</span>}
-          <MenuSelect compact label="生成预设" value={profileId} disabled={blocked || type === 'video' && !mode}
-            items={profileId ? choices : [{ id: '', label: activeProfile ? '默认 · ' + activeProfile.name : '选择模型',
-              title: activeProfile?.model }, ...choices.slice(1)]}
-            onChange={changeProfile} />
+          <div className="drama-node-creative-options">
+            <div className="drama-node-creative-selects">
+              {type === 'video'
+                ? <MenuSelect compact label="视频方式" value={mode} items={modeItems} placeholder="选择方式"
+                  onChange={changeMode} disabled={blocked} />
+                : <span className="drama-node-creative-mode" title="图片生成">T2I</span>}
+              <MenuSelect compact label="生成预设" value={profileId} disabled={blocked || type === 'video' && !mode}
+                items={profileId ? choices : [{ id: '', label: activeProfile ? '默认 · ' + activeProfile.name : '选择模型',
+                  title: activeProfile?.model }, ...choices.slice(1)]}
+                onChange={changeProfile} />
+            </div>
+            {parameters.length > 0 && <div className="drama-node-parameter-chips" role="group" aria-label="有效生成参数">
+              {parameters.map(param => param.fixed
+                ? <span className="drama-focus-param-chip is-fixed" key={param.key} title={param.label}>{param.summary}</span>
+                : <NodeParameterPopover key={param.key} label={param.label} value={param.summary} disabled={blocked}
+                  open={openParameter === param.key} onToggle={() => setOpenParameter(current => current === param.key ? '' : param.key)}
+                  onClose={() => setOpenParameter(current => current === param.key ? '' : current)}>
+                  {param.numeric ? <DurationControl param={param} update={next => updateParam(param.key, next)} />
+                    : param.options.length ? <div className="drama-param-options" role="group" aria-label={param.label}>
+                      {[{ id: '', label: param.placeholder }, ...param.options].map(option =>
+                        <Button key={option.id} size="sm" variant={option.id === param.selected ? 'primary' : 'outline'}
+                          aria-pressed={option.id === param.selected} onClick={() => updateParam(param.key, option.id)}>
+                          {option.label}
+                        </Button>)}
+                    </div> : <Input aria-label={param.label} value={param.selected} placeholder={param.placeholder}
+                      onChange={event => updateParam(param.key, event.target.value)} />}
+                </NodeParameterPopover>)}
+            </div>}
+          </div>
           <Button size="sm" className="drama-node-creative-settings" aria-label="节点详情" aria-haspopup="dialog"
             title="节点详情" icon={<IconSlidersTwoOutlineRegular size={15} />}
             onClick={() => setSettings('metadata')} />
         </div>
-        {parameters.length > 0 && <div className="drama-node-parameter-chips" role="group" aria-label="有效生成参数">
-          {parameters.map(param => param.fixed
-            ? <span className="drama-focus-param-chip is-fixed" key={param.key} title={param.label}>{param.summary}</span>
-            : <NodeParameterPopover key={param.key} label={param.label} value={param.summary} disabled={blocked}
-              open={openParameter === param.key} onToggle={() => setOpenParameter(current => current === param.key ? '' : param.key)}
-              onClose={() => setOpenParameter(current => current === param.key ? '' : current)}>
-              {param.numeric ? <DurationControl param={param} update={next => updateParam(param.key, next)} />
-                : param.options.length ? <div className="drama-param-options" role="group" aria-label={param.label}>
-                  {[{ id: '', label: param.placeholder }, ...param.options].map(option =>
-                    <Button key={option.id} size="sm" variant={option.id === param.selected ? 'primary' : 'outline'}
-                      aria-pressed={option.id === param.selected} onClick={() => updateParam(param.key, option.id)}>
-                      {option.label}
-                    </Button>)}
-                </div> : <Input aria-label={param.label} value={param.selected} placeholder={param.placeholder}
-                  onChange={event => updateParam(param.key, event.target.value)} />}
-            </NodeParameterPopover>)}
-        </div>}
         <div ref={referenceArea}>
           {(!mode || mode === 't2v') && type === 'video' ? <ReferenceModeMenu disabled={blocked} choose={changeMode} />
             : <MediaReferences compact mode={referenceMode} profile={activeProfile} media={available} mediaURL={mediaURL}
