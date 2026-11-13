@@ -485,7 +485,7 @@ function GenerationParams({ value, update, profile, generationDefaults, mode }) 
 function NodeEditor({
   draft, append, mutate, mutationReason, media = [], queryCanvas, finish, close, mediaURL, index,
   generationProfiles, generationDefaults, node, actions, latest, resolvedMedia, rename, referenceFocus, uploadReference,
-  importFile, attachAsset, reportSaveError, clearSeed,
+  importFile, attachAsset, reportSaveError,
 }) {
   const { base, preset, seed, duplicate, edit, group } = draft
   const type = node.type
@@ -525,7 +525,6 @@ function NodeEditor({
   const [references, setReferences] = useState(() => [...new Set([...persistedRefs,
     ...(seeded && !edit ? [seed.id] : []),
   ])])
-  const [pendingSeed, setPendingSeed] = useState(seeded && edit && !persistedRefs.includes(seed.id) ? seed : null)
   const [extraMedia, setExtraMedia] = useState(() => seed ? [seed] : [])
   const available = new Map([...extraMedia, ...media, ...(index?.values() ?? [])]
     .filter(item => item.id !== node.id).map(item => [item.id, item]))
@@ -655,7 +654,7 @@ function NodeEditor({
     taskActive(latest ?? {}) && '此节点正在生成。',
     saving && '正在保存修改。',
     dirty && (compact ? error || '正在保存修改。' : '请先保存修改。'),
-    !prompt.trim() && !hasTextRef && '请填写提示词。',
+    !prompt.trim() && !hasTextRef && (type === 'video' ? '生成前请填写完整视频提示词。' : '请填写提示词。'),
     referenceItems.some(item => !referenceReady(item, resolvedMedia)) && '等待上游素材。',
     issue,
     !savedProfile?.configured && '请选择已配置的生成预设。',
@@ -669,7 +668,6 @@ function NodeEditor({
         : referenceIssue(value, referenceKinds)
       if (issue) { setError(issue); return }
     }
-    if (pendingSeed && !referenceLimit(value, pendingSeed.type)) discardSeed()
     setMode(value)
     setProfileId('')
     setOverrides({})
@@ -683,24 +681,13 @@ function NodeEditor({
   }
 
   function attachReference(item) {
-    if (pendingSeed) discardSeed()
     setExtraMedia(current => [...current, item])
     setReferences(current => [...new Set([...current, item.id])])
     markDirty()
   }
 
-  function discardSeed() {
-    setPendingSeed(null)
-    clearSeed?.()
-  }
-
   function updatePrompt(value) {
     setPrompt(value)
-    if (value.trim() && pendingSeed && !pendingSeed.deleted &&
-        referenceLimit(referenceMode, pendingSeed.type, activeProfile) > 0) {
-      attachReference(pendingSeed)
-      setPendingSeed(null)
-    }
     markDirty()
   }
 
@@ -728,7 +715,6 @@ function NodeEditor({
     }
     const ordered = supportsRefs ? references : []
     if (generation) {
-      if (type === 'video' && ordered.length && !prompt.trim()) throw new Error('请填写视频提示词。')
       const structuralIssue = referenceIssue(referenceMode, referenceKinds, activeProfile)
       if (structuralIssue) throw new Error(structuralIssue)
       const params = Object.fromEntries(Object.entries(overrides).filter(([key, value]) =>
@@ -806,7 +792,6 @@ function NodeEditor({
       const result = await send('update_node', { ...payload, revision: revision.current }, committed.current)
       revision.current = result.revision
       committed.current = { ...committed.current, ...payload, revision: result.revision }
-      if (seed && payload.referenceSources.includes(seed.id)) clearSeed?.()
       state.savedVersion = version
       if (mounted.current && !state.pending && !state.error) {
         setDirty(false)
@@ -896,8 +881,7 @@ function NodeEditor({
             : <MediaReferences compact mode={referenceMode} profile={activeProfile} media={available} mediaURL={mediaURL}
               resolvedMedia={resolvedMedia} queryCanvas={queryCanvas} nodeId={node.id} references={references}
               setReferences={changeReferences} onSelect={attachReference} uploadReference={uploadReference}
-              attachAsset={attachAsset} locate={actions.locate} preview={actions.preview} disabled={blocked}
-              pendingSeed={pendingSeed} discardSeed={discardSeed} />}
+              attachAsset={attachAsset} locate={actions.locate} preview={actions.preview} disabled={blocked} />}
         </div>
         <div className={'drama-node-creative-prompt' + (expanded ? ' is-expanded' : '')}>
           <textarea ref={promptInput} aria-label="提示词" name="prompt" rows={expanded ? 9 : 3}
@@ -915,7 +899,7 @@ function NodeEditor({
           </Button>}
         </div>
       </>}
-      {(shownError || generation && prompt.trim() && !dirty && unavailable) &&
+      {(shownError || generation && (prompt.trim() || references.length > 0) && !dirty && unavailable) &&
         <p className="drama-node-creative-status" role={error ? 'alert' : 'status'}>{shownError || unavailable}</p>}
       <div className="drama-node-creative-controls">
         {type === 'video'
@@ -1122,7 +1106,7 @@ function ReferenceModeMenu({ disabled, choose }) {
 }
 
 function MediaReferences({ compact, mode, profile, media, mediaURL, resolvedMedia, queryCanvas, nodeId, references,
-  setReferences, onSelect, uploadReference, attachAsset, locate, preview, disabled, pendingSeed, discardSeed }) {
+  setReferences, onSelect, uploadReference, attachAsset, locate, preview, disabled }) {
   const [search, setSearch] = useState('')
   const [pickerOpen, setPickerOpen] = useState(false)
   const totalLimit = mode === 'r2v' ? profile?.limits?.maxReferences ?? 32 : 32
@@ -1184,10 +1168,6 @@ function MediaReferences({ compact, mode, profile, media, mediaURL, resolvedMedi
     const closePicker = () => { setPickerOpen(false); setSearch('') }
     return <>
       <div className="drama-node-reference-strip" aria-label={legend}>
-        {pendingSeed && !references.includes(pendingSeed.id) && <ReferenceSlot id={pendingSeed.id} item={pendingSeed}
-          asset={resolvedMedia?.get(pendingSeed.id) ?? pendingSeed}
-          title={slot + ' · ' + nodeName(pendingSeed) + '（填写提示词后连接）'} label={slot + ' · 待连接'} disabled={disabled}
-          index={0} count={1} mediaURL={mediaURL} locate={locate} preview={preview} remove={discardSeed} />}
         {!!references.length && <div className="drama-node-reference-track" onWheel={event => {
           const track = event.currentTarget
           if (!event.deltaX && track.scrollWidth > track.clientWidth) track.scrollLeft += event.deltaY

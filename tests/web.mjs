@@ -607,18 +607,27 @@ async function updateVideo(page, ticket, id, prompt) {
 }
 
 test('New canvas nodes are persisted and usable immediately from the picker', { timeout: 75_000 }, async () => {
-  await withWeb(async ({ page, records }) => {
+  await withWeb(async ({ page, records, url }) => {
     const [record] = records
     await select(page, record)
     await open(page, record)
-    const ticket = await ticketFor(page, record.sessionId)
+    let ticket = await ticketFor(page, record.sessionId)
     await panel(page).getByRole('button', { name: '搜索', exact: true }).click()
     const initialSearch = panel(page).getByRole('textbox', { name: '搜索节点', exact: true })
     await initialSearch.fill('不会匹配新节点')
     await initialSearch.press('Enter')
     const image = await pick(page, '图片', ticket, 'image')
     const picture = card(page, image.id)
-    await picture.getByRole('button', { name: '上传图片', exact: true }).waitFor()
+    const upload = picture.getByRole('button', { name: '上传图片', exact: true })
+    await upload.waitFor()
+    if (hasImage) {
+      const chooser = page.waitForEvent('filechooser')
+      await upload.click()
+      await (await chooser).setFiles(imageAsset)
+      await poll(async () => (await query(page, ticket, { id: image.id })).nodes[0]?.content.path,
+        'uploading a PNG did not persist before adding it as a reference')
+      await picture.locator('img').first().evaluate(img => img.decode())
+    }
     const imagePrompt = '新建图片功能验收，室内自然光照亮木桌。'
     await picture.getByRole('textbox', { name: '提示词', exact: true }).fill(imagePrompt)
     await clickBlank(page)
@@ -628,18 +637,28 @@ test('New canvas nodes are persisted and usable immediately from the picker', { 
     const target = card(page, video.id)
     assert.equal(video.content.mode, 'i2v')
     await target.getByRole('button', { name: '添加首帧', exact: true }).waitFor()
-    const prompt = '新建视频功能验收，镜头缓慢推近木桌，保持自然光。'
-    await target.getByRole('textbox', { name: '提示词', exact: true }).fill(prompt)
     await clickBlank(page)
-    await poll(async () => (await query(page, ticket, { id: video.id })).nodes[0]?.content.prompt === prompt,
-      'editing an immediately-created video did not persist')
     await dragReference(page, image.id, video.id)
-    const linked = await poll(async () => {
-      const snapshot = await query(page, ticket, { id: video.id })
-      return snapshot.edges.some(edge => edge.source === image.id && edge.target === video.id) && snapshot.nodes[0]
-    }, 'new image and video could not be connected through their canvas ports')
-    assert.deepEqual(linked.content.mixedListOrder, [image.id])
-    assert.equal(linked.content.textList, undefined)
+    async function assertBlankMediaLink(id) {
+      const linked = await poll(async () => {
+        const snapshot = await query(page, ticket, { id })
+        return snapshot.edges.some(edge => edge.source === image.id && edge.target === id) && snapshot.nodes[0]
+      }, 'video media link was not persisted before the prompt was written')
+      assert.equal((linked.content.prompt ?? '').trim(), '')
+      assert.deepEqual(linked.content.mixedListOrder, [image.id])
+      assert.equal(linked.content.textList, undefined)
+      return linked
+    }
+    await assertBlankMediaLink(video.id)
+    const generate = target.getByRole('button', { name: '生成…', exact: true })
+    await generate.waitFor()
+    assert.ok(await generate.isDisabled(), 'generation was enabled without an inline prompt')
+    const blocked = await request(page, 'operation', { ticket, action: 'generateI2V',
+      data: { operationId: randomUUID(), nodeId: video.id, confirmed: true } })
+    assert.equal(blocked.status, 400, JSON.stringify(blocked.body))
+    assert.match(blocked.body.error, /提示词/u)
+    const prompt = '新建视频功能验收，镜头缓慢推近木桌，保持自然光。'
+    await updateVideo(page, ticket, video.id, prompt)
     await clickBlank(page)
     await panel(page).getByRole('button', { name: '搜索', exact: true }).click()
     const search = panel(page).getByRole('textbox', { name: '搜索节点', exact: true })
@@ -668,15 +687,33 @@ test('New canvas nodes are persisted and usable immediately from the picker', { 
       await picture.hover()
       await picture.getByRole('button', { name: '新增后继节点', exact: true }).click()
     })
-    assert.deepEqual((await query(page, ticket, { id: successor.id })).edges, [])
-    await card(page, successor.id).getByRole('button', { name: /填写提示词后连接/u }).waitFor()
-    await updateVideo(page, ticket, successor.id, '以 @图片1 为首帧，保持自然光，固定镜头。')
-    await poll(async () => {
-      const snapshot = await query(page, ticket, { id: successor.id })
-      const [node] = snapshot.nodes
-      return snapshot.edges.some(edge => edge.source === image.id) && node?.content.mixedListOrder?.[0] === image.id &&
-        node.content.textList === undefined
-    }, 'the new successor did not connect its pending media after saving the inline prompt')
+    await assertBlankMediaLink(successor.id)
+    const pickerVideo = await pick(page, 'i2v', ticket, 'video')
+    const editor = nodeEditor(page, pickerVideo.id)
+    await editor.getByRole('button', { name: '添加首帧', exact: true }).click()
+    const references = page.getByRole('dialog', { name: '添加参考素材', exact: true })
+    await references.getByRole('button', { name: '添加图片素材', exact: true }).click()
+    const [source] = (await query(page, ticket, { id: image.id })).nodes
+    await page.getByRole('menuitem').filter({ hasText: source.content.title ?? '图片' }).click()
+    const manual = await assertBlankMediaLink(pickerVideo.id)
+    await clickBlank(page)
+    await dragReference(page, standalone.id, pickerVideo.id)
+    await flow(page).getByRole('alert').filter({ hasText: /只接受图片、视频或音频/u }).waitFor()
+    const invalidEdge = await request(page, 'operation', { ticket, action: 'append', data: {
+      operationId: randomUUID(), edges: [{ source: standalone.id, target: pickerVideo.id }],
+    } })
+    assert.equal(invalidEdge.status, 400, JSON.stringify(invalidEdge.body))
+    assert.equal((await query(page, ticket, { id: pickerVideo.id })).nodes[0].revision, manual.revision)
+    await page.reload({ waitUntil: 'domcontentloaded' })
+    await initialize(page, new URL(url).origin)
+    await select(page, record)
+    if (!(await panel(page).isVisible())) await open(page, record)
+    ticket = await ticketFor(page, record.sessionId)
+    await flow(page).waitFor()
+    await assertBlankMediaLink(successor.id)
+    await assertBlankMediaLink(pickerVideo.id)
+    assert.deepEqual((await query(page, ticket, { id: pickerVideo.id })).edges,
+      [{ source: image.id, target: pickerVideo.id }])
     assert.equal((await operate(page, ticket, 'tasks', {})).tasks.length, 0)
   })
 })
@@ -1223,6 +1260,13 @@ test('Native human CRUD follows live Workspace Agent activity', { timeout: 100_0
     assert.equal((await current(peer, bTicket, disposable.id)).deleted, true)
     assert.ok(!(await query(peer, bTicket)).nodes.some(node => node.id === disposable.id))
 
+    // Reopen the peer canvas after the delete refresh before measuring another card.
+    await peer.reload({ waitUntil: 'domcontentloaded' })
+    await initialize(peer, new URL(url).origin)
+    if (!(await panel(peer).isVisible())) {
+      await select(peer, b)
+      await open(peer, b)
+    }
     const unsaved = await edit(peer, original.id)
     const draftText = 'AI 在保存前启动，这段未保存正文仍须保留。'
     await body(unsaved).fill(draftText)

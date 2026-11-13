@@ -11,6 +11,79 @@ import (
 	"github.com/google/uuid"
 )
 
+func TestCanvasVideoDraftCanSaveMediaBeforePrompt(t *testing.T) {
+	dir := t.TempDir()
+	s := New(providerFixture{})
+	defer s.Close()
+	bindSession(t, s, dir, "a")
+	s.SetHumanWriteCheck(func(context.Context, string, string, []string, []string) (bool, error) { return true, nil })
+	image, note, video, appended := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
+	sources := []string{image}
+	noPrompt := json.RawMessage(`{"mode":"i2v"}`)
+	_, err := editCall(s, dir, "a", "human", "append", appendArgs{
+		operation: operation{ID: "create-media-first"},
+		Nodes: []NodeInput{
+			{ID: image, Type: "image", Content: json.RawMessage(`{"path":"assets/images/first.png"}`)},
+			{ID: note, Type: "note", Content: json.RawMessage(`{"text":"No text reference"}`)},
+			{ID: video, Type: "video", Content: noPrompt},
+			{ID: appended, Type: "video", Content: noPrompt},
+		},
+		Edges: []Edge{{Source: image, Target: appended}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustEdit(t, s, dir, "a", "update_node", updateNodeArgs{
+		nodeRevisionArgs: nodeRevisionArgs{operation: operation{ID: "connect-before-prompt"}, ID: video, Revision: 1},
+		Content:          noPrompt,
+		ReferenceSources: &sources,
+	})
+	_, err = editCall(s, dir, "a", "human", "update_node", updateNodeArgs{
+		nodeRevisionArgs: nodeRevisionArgs{operation: operation{ID: "reject-text"}, ID: video, Revision: 2},
+		Content:          noPrompt,
+		ReferenceSources: &[]string{note},
+	})
+	if err == nil || !strings.Contains(err.Error(), "不接受") {
+		t.Fatalf("video draft accepted a text source: %v", err)
+	}
+	deleted, err := editCall(s, dir, "a", "human", "canvas_delete", canvasChangeArgs{
+		operation: operation{ID: "delete-media-first-edge"},
+		Edges:     []canvasEdgeVersion{{Edge: Edge{Source: image, Target: video}, Revision: 2}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := editCall(s, dir, "a", "human", "canvas_restore", canvasChangeArgs{
+		operation: operation{ID: "restore-media-first-edge"},
+		Edges:     deleted.(canvasChangeResult).Edges,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i, id := range []string{video, appended} {
+		result := mustCall(t, s, dir, "a", "query", queryArgs{ID: id}).(queryResult)
+		var content map[string]json.RawMessage
+		if err := json.Unmarshal(result.Nodes[0].Content, &content); err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(result.Edges, []Edge{{Source: image, Target: id}}) || !slices.Equal(orderedSources(content), sources) {
+			t.Fatalf("media-first draft lost its ordered connection: %+v", result)
+		}
+		request := map[string]any{"operationId": fmt.Sprintf("blank-submit-%d", i), "nodeId": id, "confirmed": true}
+		if _, err := call(s, dir, "a", "generateI2V", request); err == nil || !strings.Contains(err.Error(), "完整提示词") {
+			t.Fatalf("submission failed to require inline prompt: %v", err)
+		}
+	}
+	tasks := mustCall(t, s, dir, "a", "tasks", nil).(map[string][]Task)["tasks"]
+	if len(tasks) != 0 {
+		t.Fatalf("blank drafts enqueued tasks: %+v", tasks)
+	}
+	mustEdit(t, s, dir, "a", "update_node", updateNodeArgs{
+		nodeRevisionArgs: nodeRevisionArgs{operation: operation{ID: "write-prompt-after-connection"}, ID: video, Revision: 4},
+		Content:          json.RawMessage(`{"mode":"i2v","prompt":"Keep @图片1 as the first frame."}`),
+	})
+	mustCall(t, s, dir, "a", "generateI2V", map[string]any{"operationId": "configured-submit", "nodeId": video, "confirmed": true})
+}
+
 func TestCanvasReferencesWaitResolveAndProtectTaskInput(t *testing.T) {
 	dir := t.TempDir()
 	s := New(providerFixture{})

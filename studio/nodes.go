@@ -700,7 +700,7 @@ func validateVideo(ctx context.Context, tx *sql.Tx, id string, draft bool) error
 	}
 	isDraft := data.Path == "" && data.URL == "" || data.Mode != "" || len(media) > 0
 	if isDraft {
-		if strings.TrimSpace(data.Prompt) == "" && (!draft || len(media) > 0) {
+		if !draft && strings.TrimSpace(data.Prompt) == "" {
 			return invalid("视频生成节点必须在 content.prompt 内联完整提示词")
 		}
 		if err := validateVideoDraftFields(raw); err != nil {

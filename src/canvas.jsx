@@ -80,7 +80,6 @@ export function CanvasViewport({
   const [boxSelect, setBoxSelect] = useState(false)
   const [showMap, setShowMap] = useState(false)
   const [drafts, setDrafts] = useState([])
-  const videoSeeds = useRef(new Map())
   const [preview, setPreview] = useState(null)
   const [tasksOpen, setTasksOpen] = useState(false)
   const [selectedResults, setSelectedResults] = usePositions(`drama-results:${status.canvasId}:${status.sessionId}`)
@@ -179,15 +178,13 @@ export function CanvasViewport({
       uploadReference: file => createMedia(file, undefined, false),
       attachAsset: asset => asset.deleted || asset.id === draft.id ? createAssetNode(asset) : asset,
       reportSaveError: setEdgeError,
-      clearSeed: () => videoSeeds.current.delete(draft.id),
       finish: id => finishEdit(draft.id, id),
       close: () => draft.edit ? setSelected([]) : closeDraft(draft.id),
     }
   }
   const graphNodes = visible.map(node => {
-    const seed = index.get(videoSeeds.current.get(node.id)?.id) ?? videoSeeds.current.get(node.id)
     const draft = !node.deleted && selected.length === 1 && selected[0] === node.id
-      ? { id: node.id, base: node, edit: true, group: node, seed: seed?.deleted ? undefined : seed } : null
+      ? { id: node.id, base: node, edit: true, group: node } : null
     return {
       id: node.id,
       type: 'drama',
@@ -504,17 +501,11 @@ export function CanvasViewport({
       const content = { title: preset.label, ...(mode ? { mode } : {}) }
       const node = { id, type, content, ...groupFor(seed, filters) }
       const edges = []
-      if (seed && type === 'video') videoSeeds.current.set(id, seed)
-      if (seed && type !== 'video' && type !== 'audio') {
+      if (seed && type !== 'audio') {
         edges.push({ source: seed.id, target: id })
-        if (type === 'shot' && seed.type === 'image') content.mixedListOrder = [seed.id]
+        if (type === 'video' || type === 'shot' && seed.type === 'image') content.mixedListOrder = [seed.id]
       }
-      try {
-        await appendWithHistory({ nodes: [node], edges })
-      } catch (failure) {
-        videoSeeds.current.delete(id)
-        throw failure
-      }
+      await appendWithHistory({ nodes: [node], edges })
       revealNew([node])
       const source = seed && graphNodes.find(graph => graph.id === seed.id)?.position
       placeNew(id, at ?? (source && { x: source.x + gapX, y: source.y }), true)
@@ -539,7 +530,6 @@ export function CanvasViewport({
     const kinds = ordered.map(id => index.get(id)?.type)
     if (to.type === 'video') {
       if (!mediaTypes.has(from.type)) return { error: '视频节点只接受图片、视频或音频输入' }
-      if (!String(content.prompt ?? '').trim()) return { error: '请先保存视频节点的完整提示词' }
       const mode = videoMode(to)
       if (mode === 'asset') return { error: '请先为视频节点选择生成方式' }
       let nextMode = mode === 't2v' ? ({ image: 'i2v', video: 'v2v', audio: 'r2v' })[from.type] : mode
@@ -981,10 +971,9 @@ export function CanvasViewport({
         presets={presets.filter(item => {
           if (!picker.seed) return true
           if (item.type !== 'video') return item.type !== 'image' || picker.seed.type === 'image' || textTypes.has(picker.seed.type)
-          if (mediaTypes.has(picker.seed.type)) return item.mode === 'r2v' ||
-            (picker.seed.type === 'image' && item.mode === 'i2v') ||
-            (picker.seed.type === 'video' && item.mode === 'v2v')
-          return false
+          if (!mediaTypes.has(picker.seed.type)) return false
+          const profile = resolveProfile(profileCandidates(generationProfiles, item.mode))
+          return referenceLimit(item.mode, picker.seed.type, profile) > 0
         })}
         close={() => setPicker(null)} />}
       {contextNode && index.has(contextNode.id) && <Menu open portal compact
