@@ -105,6 +105,11 @@ export function CanvasViewport({
   const writing = useRef(false)
   const latestLocks = useRef(new Set())
 
+  useEffect(() => {
+    if (rename && !selected.includes(rename.id)) setRename(null)
+    if (referenceFocus && !selected.includes(referenceFocus.id)) setReferenceFocus(null)
+  }, [selected, rename, referenceFocus])
+
   const index = useMemo(() => new Map([...referenceNodes, ...nodes].map(node => [node.id, node])), [nodes, referenceNodes])
   const resolvedMedia = useMemo(() => new Map(Object.entries(snapshot.resolvedMedia ?? {})), [snapshot.resolvedMedia])
   const locked = new Set([...agentLockedNodeIds, ...lockedNodeIds])
@@ -172,6 +177,7 @@ export function CanvasViewport({
       importFile: file => uploadFile(mediaKind(file), file),
       uploadReference: file => createMedia(file, undefined, false),
       attachAsset: asset => asset.deleted || asset.id === draft.id ? createAssetNode(asset) : asset,
+      reportSaveError: setEdgeError,
       finish: id => finishEdit(draft.id, id),
       close: () => draft.edit ? setSelected([]) : closeDraft(draft.id),
     }
@@ -328,9 +334,9 @@ export function CanvasViewport({
     return result
   }
 
-  async function editWithHistory(action, data) {
+  async function editWithHistory(action, data, committed) {
     if (action !== 'update_node') return trackRevisions(await mutate(action, data))
-    const base = index.get(data.id)
+    const base = committed ?? index.get(data.id)
     const previous = { id: base.id, ...groupOf(base), content: base.content,
       referenceSources: mutableSources(base) ? referenceIds(base) : undefined }
     const result = trackRevisions(await mutate(action, data))
@@ -769,6 +775,7 @@ export function CanvasViewport({
   }
 
   function paste(event) {
+    if (!event.currentTarget.contains(event.target)) return
     if (inEditor(event) || event.nativeEvent.isComposing) return
     const files = [...(event.clipboardData?.files ?? [])]
     if (files.length) {
@@ -787,6 +794,7 @@ export function CanvasViewport({
   }
 
   function canvasKeys(event) {
+    if (!event.currentTarget.contains(event.target)) return
     if (event.isDefaultPrevented() || event.isComposing || event.nativeEvent.isComposing ||
         event.keyCode === 229 || inEditor(event) || removal || assetPicker || preview) return
     const key = event.key.toLowerCase()
@@ -826,16 +834,19 @@ export function CanvasViewport({
     <div ref={surface} className="drama-flow" role="region" aria-label="创作节点画布" tabIndex={0}
       onKeyDown={canvasKeys} onPaste={paste}
       onPointerDownCapture={event => {
+        if (!event.currentTarget.contains(event.target)) return
         if (event.button === 0 && !inEditor(event) &&
             event.target instanceof Element && !event.target.closest('button, .nodrag')) surface.current?.focus({ preventScroll: true })
       }}
       onDragOver={event => {
+        if (!event.currentTarget.contains(event.target)) return
         if (event.dataTransfer.types.includes('Files')) {
           event.preventDefault()
           event.dataTransfer.dropEffect = 'copy'
         }
       }}
       onDrop={event => {
+        if (!event.currentTarget.contains(event.target)) return
         if (!event.dataTransfer.files.length) return
         event.preventDefault()
         importFiles([...event.dataTransfer.files], pointOnCanvas(event))

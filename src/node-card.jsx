@@ -1,16 +1,18 @@
-import React, { useEffect, useId, useRef, useState } from 'react'
+import React, { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
 import { Handle, Position } from '@xyflow/react'
 import {
   Button, FileTypeIcon, IconBranchOutlineRegular, IconChevronDownOutlineRegular,
   IconCopyOutlineRegular, IconEditOutlineRegular, IconFullscreenOutlineRegular,
   IconLinkOutlineRegular, IconListPenOutlineRegular, IconPlanOutlineRegular, IconPlayOutlineRegular,
-  IconPlusOutlineRegular, IconSparkleRegular, IconTrashOutlineRegular, Input, Menu, Tag, Tooltip,
+  IconPlusOutlineRegular, IconSlidersTwoOutlineRegular, IconSparkleRegular, IconTrashOutlineRegular,
+  Input, Menu, Modal, Tag, Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import {
   assetFolders, groupFields, isMedia, mediaTypes, modeLabels, nodeLabels, nodeTitle,
   profileCandidates, referenceIds, referenceLimit, resolveProfile, shotLabel, textTypes, videoMode,
 } from './canvas-node.jsx'
 import { TaskStatus, taskActive } from './task-drawer.jsx'
+import { useNodeEditorPlacement } from './node-editor-placement.js'
 import cardStyle from './node-card.css'
 
 export { cardStyle }
@@ -57,17 +59,18 @@ function preventCanvasDoubleClick(event) {
   event.stopPropagation()
 }
 
-function MenuSelect({ label, value, items, onChange, disabled = false, placeholder = '请选择' }) {
+function MenuSelect({ label, value, items, onChange, disabled = false, placeholder = '请选择', compact = false }) {
   const [open, setOpen] = useState(false)
   const selected = items.find(item => item.id === value)
   const id = useId()
   return <div className="drama-node-field">
-    <label id={id}>{label}</label>
+    {!compact && <label id={id}>{label}</label>}
     <Menu open={open} portal compact autoFocus minWidthFromAnchor selectedId={value}
       onClose={() => setOpen(false)}
       onSelect={id => { onChange(id); setOpen(false) }}
       items={items}
-      anchor={<Button size="sm" className="drama-node-select" aria-labelledby={id}
+      anchor={<Button size="sm" className="drama-node-select" aria-label={compact ? label : undefined}
+        aria-labelledby={compact ? undefined : id}
         aria-haspopup="menu" aria-expanded={open} disabled={disabled || items.length === 0}
         onClick={() => setOpen(current => !current)}>
         <span title={selected?.title}>{selected?.label ?? placeholder}</span>
@@ -234,24 +237,22 @@ function GenerateControl({ node, profile, generationDefaults, actions, unavailab
     }
   }
 
-  if (!confirming) return <Button size="sm" variant="primary" icon={<IconSparkleRegular size={15} />}
-    disabled={Boolean(unavailable)} title={unavailable}
-    onClick={() => {
-      setError('')
-      setConfirming(true)
-    }}>{latest ? '重新生成…' : '生成…'}</Button>
-  return <section className="drama-node-confirm" role="dialog" aria-label="确认生成">
-    <strong>确认生成</strong>
-    {profile && <span className="drama-node-caption">{[profile.name, profile.model,
-      ...paramSummary(profile, generationDefaults, node.content.params, mode)].join(' · ')}</span>}
-    {error && <p className="drama-node-form-error" role="alert">{error}</p>}
-    <div className="drama-node-actions">
-      <Button size="sm" disabled={busy} onClick={() => setConfirming(false)}>取消</Button>
-      <Button size="sm" variant="primary" disabled={busy || !profile?.configured || Boolean(unavailable)} onClick={submit}>
-        {busy ? '正在提交' : '确认提交'}
-      </Button>
-    </div>
-  </section>
+  return <>
+    <Button size="sm" variant="primary" className="drama-node-generate" icon={<IconSparkleRegular size={14} />}
+      disabled={Boolean(unavailable)} title={unavailable}
+      onClick={() => { setError(''); setConfirming(true) }}>{latest ? '重新生成…' : '生成…'}</Button>
+    {confirming && <Modal open title="确认生成" closeLabel="关闭生成确认"
+      onClose={() => { if (!busy) setConfirming(false) }} footer={<>
+        <Button size="sm" disabled={busy} onClick={() => setConfirming(false)}>取消</Button>
+        <Button size="sm" variant="primary" disabled={busy || !profile?.configured || Boolean(unavailable)} onClick={submit}>
+          {busy ? '正在提交' : '确认提交'}
+        </Button>
+      </>}>
+      {profile && <p className="drama-node-dialog-summary">{[profile.name, profile.model,
+        ...paramSummary(profile, generationDefaults, node.content.params, mode)].join(' · ')}</p>}
+      {error && <p className="drama-node-form-error" role="alert">{error}</p>}
+    </Modal>}
+  </>
 }
 
 function FileAction({ label, accept, onFile, disabled = false }) {
@@ -316,6 +317,8 @@ function referenceReady(item, resolvedMedia) {
 export function GraphNode({ data, selected }) {
   const { node, draft, editor, compact, mediaURL, index, edges, tasks = [], generationProfiles = [],
     generationDefaults, resolvedMedia, rename, referenceFocus, selectedResult, actions = {} } = data
+  const compactEditor = draft?.edit && (node.type === 'image' || node.type === 'video')
+  const panelRef = useNodeEditorPlacement(node.id, Boolean(compactEditor && editor))
   const latest = tasks[0]
   const mode = videoMode(node)
   const mediaKind = mediaTypes.has(node.type)
@@ -400,7 +403,8 @@ export function GraphNode({ data, selected }) {
         <IconPlusOutlineRegular size={15} />
       </QuickAction>
     </div>}
-    {draft && editor && <div className="drama-node-editor-panel">
+    {draft && editor && <div ref={panelRef}
+      className={'drama-node-editor-panel' + (compactEditor ? ' is-creative' : '')}>
       <NodeEditor draft={draft} {...editor} node={node} index={index} resolvedMedia={resolvedMedia} rename={rename} referenceFocus={referenceFocus}
         mediaURL={mediaURL} generationProfiles={generationProfiles} generationDefaults={generationDefaults}
         actions={actions} latest={latest} />
@@ -481,10 +485,11 @@ function GenerationParams({ value, update, profile, generationDefaults, mode }) 
 function NodeEditor({
   draft, append, mutate, mutationReason, media = [], queryCanvas, finish, close, mediaURL, index,
   generationProfiles, generationDefaults, node, actions, latest, resolvedMedia, rename, referenceFocus, uploadReference,
-  importFile, attachAsset,
+  importFile, attachAsset, reportSaveError,
 }) {
   const { base, preset, seed, duplicate, edit, group } = draft
   const type = node.type
+  const compact = edit && (type === 'image' || type === 'video')
   const sameKind = base?.type === type
   const content = sameKind ? base.content : {}
   const savedMode = preset?.mode ?? (sameKind && type === 'video' ? videoMode(base) : 't2v')
@@ -492,6 +497,7 @@ function NodeEditor({
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
   const [dirty, setDirty] = useState(false)
+  const [changeVersion, setChangeVersion] = useState(0)
   const promptField = type === 'prompt'
     ? ['text', 'description', 'prompt'].find(field => textValue(content, field)) ?? 'prompt'
     : 'prompt'
@@ -500,6 +506,12 @@ function NodeEditor({
   const [prompt, setPrompt] = useState(storedPrompt)
   const [profileId, setProfileId] = useState(storedProfileId)
   const [overrides, setOverrides] = useState(() => parameterValues(content))
+  const [metadata, setMetadata] = useState(() => nodeMetadata(base))
+  const [settings, setSettings] = useState('')
+  const [expanded, setExpanded] = useState(false)
+  const [canExpand, setCanExpand] = useState(false)
+  const promptInput = useRef(null)
+  const composingPrompt = useRef(false)
   const generation = type === 'image' || type === 'video' && mode !== 'asset'
   const hasPrompt = type === 'prompt' || generation
   const assetNode = mediaTypes.has(type) && !(type === 'video' && generation)
@@ -521,9 +533,18 @@ function NodeEditor({
   const referenceArea = useRef(null)
   const formRef = useRef(null)
   const revision = useRef(base?.revision)
+  const committed = useRef(base)
+  const mounted = useRef(false)
+  const queue = useRef({ pending: null, saving: false, savedVersion: 0, timer: 0, error: '' })
+
+  function markDirty() {
+    setDirty(true)
+    if (compact) setChangeVersion(version => version + 1)
+  }
 
   useEffect(() => {
     if (!edit) return
+    if (compact && (dirty || base.revision < revision.current)) return
     const old = previous.current
     const incoming = persistedRefKey ? persistedRefKey.split(',') : []
     setReferences(current => {
@@ -533,15 +554,17 @@ function NodeEditor({
     })
     setMode(current => current === old.mode ? savedMode : current)
     previous.current = { mode: savedMode, ids: incoming }
-  }, [persistedRefKey, savedMode, edit])
+  }, [persistedRefKey, savedMode, edit, compact, compact && dirty, compact && base?.revision])
 
   useEffect(() => {
     if (!edit || dirty || base.revision < revision.current) return
     revision.current = base.revision
+    committed.current = base
     setPrompt(storedPrompt)
     setProfileId(storedProfileId)
     setOverrides(parameterValues(content))
     setAsset(null)
+    if (compact) setMetadata(nodeMetadata(base))
     formRef.current?.reset()
   }, [base?.revision, dirty, edit])
 
@@ -557,6 +580,10 @@ function NodeEditor({
   }, [missing, queryCanvas])
 
   useEffect(() => {
+    if (compact) {
+      if (rename) setSettings('metadata')
+      return
+    }
     if (edit && !rename) return
     let frame
     let attempts = 0
@@ -582,13 +609,24 @@ function NodeEditor({
     }
     frame = requestAnimationFrame(focusName)
     return () => cancelAnimationFrame(frame)
-  }, [rename, edit])
+  }, [rename, edit, compact])
+
+  useLayoutEffect(() => {
+    if (!compact || expanded || !promptInput.current) return
+    const input = promptInput.current
+    const measure = () => setCanExpand(input.scrollHeight > input.clientHeight + 1)
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(input)
+    return () => observer.disconnect()
+  }, [compact, expanded, prompt])
 
   useEffect(() => {
     if (!referenceFocus) return
     const frame = requestAnimationFrame(() => {
       const area = referenceArea.current
-      const button = area?.querySelector('button:not([disabled])')
+      const button = area?.querySelector('.drama-node-reference-add:not([disabled])') ??
+        area?.querySelector('button:not([disabled])')
       if (!area || !button) return
       button.focus({ preventScroll: true })
       const fields = area.closest('.drama-node-editor-fields')
@@ -611,11 +649,11 @@ function NodeEditor({
   const hasTextRef = type === 'image' && referenceItems.some(item => textTypes.has(item?.type) && savedText(item))
   const issue = referenceIssue(referenceMode, referenceKinds, activeProfile, true)
     || (type === 'video' ? inlineReferenceIssue(prompt, referenceKinds) : '')
-  const savedProfile = resolveProfile(currentProfiles, storedProfileId)
+  const savedProfile = compact ? activeProfile : resolveProfile(currentProfiles, storedProfileId)
   const unavailable = mutationReason || [
     taskActive(latest ?? {}) && '此节点正在生成。',
     saving && '正在保存修改。',
-    dirty && '请先保存修改。',
+    dirty && (compact ? error || '正在保存修改。' : '请先保存修改。'),
     !prompt.trim() && !hasTextRef && '请填写提示词。',
     referenceItems.some(item => !referenceReady(item, resolvedMedia)) && '等待上游素材。',
     issue,
@@ -624,22 +662,28 @@ function NodeEditor({
   const blocked = Boolean(edit && mutationReason)
 
   function changeMode(value) {
+    if (compact) {
+      const issue = value === 'asset'
+        ? (!isMedia(node) || references.length ? '切换素材模式前需要已有视频，并移除参考素材。' : '')
+        : referenceIssue(value, referenceKinds)
+      if (issue) { setError(issue); return }
+    }
     setMode(value)
     setProfileId('')
     setOverrides({})
-    setDirty(true)
+    markDirty()
     setError('')
   }
 
   function changeReferences(ids) {
     setReferences(ids)
-    setDirty(true)
+    markDirty()
   }
 
   function attachReference(item) {
     setExtraMedia(current => [...current, item])
     setReferences(current => [...new Set([...current, item.id])])
-    setDirty(true)
+    markDirty()
   }
 
   function setAssetSource(item) {
@@ -648,29 +692,27 @@ function NodeEditor({
     if (titleInput.current && !titleInput.current.value) titleInput.current.value = item.title ?? ''
   }
 
-  async function save(event) {
-    event.preventDefault()
-    if (saving || blocked) return
-    const form = new FormData(event.currentTarget)
+  function buildEdit(form) {
     const next = { ...content }
     const description = String(form.get('description') ?? '').trim()
     if (form.has('description')) next[textField] = description
-    const title = String(form.get('title') ?? '').trim()
+    if (compact && !hasPrompt) next[textField] = metadata.description
+    const title = String(compact ? metadata.title : form.get('title') ?? '').trim()
     if (title) next.title = title
     else delete next.title
     if (hasPrompt) next[promptField] = prompt
-    if (assetNode && (asset || form.has('path') || form.has('url'))) {
+    if (assetNode && (compact || asset || form.has('path') || form.has('url'))) {
       for (const field of ['path', 'url']) {
-        const value = asset ? asset[field] : String(form.get(field) ?? '').trim()
+        const value = compact ? metadata[field].trim() : asset ? asset[field] : String(form.get(field) ?? '').trim()
         if (value) next[field] = value
         else delete next[field]
       }
     }
     const ordered = supportsRefs ? references : []
     if (generation) {
-      if (type === 'video' && ordered.length && !prompt.trim()) { setError('请填写完整视频提示词。'); return }
+      if (type === 'video' && ordered.length && !prompt.trim()) throw new Error('请填写视频提示词。')
       const structuralIssue = referenceIssue(referenceMode, referenceKinds, activeProfile)
-      if (structuralIssue) { setError(structuralIssue); return }
+      if (structuralIssue) throw new Error(structuralIssue)
       const params = Object.fromEntries(Object.entries(overrides).filter(([key, value]) =>
         value.trim() && activeProfile?.parameters?.includes(key) &&
         (key !== 'aspectRatio' || !inheritsFirstFrameRatio(activeProfile, mode))).map(([key, value]) =>
@@ -687,7 +729,7 @@ function NodeEditor({
         delete next.textList
       }
     } else if (type === 'video') {
-      if (!next.path && !next.url) { setError('请上传或选择视频素材。'); return }
+      if (!next.path && !next.url) throw new Error('请上传或选择视频素材。')
       for (const key of ['mode', 'profileId', 'params', 'prompt', 'textList', 'mixedListOrder']) delete next[key]
     } else if (type === 'shot') {
       if (ordered.length) next.mixedListOrder = ordered
@@ -697,11 +739,20 @@ function NodeEditor({
       for (const key of Object.keys(next)) if (channelFields.has(key.toLowerCase().replace(/[_-]/gu, ''))) delete next[key]
     }
     if (!edit && mediaTypes.has(type)) delete next.providerTaskId
+    const fields = Object.fromEntries(groupFields.map(([field]) => [field,
+      String(compact ? metadata[field] : form.get(field) ?? '').trim()]))
+    return { content: next, fields, ordered }
+  }
+
+  async function save(event) {
+    event.preventDefault()
+    if (saving || blocked || compact) return
+    const form = new FormData(event.currentTarget)
     setSaving(true)
     setError('')
     try {
+      const { content: next, fields, ordered } = buildEdit(form)
       const id = edit ? base.id : crypto.randomUUID()
-      const fields = Object.fromEntries(groupFields.map(([field]) => [field, String(form.get(field) ?? '').trim()]))
       if (edit) {
         const result = await mutate('update_node', { id, revision: revision.current, ...fields, content: next,
           referenceSources: supportsRefs || type === 'video' ? ordered : undefined })
@@ -719,6 +770,179 @@ function NodeEditor({
     } finally {
       setSaving(false)
     }
+  }
+
+  // Keep one in-flight update and coalesce typing into the latest pending edit.
+  // The pending payload lives past deselection so a final keystroke is committed.
+  async function flushAutosave() {
+    const state = queue.current
+    clearTimeout(state.timer)
+    if (state.saving || !state.pending) return
+    const { payload, version, send } = state.pending
+    state.pending = null
+    state.saving = true
+    state.error = ''
+    if (mounted.current) setSaving(true)
+    try {
+      const result = await send('update_node', { ...payload, revision: revision.current }, committed.current)
+      revision.current = result.revision
+      committed.current = { ...committed.current, ...payload, revision: result.revision }
+      state.savedVersion = version
+      if (mounted.current && !state.pending && !state.error) {
+        setDirty(false)
+        setError('')
+      }
+    } catch (failure) {
+      if (failure.cause?.status === 409) state.pending = null
+      state.error ||= failure.message
+      if (mounted.current) setError(state.error)
+      else reportSaveError?.(state.error)
+    } finally {
+      state.saving = false
+      if (mounted.current) setSaving(false)
+      if (state.pending) void flushAutosave()
+    }
+  }
+
+  useLayoutEffect(() => {
+    if (!compact) return
+    mounted.current = true
+    return () => {
+      mounted.current = false
+      if (queue.current.error) reportSaveError?.(queue.current.error)
+      void flushAutosave()
+    }
+  }, [compact])
+
+  useLayoutEffect(() => {
+    if (!compact || !changeVersion || changeVersion <= queue.current.savedVersion) return
+    const state = queue.current
+    clearTimeout(state.timer)
+    state.pending = null
+    if (blocked) {
+      state.error = mutationReason
+      return
+    }
+    try {
+      const { content, fields, ordered } = buildEdit(new FormData())
+      const payload = { id: base.id, ...fields, content, referenceSources: ordered }
+      state.pending = { payload, version: changeVersion, send: mutate }
+      state.timer = setTimeout(flushAutosave, 360)
+      state.error = ''
+      setError('')
+    } catch (failure) {
+      state.error = failure.message
+      setError(failure.message)
+    }
+  }, [compact, changeVersion, blocked])
+
+  function changeProfile(id) {
+    const profile = resolveProfile(currentProfiles, id)
+    const issue = compact && referenceIssue(referenceMode, referenceKinds, profile)
+    if (issue) { setError(issue); return }
+    setProfileId(id)
+    setOverrides(current => Object.fromEntries(Object.entries(current)
+      .filter(([key]) => profile?.parameters?.includes(key))))
+    markDirty()
+  }
+
+  function updateParam(key, value) {
+    setOverrides(current => ({ ...current, [key]: value }))
+    markDirty()
+  }
+
+  function updateMetadata(key, value) {
+    setMetadata(current => ({ ...current, [key]: value }))
+    markDirty()
+  }
+
+  const effectiveNode = node.revision >= revision.current ? node : committed.current
+  if (compact) {
+    const modeItems = Object.entries(modeLabels).filter(([id]) => id !== 'asset' || !generation)
+      .map(([id, label]) => ({ id, label: id === 'asset' ? '素材' : id.toUpperCase(), title: label }))
+    const shownError = error || (blocked ? mutationReason : '')
+    return <form className={'drama-node-editor drama-node-creative ' + interactions} aria-label={formLabel}
+      onSubmit={event => event.preventDefault()} onDoubleClick={preventCanvasDoubleClick}
+      onKeyDown={event => {
+        if (!event.currentTarget.contains(event.target)) return
+        if (event.key === 'Escape' && !settings && !event.nativeEvent.isComposing && event.keyCode !== 229) close()
+        stopCanvasKeys(event)
+      }}>
+      {generation && <>
+        <div ref={referenceArea}>
+          {mode === 't2v' && type === 'video' ? <ReferenceModeMenu disabled={blocked} choose={changeMode} />
+            : <MediaReferences compact mode={referenceMode} profile={activeProfile} media={available} mediaURL={mediaURL}
+              resolvedMedia={resolvedMedia} queryCanvas={queryCanvas} nodeId={node.id} references={references}
+              setReferences={changeReferences} onSelect={attachReference} uploadReference={uploadReference}
+              attachAsset={attachAsset} locate={actions.locate} preview={actions.preview} disabled={blocked} />}
+        </div>
+        <div className={'drama-node-creative-prompt' + (expanded ? ' is-expanded' : '')}>
+          <textarea ref={promptInput} aria-label="提示词" name="prompt" rows={expanded ? 9 : 3}
+            placeholder={type === 'video' ? '描述镜头、动作与声音…' : '描述要生成的画面…'} value={prompt} disabled={blocked}
+            onCompositionStart={() => { composingPrompt.current = true }}
+            onCompositionEnd={event => {
+              composingPrompt.current = false
+              setPrompt(event.currentTarget.value)
+              markDirty()
+            }}
+            onChange={event => { setPrompt(event.target.value); if (!composingPrompt.current) markDirty() }} />
+          {(canExpand || expanded) && <Button size="sm" className="drama-node-prompt-expand" aria-expanded={expanded}
+            aria-label={expanded ? '收起提示词' : '展开提示词'} title={expanded ? '收起提示词' : '展开提示词'}
+            onClick={() => setExpanded(current => !current)}>
+            <IconChevronDownOutlineRegular size={13} />
+          </Button>}
+        </div>
+      </>}
+      {shownError && <p className="drama-node-creative-status" role={error ? 'alert' : 'status'}>{shownError}</p>}
+      <div className="drama-node-creative-controls">
+        {type === 'video'
+          ? <MenuSelect compact label="视频方式" value={mode} items={modeItems} onChange={changeMode} disabled={blocked} />
+          : <span className="drama-node-creative-mode" title="图片生成">T2I</span>}
+        {generation && <MenuSelect compact label="生成预设" value={profileId} disabled={blocked}
+          items={profileId ? choices : [{ id: '', label: activeProfile ? '默认 · ' + activeProfile.name : '选择模型',
+            title: activeProfile?.model }, ...choices.slice(1)]}
+          onChange={changeProfile} />}
+        <Button size="sm" className="drama-node-creative-settings" aria-label="生成设置" aria-haspopup="dialog"
+          title="生成设置" icon={<IconSlidersTwoOutlineRegular size={15} />}
+          onClick={() => setSettings(generation ? 'generation' : 'metadata')} />
+        {generation && <GenerateControl node={effectiveNode} profile={savedProfile} generationDefaults={generationDefaults}
+          actions={actions} unavailable={unavailable} latest={latest} />}
+      </div>
+      {settings && <Modal open title={settings === 'generation' ? '生成设置' : '节点详情'}
+        closeLabel={settings === 'generation' ? '关闭生成设置' : '关闭节点详情'}
+        backdropBlur={false} onClose={() => setSettings('')}>
+        <fieldset className="drama-node-settings drama-node-dialog-fields" disabled={blocked}>
+          {settings === 'generation' ? <>
+            <div className="drama-node-parameter-fields">
+              <GenerationParams value={overrides} profile={activeProfile} generationDefaults={generationDefaults} mode={mode}
+                update={updateParam} />
+            </div>
+            {!activeProfile?.parameters?.length && <p className="drama-node-dialog-summary">当前模型没有可调整的生成参数。</p>}
+            <Button size="sm" className="drama-node-details-link" onClick={() => setSettings('metadata')}>名称与镜头</Button>
+            <TaskDetail task={latest} nodeId={node.id} locate={actions.locate} />
+          </> : <>
+            <label className="drama-node-field">节点名称
+              <Input data-modal-autofocus value={metadata.title} onChange={event => updateMetadata('title', event.target.value)} />
+            </label>
+            <div className="drama-node-group-fields">{groupFields.map(([field, label]) =>
+              <label className="drama-node-field" key={field}>{label}
+                <Input value={metadata[field]} onChange={event => updateMetadata(field, event.target.value)} />
+              </label>)}</div>
+            {assetNode && <>
+              <label className="drama-node-field">项目内素材路径
+                <Input value={metadata.path} onChange={event => updateMetadata('path', event.target.value)} />
+              </label>
+              <label className="drama-node-field">素材网址
+                <Input value={metadata.url} onChange={event => updateMetadata('url', event.target.value)} />
+              </label>
+            </>}
+            {!generation && <label className="drama-node-field">正文
+              <textarea rows={3} value={metadata.description} onChange={event => updateMetadata('description', event.target.value)} />
+            </label>}
+          </>}
+        </fieldset>
+      </Modal>}
+    </form>
   }
 
   const showReferences = supportsRefs && (referenceMode !== 't2v' || references.length > 0)
@@ -751,12 +975,7 @@ function NodeEditor({
               items={['i2v', 'r2v', 'v2v'].map(id => ({ id, label: modeLabels[id] }))} />}
         </div>}
         {generation && <>
-          <MenuSelect label="生成预设" value={profileId} onChange={id => {
-            setProfileId(id)
-            setOverrides(current => Object.fromEntries(Object.entries(current)
-              .filter(([key]) => resolveProfile(currentProfiles, id)?.parameters?.includes(key))))
-            setDirty(true)
-          }} items={choices} />
+          <MenuSelect label="生成预设" value={profileId} onChange={changeProfile} items={choices} />
           {activeProfile && <span className="drama-node-caption">
             {[activeProfile.model, ...paramSummary(activeProfile, generationDefaults, undefined, mode)].join(' · ')}
           </span>}
@@ -798,8 +1017,6 @@ function NodeEditor({
       <Button size="sm" type="submit" variant={edit && !dirty ? 'outline' : 'primary'} disabled={saving || blocked}>
         {saving ? '正在保存' : edit ? '保存修改' : duplicate ? '保存副本' : base ? '保存新版本' : '创建节点'}
       </Button>
-      {edit && generation && <GenerateControl node={node} profile={savedProfile}
-        generationDefaults={generationDefaults} actions={actions} unavailable={unavailable} latest={latest} />}
     </div>
   </form>
 }
@@ -807,6 +1024,14 @@ function NodeEditor({
 function parameterValues(content) {
   return Object.fromEntries(Object.keys(generationFields)
     .filter(key => content.params?.[key] != null).map(key => [key, String(content.params[key])]))
+}
+
+function nodeMetadata(node) {
+  return {
+    title: nodeTitle(node), path: node?.content.path ?? '', url: node?.content.url ?? '',
+    description: node ? textValue(node.content, 'text', 'description') : '',
+    ...Object.fromEntries(groupFields.map(([field]) => [field, node?.[field] ?? ''])),
+  }
 }
 
 function useSourceSearch(queryCanvas, types, search, mediaOnly = false) {
@@ -860,16 +1085,30 @@ function referenceLabel(mode, references, position, known) {
   return '参考 ' + (position + 1)
 }
 
-function MediaReferences({ mode, profile, media, mediaURL, resolvedMedia, queryCanvas, nodeId, references,
+function ReferenceModeMenu({ disabled, choose }) {
+  const [open, setOpen] = useState(false)
+  return <div className="drama-node-reference-strip">
+    <Menu open={open} portal compact onClose={() => setOpen(false)}
+      items={['i2v', 'r2v', 'v2v'].map(id => ({ id, label: modeLabels[id] }))}
+      onSelect={id => { choose(id); setOpen(false) }}
+      anchor={<button type="button" className="drama-node-reference-add" aria-label="添加参考素材" aria-haspopup="menu"
+        title="选择参考生成方式" disabled={disabled} onClick={() => setOpen(true)}>
+        <IconPlusOutlineRegular size={15} /><span>参考素材</span>
+      </button>} />
+  </div>
+}
+
+function MediaReferences({ compact, mode, profile, media, mediaURL, resolvedMedia, queryCanvas, nodeId, references,
   setReferences, onSelect, uploadReference, attachAsset, locate, preview, disabled }) {
   const [search, setSearch] = useState('')
+  const [pickerOpen, setPickerOpen] = useState(false)
   const totalLimit = mode === 'r2v' ? profile?.limits?.maxReferences ?? 32 : 32
   const allowedKinds = [...mediaTypes, ...textTypes].filter(kind => {
     const count = references.filter(id => media.get(id)?.type === kind).length
     return references.length < totalLimit && count < referenceLimit(mode, kind, profile)
   })
   const types = allowedKinds.join(',')
-  const { nodes: results, error } = useSourceSearch(queryCanvas, types, search)
+  const { nodes: results, error } = useSourceSearch(queryCanvas, !compact || pickerOpen ? types : '', search)
   const known = new Map([...results.map(node => [node.id, node]), ...media])
   const q = search.trim().toLowerCase()
   const available = [...known.values()].filter(node => !node.deleted && node.id !== nodeId &&
@@ -893,25 +1132,61 @@ function MediaReferences({ mode, profile, media, mediaURL, resolvedMedia, queryC
     setReferences(next)
   }
 
-  return <fieldset className="drama-node-editor-references">
-    <legend>{legend}</legend>
-    {types && <div className="drama-node-reference-picker">
+  function select(item) {
+    onSelect(item)
+    setPickerOpen(false)
+    setSearch('')
+  }
+
+  const picker = types && <div className="drama-node-reference-picker">
       {queryCanvas && <Input aria-label={'搜索' + kindLabel} placeholder={'搜索' + kindLabel} value={search}
+        data-modal-autofocus={compact || undefined}
         onChange={event => { event.stopPropagation(); setSearch(event.target.value) }} />}
       <MenuSelect label={'添加' + kindLabel} value="" placeholder={available.length ? '选择' + kindLabel : '暂无匹配素材'}
         disabled={disabled} items={available.map(item => ({ id: item.id, label: item.type === 'image' ? nodeName(item) :
           nodeLabels[item.type] + ' · ' + nodeName(item), title: item.id }))}
-        onChange={id => { if (known.has(id)) onSelect(known.get(id)) }} />
+        onChange={id => { if (known.has(id)) select(known.get(id)) }} />
       {uploadKinds.length > 0 && <>
         {attachAsset && <ProjectReferenceSelect types={uploadKinds.join(',')} queryCanvas={queryCanvas}
-          disabled={disabled} search={search} excluded={[nodeId, ...references]} attachAsset={attachAsset} onSelect={onSelect} />}
+          disabled={disabled} search={search} excluded={[nodeId, ...references]} attachAsset={attachAsset} onSelect={select} />}
         <FileAction label="上传参考素材" disabled={disabled}
           accept={uploadKinds.map(kind => kind + '/*').join(',')}
-          onFile={uploadReference && (async file => onSelect(await uploadReference(file)))} />
+          onFile={uploadReference && (async file => select(await uploadReference(file)))} />
       </>}
-    </div>}
+      {error && <p className="drama-node-form-error" role="alert">{error}</p>}
+    </div>
+
+  if (compact) {
+    const slot = mode === 'i2v' ? (references.length ? '尾帧' : '首帧') : mode === 'v2v' ? '源视频' : '参考素材'
+    const closePicker = () => { setPickerOpen(false); setSearch('') }
+    return <>
+      <div className="drama-node-reference-strip" aria-label={legend}>
+        {!!references.length && <div className="drama-node-reference-track" onWheel={event => {
+          const track = event.currentTarget
+          if (!event.deltaX && track.scrollWidth > track.clientWidth) track.scrollLeft += event.deltaY
+        }}>{references.map((id, index) => {
+          const item = known.get(id)
+          const asset = resolvedMedia?.get(id) ?? item
+          const label = referenceLabel(mode, references, index, known)
+          const title = label + ' · ' + (item ? nodeName(item) : '等待素材')
+          return <ReferenceSlot key={id} id={id} item={item} asset={asset} title={title} label={label} disabled={disabled}
+            index={index} count={references.length} mediaURL={mediaURL} locate={locate} preview={preview}
+            move={delta => move(index, delta)} remove={() => setReferences(references.filter(ref => ref !== id))} />
+        })}</div>}
+        {types ? <button type="button" className="drama-node-reference-add" aria-label={'添加' + slot}
+          aria-haspopup="dialog" title={'添加' + slot} disabled={disabled} onClick={() => setPickerOpen(true)}>
+          <IconPlusOutlineRegular size={15} /><span>{slot}</span>
+        </button> : !references.length && <span className="drama-node-caption">当前模型无可用参考槽</span>}
+      </div>
+      {pickerOpen && <Modal open title="添加参考素材" closeLabel="关闭参考素材选择" backdropBlur={false}
+        onClose={closePicker}>{picker}</Modal>}
+    </>
+  }
+
+  return <fieldset className="drama-node-editor-references">
+    <legend>{legend}</legend>
+    {picker}
     {!types && !references.length && mode === 'r2v' && <small>所选模型未配置可用的参考素材。</small>}
-    {error && <p className="drama-node-form-error" role="alert">{error}</p>}
     {references.length > 0 && <ol>{references.map((id, index) => {
       const item = known.get(id)
       const asset = resolvedMedia?.get(id) ?? item
@@ -937,6 +1212,35 @@ function MediaReferences({ mode, profile, media, mediaURL, resolvedMedia, queryC
       </li>
     })}</ol>}
   </fieldset>
+}
+
+function ReferenceSlot({ id: sourceId, item, asset, title, label, disabled, index, count, mediaURL, locate, preview, move, remove }) {
+  const [menu, setMenu] = useState(false)
+  const url = asset?.type === 'image' && isMedia(asset) ? mediaURL?.(asset) : undefined
+  const canPreview = isMedia(asset) && preview
+  return <div className="drama-node-reference-slot">
+    <Menu open={menu} portal compact onClose={() => setMenu(false)}
+      items={[
+        { id: 'view', label: canPreview ? '查看素材' : '定位节点', disabled: !canPreview && !locate },
+        ...(count > 1 ? [
+          { id: 'left', label: '前移', disabled: disabled || index === 0 },
+          { id: 'right', label: '后移', disabled: disabled || index === count - 1 },
+        ] : []),
+        { id: 'remove', label: '移除引用', disabled },
+      ]} onSelect={id => {
+        setMenu(false)
+        if (id === 'view') canPreview ? preview(asset) : locate?.(sourceId)
+        else if (id === 'remove') remove()
+        else move(id === 'left' ? -1 : 1)
+      }} anchor={<button type="button" className="drama-node-reference-thumb" aria-label={title}
+        aria-haspopup="menu" aria-expanded={menu} title={title} onClick={() => setMenu(true)}>
+        {url ? <img src={url} alt="" loading="lazy" decoding="async" /> :
+          <NodeIcon type={item?.type} size={16} />}
+        <span>{label}</span>
+      </button>} />
+    <button type="button" className="drama-node-reference-remove" aria-label={'移除参考 ' + (index + 1)}
+      title="移除引用" disabled={disabled} onClick={remove}>×</button>
+  </div>
 }
 
 function ProjectReferenceSelect({ types, queryCanvas, disabled, search, excluded, attachAsset, onSelect }) {

@@ -191,7 +191,7 @@ const chrome = [
   join(process.env.ProgramFiles, 'Google/Chrome/Application/chrome.exe'),
   join(process.env['ProgramFiles(x86)'], 'Microsoft/Edge/Application/msedge.exe'),
 ].find(existsSync)
-const evidence = join(root, 'docs', 'uiux-v2')
+const evidence = process.env.DRAMA_UIUX_CAPTURE_DIR ?? join(root, 'docs', 'uiux-v2')
 const desktop = join(process.env.USERPROFILE ?? '', 'Desktop')
 const imageAsset = process.env.DRAMA_UIUX_IMAGE ?? join(desktop, '课件/4-5-6文生图 图生图/文生图 资料/资产/黄色毛绒小鸭.png')
 const projectImageAsset = process.env.DRAMA_UIUX_PROJECT_IMAGE ?? join(dirname(imageAsset), '餐厅门口.png')
@@ -1346,7 +1346,7 @@ test('U4 native task drawer follows real Go worker in isolated provider fixture'
     const source = card(page, nodeId)
     await source.locator('.drama-node-titlebar').click()
     await source.getByRole('button', { name: '生成…', exact: true }).click()
-    const confirm = source.getByRole('dialog', { name: '确认生成', exact: true })
+    const confirm = page.getByRole('dialog', { name: '确认生成', exact: true })
     const submit = confirm.getByRole('button', { name: '确认提交', exact: true })
     await submit.click()
     const running = await poll(async () => {
@@ -1539,6 +1539,14 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       await poll(async () => (await query(page, ticket, { id: emptyImage.id })).nodes[0].content.path,
         'image node upload did not save the asset')
       await card(page, emptyImage.id).locator('img').first().evaluate(element => element.decode())
+      await card(page, emptyImage.id).locator('.drama-node-titlebar').click()
+      const imageEditor = card(page, emptyImage.id).getByRole('form', { name: '编辑节点', exact: true })
+      await imageEditor.getByRole('textbox', { name: '提示词', exact: true }).fill('保持原图构图，使用自然的室内光。')
+      await clickBlank(page)
+      await poll(async () => {
+        const [node] = (await query(page, ticket, { id: emptyImage.id })).nodes
+        return node.content.path && node.content.prompt === '保持原图构图，使用自然的室内光。'
+      }, 'image prompt did not autosave without replacing the uploaded image')
 
       const clipDraft = await pick(page, '视频素材')
       const clipUpload = clipDraft.getByRole('button', { name: '上传视频', exact: true })
@@ -1590,25 +1598,113 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       await fit(page)
       const before = await nodeGeometry(first)
       await firstBox.click()
-      await formFor(first).waitFor()
+      const editor = formFor(first)
+      await editor.waitFor()
       assert.deepEqual(await nodeGeometry(first), before, 'opening the editor moved the node or its handles')
-      assert.ok(await formFor(first).evaluate(element => element.getBoundingClientRect().top >=
-        element.closest('article').getBoundingClientRect().bottom), 'editor did not open below the node card')
-      await formFor(first).getByRole('button', { name: '生成预设', exact: true }).waitFor()
-      await formFor(first).getByText(/^首帧 · /u).first().waitFor()
-      const promptBox = formFor(first).getByRole('textbox', { name: '完整视频提示词', exact: true })
+      const editorGeometry = await editor.evaluate(element => {
+        const box = element.getBoundingClientRect()
+        const node = element.closest('article')
+        const canvas = element.closest('.drama-flow').getBoundingClientRect()
+        return { height: element.offsetHeight, width: element.offsetWidth, nodeWidth: node.offsetWidth,
+          top: box.top, bottom: box.bottom, cardBottom: node.getBoundingClientRect().bottom, canvasBottom: canvas.bottom,
+          scrolling: [element, ...element.querySelectorAll('div, fieldset')].some(candidate =>
+            candidate.clientHeight > 0 && candidate.scrollHeight > candidate.clientHeight + 1 &&
+            /^(auto|scroll)$/u.test(getComputedStyle(candidate).overflowY)) }
+      })
+      assert.ok(editorGeometry.height >= 160 && editorGeometry.height <= 240, JSON.stringify(editorGeometry))
+      assert.ok(Math.abs(editorGeometry.width - editorGeometry.nodeWidth) <= 6, JSON.stringify(editorGeometry))
+      assert.ok(editorGeometry.top >= editorGeometry.cardBottom, 'editor did not open below the node card')
+      assert.ok(editorGeometry.bottom <= editorGeometry.canvasBottom, 'the lower panel is clipped by the canvas')
+      assert.equal(editorGeometry.scrolling, false, 'the compact editor has a vertical scrollbar')
+      assert.equal(await editor.getByRole('button', { name: '保存修改', exact: true }).count(), 0)
+      assert.equal(await editor.getByRole('button', { name: '取消', exact: true }).count(), 0)
+      assert.equal(await editor.getByRole('textbox', { name: /搜索/u }).count(), 0)
+      const modeButton = editor.getByRole('button', { name: '视频方式', exact: true })
+      const modelButton = editor.getByRole('button', { name: '生成预设', exact: true })
+      const settingsButton = editor.getByRole('button', { name: '生成设置', exact: true })
+      const generateButton = editor.getByRole('button', { name: '生成…', exact: true })
+      const controlLine = await Promise.all([modeButton, modelButton, settingsButton, generateButton].map(control => control.boundingBox()))
+      const centers = controlLine.map(box => box.y + box.height / 2)
+      assert.ok(Math.max(...centers) - Math.min(...centers) < 4, 'generation controls are not on one line')
+      const thumbnail = editor.getByRole('button', { name: /^首帧 · /u }).locator('img')
+      await thumbnail.evaluate(async image => {
+        await image.decode()
+        if (!image.naturalWidth) throw new Error('The connected first-frame thumbnail did not decode')
+      })
+      await flow(page).focus()
+      await page.keyboard.press('.')
+      await delay(240)
+      const zoomedGeometry = await nodeGeometry(first)
+      await screenshot(page, 'compact-editor-light.png')
+      await setTheme(page, 'dark')
+      await screenshot(page, 'compact-editor-dark.png')
+      await setTheme(page, 'light')
+      const promptBox = editor.getByRole('textbox', { name: '提示词', exact: true })
+      const promptHeight = await promptBox.evaluate(element => {
+        const style = getComputedStyle(element)
+        return element.clientHeight / Number.parseFloat(style.lineHeight)
+      })
+      assert.ok(promptHeight >= 2 && promptHeight <= 4, 'the prompt editor did not open at its compact height')
+      const longPrompt = Array.from({ length: 6 }, () => prompt).join('\n')
+      await promptBox.fill(longPrompt)
+      const collapsedHeight = await promptBox.evaluate(element => element.offsetHeight)
+      await editor.getByRole('button', { name: '展开提示词', exact: true }).click()
+      assert.ok(await promptBox.evaluate(element => element.offsetHeight) > collapsedHeight,
+        'expanding a long prompt did not grow the textarea')
+      await editor.getByRole('button', { name: '收起提示词', exact: true }).click()
+      assert.equal(await promptBox.evaluate(element => element.offsetHeight), collapsedHeight)
+      assert.deepEqual(await nodeGeometry(first), zoomedGeometry, 'expanding the prompt moved the node or its handles')
       await promptBox.fill(prompt + '。')
       await promptBox.press('End')
       await promptBox.press('Backspace')
       assert.equal(await promptBox.inputValue(), prompt)
       assert.ok(!(await query(page, ticket, { id: first.id })).nodes[0].deleted)
-      await formFor(first).getByRole('button', { name: '生成预设', exact: true }).click()
+      await modelButton.click()
       await page.getByRole('menuitem', { name: '回环首帧预设', exact: true }).click()
-      await formFor(first).getByRole('button', { name: '时长（秒）', exact: true }).click()
+      assert.equal(await editor.getByRole('button', { name: '时长（秒）', exact: true }).count(), 0)
+      await settingsButton.click()
+      const parameterPopover = page.getByRole('dialog', { name: '生成设置', exact: true })
+      await parameterPopover.getByRole('button', { name: '时长（秒）', exact: true }).click()
       await page.getByRole('menuitem', { name: '8', exact: true }).click()
-      await formFor(first).getByRole('button', { name: '保存修改', exact: true }).click()
+      await screenshot(page, 'compact-editor-settings.png')
+      await parameterPopover.getByRole('button', { name: '关闭生成设置', exact: true }).click()
+      await clickBlank(page)
       await poll(async () => (await query(page, ticket, { id: first.id })).nodes[0].content.params?.duration === 8,
-        'node-local model parameters were not saved')
+        'advanced parameters did not autosave')
+      await poll(async () => {
+        const [node] = (await query(page, ticket, { id: first.id })).nodes
+        return node.content.prompt === prompt && node.content.profileId === profileId
+      }, 'prompt or model selection did not autosave')
+      await fit(page)
+      await firstBox.click()
+      await editor.waitFor()
+      const editorPanel = card(page, first.id).locator('.drama-node-editor-panel')
+      const initialPlacement = await editorPanel.getAttribute('data-placement')
+      assert.equal(initialPlacement, 'below')
+      const geometryBeforeDrag = await nodeGeometry(first)
+      const canvasBounds = await flow(page).boundingBox()
+      const sourceBounds = await card(page, first.id).boundingBox()
+      const titleBounds = await firstBox.boundingBox()
+      const panX = titleBounds.x + titleBounds.width * .45
+      const panY = titleBounds.y + titleBounds.height * .5
+      const targetY = canvasBounds.y + canvasBounds.height - Math.max(sourceBounds.height * .7, 70)
+      await page.mouse.move(panX, panY)
+      await page.mouse.down()
+      await page.mouse.move(panX, targetY, { steps: 16 })
+      await page.mouse.up()
+      await poll(async () => (await editorPanel.getAttribute('data-placement')) === 'above',
+        'the editor did not flip above the node at the viewport edge')
+      const geometryAfterDrag = await nodeGeometry(first)
+      assert.notEqual(geometryAfterDrag.transform, geometryBeforeDrag.transform, 'dragging the card did not move it')
+      assert.deepEqual(geometryAfterDrag.input, geometryBeforeDrag.input)
+      assert.deepEqual(geometryAfterDrag.output, geometryBeforeDrag.output)
+      assert.ok(await editorPanel.evaluate(panel => {
+        const panelBox = panel.getBoundingClientRect()
+        const nodeBox = panel.closest('article').getBoundingClientRect()
+        const canvasBox = panel.closest('.drama-flow').getBoundingClientRect()
+        return panelBox.bottom <= nodeBox.top && panelBox.top >= canvasBox.top
+      }), 'the flipped editor is clipped or overlaps its own card')
+      await screenshot(page, 'compact-editor-flipped.png')
       await fit(page)
       await card(page, second.id).locator('.drama-node-titlebar').click()
       await formFor(second).waitFor()
@@ -1642,11 +1738,55 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       await append(page, ticket, [projectAsset])
       await fit(page)
       await card(page, second.id).locator('.drama-node-titlebar').click()
-      await formFor(second).getByRole('button', { name: '从项目资产添加', exact: true }).click()
-      await page.getByRole('menuitem').filter({ hasText: projectAsset.content.title }).click()
-      await formFor(second).getByRole('button', { name: '保存修改', exact: true }).click()
-      await poll(async () => (await query(page, ticket)).edges.some(item => item.source === projectAsset.id && item.target === second.id),
-        'selecting a project asset did not persist a reference')
+      const secondEditor = formFor(second)
+      const chooseMode = async mode => {
+        await secondEditor.getByRole('button', { name: '视频方式', exact: true }).click()
+        await page.getByRole('menuitem', { name: mode.toUpperCase(), exact: true }).click()
+        await poll(async () => (await query(page, ticket, { id: second.id })).nodes[0].content.mode === mode,
+          'changing the mode did not autosave: ' + mode)
+      }
+      await chooseMode('t2v')
+      await chooseMode('i2v')
+      const projectEdgeSaved = async () => (await query(page, ticket)).edges.some(item =>
+        item.source === projectAsset.id && item.target === second.id)
+      async function attachProjectAsset() {
+        await secondEditor.getByRole('button', { name: '添加首帧', exact: true }).click()
+        await page.getByRole('dialog', { name: '添加参考素材', exact: true })
+          .getByRole('button', { name: '从项目资产添加', exact: true }).click()
+        await page.getByRole('menuitem').filter({ hasText: projectAsset.content.title }).click()
+        await poll(projectEdgeSaved, 'selecting a project asset did not autosave a reference')
+      }
+      await attachProjectAsset()
+      await secondEditor.getByRole('button', { name: '移除参考 1', exact: true }).click()
+      await poll(async () => !(await projectEdgeSaved()), 'removing a slot did not autosave disconnection')
+      await attachProjectAsset()
+      const secondPrompt = '以 @图片1 为首帧，保留餐厅门口的原始构图。'
+      await secondEditor.getByRole('textbox', { name: '提示词', exact: true }).fill(secondPrompt)
+      await clickBlank(page)
+      await secondEditor.waitFor({ state: 'hidden' })
+      await poll(async () => (await query(page, ticket, { id: second.id })).nodes[0].content.prompt === secondPrompt,
+        'deselecting the node discarded an unsaved prompt edit')
+      const finalPrompt = secondPrompt + ' 保留环境声。'
+      await fit(page)
+      await card(page, second.id).locator('.drama-node-titlebar').click()
+      await secondEditor.getByRole('textbox', { name: '提示词', exact: true }).fill(finalPrompt)
+      await clickBlank(page)
+      const savedPrompt = async expected => (await query(page, ticket, { id: second.id })).nodes[0].content.prompt === expected
+      await poll(() => savedPrompt(finalPrompt), 'second prompt edit did not autosave')
+      const undo = async expected => {
+        await flow(page).focus()
+        await page.keyboard.press('Control+z')
+        await poll(() => savedPrompt(expected), 'undo restored the wrong autosave revision')
+      }
+      const redo = async expected => {
+        await flow(page).focus()
+        await page.keyboard.press('Control+Shift+z')
+        await poll(() => savedPrompt(expected), 'redo restored the wrong autosave revision')
+      }
+      await undo(secondPrompt)
+      await undo(prompt.replace('以 @图片1 为首帧，', ''))
+      await redo(secondPrompt)
+      await redo(finalPrompt)
 
       await page.reload({ waitUntil: 'domcontentloaded' })
       await panel(page).and(page.locator(`[data-session-id="${record.sessionId}"][data-canvas-id]`)).waitFor()
@@ -1661,8 +1801,11 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       assert.ok(reloaded.edges.some(item => item.source === image.id && item.target === first.id))
       assert.ok(!reloaded.edges.some(item => item.source === image.id && item.target === second.id))
       assert.deepEqual(reloaded.nodes.find(item => item.id === second.id).content.mixedListOrder, [projectAsset.id])
+      assert.equal(reloaded.nodes.find(item => item.id === second.id).content.mode, 'i2v')
+      assert.equal(reloaded.nodes.find(item => item.id === second.id).content.prompt, finalPrompt)
       assert.ok(reloaded.edges.some(item => item.source === projectAsset.id && item.target === second.id))
       assert.equal((await operate(page, ticket, 'tasks', {})).tasks.length, 0, 'configuration silently submitted a generation')
+      assert.equal(received.length, 0, 'editing unexpectedly called the provider')
 
       await fit(page)
       await card(page, first.id).locator('.drama-node-titlebar').click()
@@ -1683,6 +1826,7 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       assert.equal(failure.resultNodeId, undefined)
       assert.deepEqual((await query(page, ticket, { id: first.id })).nodes[0].content, restored.content)
       assert.equal(received.length, 1, 'the deliberate rejection should not be retried')
+      console.info(`Compact editor PASS: ${editorGeometry.width}×${editorGeometry.height} CSS px, inline autosave, edge placement, advanced settings and real PNG request`)
     })
   } finally {
     await new Promise(resolve => endpoint.close(resolve))
