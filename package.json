@@ -33,6 +33,11 @@
     "playwright-core": "1.62.1"
   },
   "dependencies": {
+    "@tiptap/core": "3.34.0",
+    "@tiptap/pm": "3.34.0",
+    "@tiptap/react": "3.34.0",
+    "@tiptap/starter-kit": "3.34.0",
+    "@tiptap/suggestion": "3.34.0",
     "@xyflow/react": "12.11.0"
   }
 }

@@ -123,6 +123,7 @@ export function CanvasViewport({
 
   const index = useMemo(() => new Map([...referenceNodes, ...nodes].map(node => [node.id, node])), [nodes, referenceNodes])
   const resolvedMedia = useMemo(() => new Map(Object.entries(snapshot.resolvedMedia ?? {})), [snapshot.resolvedMedia])
+  const mentionedAssets = snapshot.mentionedAssets
   const locked = new Set([...agentLockedNodeIds, ...lockedNodeIds])
   latestLocks.current = locked
   const lockReason = id => locked.has(id) ? '执行中使用的节点，结束后可编辑。' : ''
@@ -216,7 +217,7 @@ export function CanvasViewport({
         actions: node.deleted ? { preview: setPreview, locate } : { ...actions, mutationReason: lockReason(node.id) },
         draft, editor: draft && editorFor(draft), rename: rename?.id === node.id ? rename.token : undefined,
         referenceFocus: referenceFocus?.id === node.id ? referenceFocus.token : undefined,
-        index, edges, resolvedMedia, mediaURL, generationProfiles, generationDefaults,
+        index, edges, resolvedMedia, mentionedAssets, mediaURL, generationProfiles, generationDefaults,
         tasks: taskIndex.get(node.id), selectedResult: selectedResultIds.has(node.id),
       },
     }
@@ -237,7 +238,7 @@ export function CanvasViewport({
         ...actions, edit: () => selectNode(draft.id), delete: () => closeDraft(draft.id),
         upload: undefined, chooseAsset: undefined,
       }, rename: rename?.id === draft.id ? rename.token : undefined,
-      index, edges, resolvedMedia, mediaURL, generationProfiles, generationDefaults } })
+      index, edges, resolvedMedia, mentionedAssets, mediaURL, generationProfiles, generationDefaults } })
   }
 
   const graphEdges = visibleReferences

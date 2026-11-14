@@ -54,6 +54,7 @@ export function registerTools(ctx, workspaceFor, kernel, keys, protectNodes) {
           ...(result.referenceNodes ?? []).map(item => item.id),
           ...result.edges.flatMap(item => [item.source, item.target]),
           ...Object.values(result.resolvedMedia ?? {}).map(item => item.id),
+          ...Object.values(result.mentionedAssets ?? {}).map(item => item.id),
         ])
         if (action === 'append') protectNodes(exec.agent, result.ids ?? [])
         return action === 'context' ? { ...result, workspacePath: workspace.path } : result

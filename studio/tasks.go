@@ -88,7 +88,7 @@ func (p *project) submit(ctx context.Context, r Request, providers providerRegis
 		if providers == nil {
 			return nil, providerUnavailable
 		}
-		input, pinned, sourceIDs, err := generationInput(ctx, tx, args.NodeID, kind, snapshot)
+		input, pinned, sourceIDs, err := generationInput(ctx, tx, p.dir, args.NodeID, kind, snapshot)
 		if err != nil {
 			return nil, err
 		}
@@ -313,9 +313,10 @@ func (p *project) controlTask(ctx context.Context, r Request) (any, error) {
 	})
 }
 
-func generationInput(ctx context.Context, tx *sql.Tx, id, kind, snapshot string) (GenerationInput, string, []string, error) {
+func generationInput(ctx context.Context, tx *sql.Tx, workspace, id, kind, snapshot string) (GenerationInput, string, []string, error) {
 	var content struct {
 		Prompt    string          `json:"prompt"`
+		PromptDoc json.RawMessage `json:"promptDoc"`
 		Order     []string        `json:"mixedListOrder"`
 		Mode      string          `json:"mode"`
 		ProfileID string          `json:"profileId"`
@@ -337,7 +338,6 @@ func generationInput(ctx context.Context, tx *sql.Tx, id, kind, snapshot string)
 		}
 	}
 	sourceIDs := []string{}
-	kinds := make([]string, 0, len(content.Order))
 	var text []string
 	for _, reference := range content.Order {
 		var source Node
@@ -374,19 +374,21 @@ func generationInput(ctx context.Context, tx *sql.Tx, id, kind, snapshot string)
 		if resolved.ID != source.ID {
 			sourceIDs = append(sourceIDs, resolved.ID)
 		}
-		var media struct {
-			URL  string `json:"url"`
-			Path string `json:"path"`
-		}
-		if json.Unmarshal(resolved.Content, &media) != nil || (!providerURL(media.URL) && media.Path == "") {
-			return GenerationInput{}, "", nil, invalid("模型参考素材需要项目内媒体或可访问的外部 HTTP/HTTPS URL")
-		}
-		ref := GenerationReference{Type: source.Type, Path: media.Path}
-		if providerURL(media.URL) {
-			ref.URL = media.URL
+		ref, err := mediaGenerationReference(resolved.NodeInput)
+		if err != nil {
+			return GenerationInput{}, "", nil, err
 		}
 		input.References = append(input.References, ref)
-		kinds = append(kinds, source.Type)
+	}
+	if doc, err := parsePromptDoc(content.PromptDoc); err != nil {
+		return GenerationInput{}, "", nil, err
+	} else if doc != nil {
+		target := NodeInput{ID: id, Type: kind, Content: json.RawMessage(snapshot)}
+		ids, err := compileAssetMentions(ctx, tx, workspace, target, &input, doc)
+		if err != nil {
+			return GenerationInput{}, "", nil, err
+		}
+		sourceIDs = append(sourceIDs, ids...)
 	}
 	if len(text) > 0 {
 		prompt := append([]string{strings.TrimSpace(input.Prompt)}, text...)
@@ -401,6 +403,10 @@ func generationInput(ctx context.Context, tx *sql.Tx, id, kind, snapshot string)
 		}
 		input.Mode = "t2i"
 		return input, content.ProfileID, sourceIDs, nil
+	}
+	kinds := make([]string, 0, len(input.References))
+	for _, ref := range input.References {
+		kinds = append(kinds, ref.Type)
 	}
 	if input.Mode == "" {
 		for _, media := range kinds {
@@ -424,6 +430,18 @@ func generationInput(ctx context.Context, tx *sql.Tx, id, kind, snapshot string)
 		return GenerationInput{}, "", nil, err
 	}
 	return input, content.ProfileID, sourceIDs, nil
+}
+
+func mediaGenerationReference(asset NodeInput) (GenerationReference, error) {
+	var media struct{ URL, Path string }
+	if json.Unmarshal(asset.Content, &media) != nil || (!providerURL(media.URL) && media.Path == "") {
+		return GenerationReference{}, invalid("模型参考素材需要项目内媒体或可访问的外部 HTTP/HTTPS URL")
+	}
+	ref := GenerationReference{Type: asset.Type, Path: media.Path}
+	if providerURL(media.URL) {
+		ref.URL = media.URL
+	}
+	return ref, nil
 }
 
 func nodeText(raw json.RawMessage) string {

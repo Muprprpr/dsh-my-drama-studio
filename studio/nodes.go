@@ -67,13 +67,14 @@ func scanNode(row interface{ Scan(...any) error }) (Node, error) {
 }
 
 type queryResult struct {
-	ReferenceNodes []Node          `json:"referenceNodes,omitempty"`
-	ResolvedMedia  map[string]Node `json:"resolvedMedia,omitempty"`
-	LockedNodeIDs  []string        `json:"lockedNodeIds,omitempty"`
-	Nodes          []Node          `json:"nodes"`
-	Edges          []Edge          `json:"edges"`
-	Status         Status          `json:"status"`
-	HasMore        bool            `json:"hasMore"`
+	ReferenceNodes  []Node          `json:"referenceNodes,omitempty"`
+	ResolvedMedia   map[string]Node `json:"resolvedMedia,omitempty"`
+	MentionedAssets map[string]Node `json:"mentionedAssets,omitempty"`
+	LockedNodeIDs   []string        `json:"lockedNodeIds,omitempty"`
+	Nodes           []Node          `json:"nodes"`
+	Edges           []Edge          `json:"edges"`
+	Status          Status          `json:"status"`
+	HasMore         bool            `json:"hasMore"`
 }
 
 func (p *project) query(ctx context.Context, r Request) (queryResult, error) {
@@ -190,6 +191,9 @@ func (p *project) query(ctx context.Context, r Request) (queryResult, error) {
 		return queryResult{}, err
 	}
 	if err := addReferenceProjection(ctx, tx, &result); err != nil {
+		return queryResult{}, err
+	}
+	if err := p.projectMentionedAssets(ctx, tx, &result); err != nil {
 		return queryResult{}, err
 	}
 	result.LockedNodeIDs, err = taskLockedNodes(ctx, tx)
@@ -323,6 +327,12 @@ func appendNodes(ctx context.Context, tx *sql.Tx, session string, nodes []NodeIn
 		if err := validateNode(n); err != nil {
 			return appendResult{}, err
 		}
+		var err error
+		n.Content, err = normalizePromptDoc(n.Type, n.Content)
+		if err != nil {
+			return appendResult{}, err
+		}
+
 		if n.ID == "" {
 			n.ID = uuid.NewString()
 		}
@@ -666,6 +676,7 @@ func validateVideo(ctx context.Context, tx *sql.Tx, id string, draft bool) error
 	}
 	var data struct {
 		Prompt         string            `json:"prompt"`
+		PromptDoc      json.RawMessage   `json:"promptDoc"`
 		Mode           string            `json:"mode"`
 		ProfileID      json.RawMessage   `json:"profileId"`
 		Path           string            `json:"path"`
@@ -712,7 +723,7 @@ func validateVideo(ctx context.Context, tx *sql.Tx, id string, draft bool) error
 		if len(media) != 0 || len(data.MixedListOrder) != 0 {
 			return invalid("视频素材节点不能接入生成参考")
 		}
-		if strings.TrimSpace(data.Prompt) != "" ||
+		if strings.TrimSpace(data.Prompt) != "" || len(data.PromptDoc) != 0 && string(data.PromptDoc) != "null" ||
 			len(data.ProfileID) != 0 && string(data.ProfileID) != "null" && string(data.ProfileID) != `""` ||
 			len(data.Params) != 0 && string(data.Params) != "null" {
 			return invalid("视频素材节点不能保存生成提示词、模型或参数")
@@ -743,10 +754,21 @@ func validateVideo(ctx context.Context, tx *sql.Tx, id string, draft bool) error
 		kinds = append(kinds, kind)
 		delete(media, source)
 	}
+	doc, err := parsePromptDoc(data.PromptDoc)
+	if err != nil {
+		return err
+	}
 	if data.Mode != "" {
-		if err := validateVideoDraftMode(data.Mode, kinds, draft); err != nil {
+		if err := validateVideoDraftMode(data.Mode, kinds, draft || doc != nil); err != nil {
 			return err
 		}
+	}
+	if doc != nil {
+		plain, err := doc.render(func(assetMention) (string, error) { return "", nil })
+		if err != nil {
+			return err
+		}
+		return checkVideoPromptReferences(plain, counts, true)
 	}
 	return checkVideoPromptReferences(data.Prompt, counts, draft)
 }

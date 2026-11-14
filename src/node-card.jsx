@@ -1,4 +1,4 @@
-import React, { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { Handle, Position } from '@xyflow/react'
 import {
   Button, FileTypeIcon, IconBranchOutlineRegular, IconChevronDownOutlineRegular,
@@ -14,9 +14,11 @@ import {
 import { TaskStatus, taskActive } from './task-drawer.jsx'
 import { useNodeEditorPlacement } from './node-editor-placement.js'
 import { DurationControl, NodeParameterPopover } from './node-parameter-popover.jsx'
+import { PromptEditor, promptDocumentMentions, promptDocumentText, promptEditorStyle } from './prompt-editor.jsx'
 import cardStyle from './node-card.css'
 
-export { cardStyle }
+const nodeCardStyle = cardStyle + '\n' + promptEditorStyle
+export { nodeCardStyle as cardStyle }
 
 const interactions = 'nodrag nopan nowheel'
 const typeIcons = {
@@ -327,7 +329,7 @@ function referenceReady(item, resolvedMedia) {
 
 export function GraphNode({ data, selected }) {
   const { node, draft, editor, compact, mediaURL, index, edges, tasks = [], generationProfiles = [],
-    generationDefaults, resolvedMedia, rename, referenceFocus, selectedResult, isFocused, actions = {} } = data
+    generationDefaults, resolvedMedia, mentionedAssets, rename, referenceFocus, selectedResult, isFocused, actions = {} } = data
   const compactEditor = draft?.edit && (node.type === 'image' || node.type === 'video')
   const panelRef = useNodeEditorPlacement(node.id, Boolean(compactEditor && editor), Boolean(isFocused))
   const latest = tasks[0]
@@ -415,7 +417,7 @@ export function GraphNode({ data, selected }) {
     {draft && editor && <div ref={panelRef}
       className={'drama-node-editor-panel' + (compactEditor ? ' is-creative' : '')}>
       <NodeEditor draft={draft} {...editor} node={node} index={index} resolvedMedia={resolvedMedia} rename={rename} referenceFocus={referenceFocus}
-        mediaURL={mediaURL} generationProfiles={generationProfiles} generationDefaults={generationDefaults}
+        mediaURL={mediaURL} mentionedAssets={mentionedAssets} generationProfiles={generationProfiles} generationDefaults={generationDefaults}
         actions={actions} latest={latest} isFocused={isFocused} />
     </div>}
   </article>
@@ -445,6 +447,7 @@ function referenceIssue(mode, kinds, profile, ready = false) {
     }
   }
   if (mode === 't2i') {
+    if (kinds.some(kind => kind === 'video' || kind === 'audio')) return '图片生成只支持引用图片素材。'
     const count = kinds.filter(kind => kind === 'image').length
     const max = referenceLimit(mode, 'image', profile)
     if (count > max) return max ? '所选模型最多支持 ' + max + ' 张参考图片。' : '所选模型不接收参考图片。'
@@ -505,9 +508,28 @@ function GenerationParams({ value, update, profile, generationDefaults, mode }) 
       </label>)
 }
 
+function promptAsset(node, mediaURL, sourceLabel) {
+  const url = mediaURL?.(node)
+  return {
+    assetId: node.content.assetId || node.id,
+    assetType: node.type,
+    label: nodeTitle(node) || node.content.path?.split('/').at(-1) || nodeLabels[node.type],
+    thumbnailUrl: node.type === 'image' ? url : undefined,
+    mediaUrl: url,
+    duration: node.content.duration,
+    sourceLabel,
+    nodeId: node.deleted ? undefined : node.id,
+    node,
+  }
+}
+
+function promptAssetKey(node) {
+  return node.type + ':' + (node.content.path || node.content.url)
+}
+
 function NodeEditor({
   draft, append, mutate, mutationReason, media = [], queryCanvas, finish, close, mediaURL, index,
-  generationProfiles, generationDefaults, node, actions, latest, resolvedMedia, rename, referenceFocus, uploadReference,
+  generationProfiles, generationDefaults, node, actions, latest, resolvedMedia, mentionedAssets, rename, referenceFocus, uploadReference,
   importFile, attachAsset, reportSaveError, isFocused,
 }) {
   const { base, preset, seed, duplicate, edit, group } = draft
@@ -525,8 +547,12 @@ function NodeEditor({
     ? ['text', 'description', 'prompt'].find(field => textValue(content, field)) ?? 'prompt'
     : 'prompt'
   const storedPrompt = typeof content[promptField] === 'string' ? content[promptField] : ''
+  const storedPromptDoc = content.promptDoc ?? null
   const storedProfileId = textValue(content, 'profileId')
-  const [prompt, setPrompt] = useState(storedPrompt)
+  const [plainPrompt, setPlainPrompt] = useState(storedPrompt)
+  const [promptDoc, setPromptDoc] = useState(storedPromptDoc)
+  const prompt = promptDoc ? promptDocumentText(promptDoc) : plainPrompt
+  const [pickedAssets, setPickedAssets] = useState(new Map())
   const [profileId, setProfileId] = useState(storedProfileId)
   const [overrides, setOverrides] = useState(() => parameterValues(content))
   const [metadata, setMetadata] = useState(() => nodeMetadata(base))
@@ -535,11 +561,8 @@ function NodeEditor({
   const [promptComposing, setPromptComposing] = useState(false)
   const [openParameter, setOpenParameter] = useState('')
   const promptInput = useRef(null)
-  const expandedPromptInput = useRef(null)
-  const promptExpand = useRef(null)
   const promptScroll = useRef(0)
   const composingPrompt = useRef(false)
-  const promptCompositionEnded = useRef(false)
   const generation = type === 'image' || type === 'video' && mode !== 'asset'
   const hasPrompt = type === 'prompt' || generation
   const assetNode = mediaTypes.has(type) && !(type === 'video' && generation)
@@ -588,20 +611,14 @@ function NodeEditor({
     if (!edit || dirty || composingPrompt.current || base.revision < revision.current) return
     revision.current = base.revision
     committed.current = base
-    setPrompt(storedPrompt)
+    setPlainPrompt(storedPrompt)
+    setPromptDoc(storedPromptDoc)
     setProfileId(storedProfileId)
     setOverrides(parameterValues(content))
     setAsset(null)
     if (compact) setMetadata(nodeMetadata(base))
     formRef.current?.reset()
   }, [base?.revision, dirty, edit, promptComposing])
-
-  useLayoutEffect(() => {
-    if (composingPrompt.current) return
-    for (const input of [promptInput.current, expandedPromptInput.current]) {
-      if (input && input.value !== prompt) input.value = prompt
-    }
-  }, [prompt, promptComposing, promptOpen])
 
   useEffect(() => {
     if (!queryCanvas || !missing) return
@@ -673,8 +690,57 @@ function NodeEditor({
   const referenceItems = references.map(id => available.get(id))
   const referenceKinds = referenceItems.map(item => item?.type)
   const hasTextRef = type === 'image' && referenceItems.some(item => textTypes.has(item?.type) && savedText(item))
-  const issue = referenceIssue(referenceMode, referenceKinds, activeProfile, true)
-    || (type === 'video' ? inlineReferenceIssue(prompt, referenceKinds) : '')
+  const ownMediaKey = isMedia(node) ? promptAssetKey(node) : null
+  const promptAssets = useMemo(() => {
+    const assets = new Map()
+    for (const asset of media) {
+      if (asset.id === node.id || asset.deleted || !isMedia(asset) || promptAssetKey(asset) === ownMediaKey) continue
+      const item = promptAsset(asset, mediaURL, '画布')
+      assets.set(item.assetId, item)
+    }
+    for (const [id, item] of pickedAssets) if (!assets.has(id)) assets.set(id, item)
+    for (const [id, asset] of Object.entries(mentionedAssets ?? {})) {
+      if (asset.id === node.id || promptAssetKey(asset) === ownMediaKey) continue
+      const current = assets.get(id)
+      if (current?.sourceLabel !== '画布' || current.node.revision < asset.revision) {
+        assets.set(id, promptAsset(asset, mediaURL, '项目资产'))
+      }
+    }
+    for (const attrs of promptDocumentMentions(storedPromptDoc)) {
+      if (!Object.hasOwn(mentionedAssets ?? {}, attrs.assetId)) {
+        assets.set(attrs.assetId, { ...attrs, disabled: true, status: '素材已失效' })
+      }
+    }
+    return assets
+  }, [media, mediaURL, mentionedAssets, node.id, ownMediaKey, pickedAssets, storedPromptDoc])
+  const generationKinds = [...referenceKinds]
+  const linkedMediaKeys = new Set(referenceItems.filter(Boolean).map(item => resolvedMedia?.get(item.id) ?? item)
+    .filter(isMedia).map(promptAssetKey))
+  let missingMention = ''
+  const mentionSlots = new Map()
+  for (const attrs of promptDocumentMentions(promptDoc)) {
+    const { assetId, assetType, label } = attrs
+    const asset = promptAssets.get(assetId)
+    const item = asset?.assetType === assetType ? asset.node : undefined
+    const key = item ? promptAssetKey(item) : 'missing:' + assetType + ':' + assetId
+    if (linkedMediaKeys.has(key)) continue
+    const existing = mentionSlots.get(key)
+    if (existing) {
+      if (!existing.ids.includes(assetId)) existing.ids.push(assetId)
+      continue
+    }
+    const valid = Boolean(item && key !== ownMediaKey)
+    const name = asset?.label || label || nodeLabels[assetType]
+    mentionSlots.set(key, { ids: [assetId], item: valid ? item : undefined, kind: assetType, name,
+      inputPosition: generationKinds.length })
+    if (!valid) {
+      missingMention ||= '找不到引用素材：' + (label || nodeLabels[assetType])
+      continue
+    }
+    generationKinds.push(assetType)
+  }
+  const issue = missingMention || referenceIssue(referenceMode, generationKinds, activeProfile, true)
+    || (type === 'video' ? inlineReferenceIssue(promptDoc ? promptDocumentText(promptDoc, () => '') : prompt, generationKinds) : '')
   const savedProfile = compact ? activeProfile : resolveProfile(currentProfiles, storedProfileId)
   const generationIssue = [
     taskActive(latest ?? {}) && '此节点正在生成。',
@@ -714,10 +780,34 @@ function NodeEditor({
     markDirty()
   }
 
-  function updatePrompt(value) {
-    if (value === prompt) return
-    setPrompt(value)
+  function updatePrompt(doc) {
+    setPromptDoc(doc)
     markDirty()
+  }
+
+  const searchPromptAssets = useCallback(async (query, category, signal) => {
+    if (!queryCanvas || category === 'character' || category === 'scene') return []
+    const { nodes } = await queryCanvas({ type: mediaTypes.has(category) ? category : undefined,
+      mediaOnly: true, q: query, limit: 32 }, signal)
+    return nodes.filter(item => item.id !== node.id && isMedia(item) && promptAssetKey(item) !== ownMediaKey)
+      .map(item => promptAsset(item, mediaURL, '项目资产'))
+  }, [queryCanvas, mediaURL, node.id, ownMediaKey])
+
+  const promptProps = {
+    value: promptDoc, prompt, assets: useMemo(() => [...promptAssets.values()], [promptAssets]), onChange: updatePrompt,
+    search: searchPromptAssets,
+    onAssetSelect: item => setPickedAssets(current => new Map(current).set(item.assetId, item)),
+    onPreview: item => { if (item.node) actions.preview?.(item.node) },
+    onLocate: id => actions.locate?.(id),
+    onCompositionChange: composing => {
+      composingPrompt.current = composing
+      setPromptComposing(composing)
+    },
+    disabled: blocked,
+  }
+  const mentionReferences = [...mentionSlots.values()]
+  function removeMention({ ids, kind }) {
+    promptInput.current?.removeMentions(ids, kind)
   }
 
   function setAssetSource(item) {
@@ -735,7 +825,10 @@ function NodeEditor({
     const title = String(compact ? metadata.title : form.get('title') ?? '').trim()
     if (title) next.title = title
     else delete next.title
-    if (hasPrompt) next[promptField] = prompt
+    if (hasPrompt) {
+      next[promptField] = prompt
+      if (promptDoc && (generation || type === 'prompt')) next.promptDoc = promptDoc
+    }
     if (assetNode && (compact || asset || form.has('path') || form.has('url'))) {
       for (const field of ['path', 'url']) {
         const value = compact ? metadata[field].trim() : asset ? asset[field] : String(form.get(field) ?? '').trim()
@@ -767,7 +860,7 @@ function NodeEditor({
     } else if (type === 'video') {
       if (compact) next.mode = 'asset'
       else delete next.mode
-      for (const key of ['profileId', 'params', 'prompt', 'textList', 'mixedListOrder']) delete next[key]
+      for (const key of ['profileId', 'params', 'prompt', 'promptDoc', 'textList', 'mixedListOrder']) delete next[key]
     } else if (type === 'shot') {
       if (ordered.length) next.mixedListOrder = ordered
       else delete next.mixedListOrder
@@ -898,28 +991,8 @@ function NodeEditor({
     setPromptOpen(false)
     void flushAutosave()
     requestAnimationFrame(() => {
-      promptExpand.current?.focus({ preventScroll: true })
-      if (promptInput.current) promptInput.current.scrollTop = promptScroll.current
+      if (promptInput.current?.element) promptInput.current.element.scrollTop = promptScroll.current
     })
-  }
-
-  const promptEvents = {
-    onCompositionStart: () => {
-      composingPrompt.current = true
-      promptCompositionEnded.current = false
-      setPromptComposing(true)
-    },
-    onCompositionEnd: event => {
-      composingPrompt.current = false
-      promptCompositionEnded.current = true
-      setPromptComposing(false)
-      updatePrompt(event.currentTarget.value)
-    },
-    onKeyUp: () => { promptCompositionEnded.current = false },
-    onBlur: () => { promptCompositionEnded.current = false },
-    onChange: event => {
-      if (!composingPrompt.current && !event.nativeEvent.isComposing) updatePrompt(event.currentTarget.value)
-    },
   }
 
   const effectiveNode = node.revision >= revision.current ? node : committed.current
@@ -933,10 +1006,8 @@ function NodeEditor({
       onSubmit={event => event.preventDefault()} onDoubleClick={preventCanvasDoubleClick}
       onKeyDown={event => {
         if (!event.currentTarget.contains(event.target)) return
-        const ended = event.target === promptInput.current && promptCompositionEnded.current
-        promptCompositionEnded.current = false
         if (event.key === 'Escape' && !settings && !promptOpen && !openParameter &&
-            !composingPrompt.current && !ended && !event.nativeEvent.isComposing && event.keyCode !== 229) {
+            !composingPrompt.current && !event.nativeEvent.isComposing && event.keyCode !== 229) {
           if (isFocused) return
           close()
         }
@@ -944,12 +1015,11 @@ function NodeEditor({
       }}>
       {generation && <>
         <div className="drama-node-creative-prompt">
-          <textarea ref={promptInput} aria-label="提示词" name="prompt" rows={3}
-            placeholder={type === 'video' ? '描述镜头、动作与声音…' : '描述要生成的画面…'} defaultValue={prompt} disabled={blocked}
-            {...promptEvents} />
-          <Button ref={promptExpand} size="sm" className="drama-node-prompt-expand" aria-haspopup="dialog" aria-expanded={promptOpen}
+          <PromptEditor ref={promptInput} {...promptProps}
+            placeholder={type === 'video' ? '描述镜头、动作与声音…' : '描述要生成的画面…'} />
+          <Button size="sm" className="drama-node-prompt-expand" aria-haspopup="dialog" aria-expanded={promptOpen}
             aria-label="展开提示词" title="展开提示词" onClick={() => {
-              promptScroll.current = promptInput.current?.scrollTop ?? 0
+              promptScroll.current = promptInput.current?.element?.scrollTop ?? 0
               setOpenParameter('')
               setPromptOpen(true)
             }}>
@@ -991,11 +1061,12 @@ function NodeEditor({
             onClick={() => setSettings('metadata')} />
         </div>
         <div ref={referenceArea}>
-          {(!mode || mode === 't2v') && type === 'video' ? <ReferenceModeMenu disabled={blocked} choose={changeMode} />
-            : <MediaReferences compact mode={referenceMode} profile={activeProfile} media={available} mediaURL={mediaURL}
-              resolvedMedia={resolvedMedia} queryCanvas={queryCanvas} nodeId={node.id} references={references}
-              setReferences={changeReferences} onSelect={attachReference} uploadReference={uploadReference}
-              attachAsset={attachAsset} locate={actions.locate} preview={actions.preview} disabled={blocked} />}
+          <MediaReferences compact mode={referenceMode} profile={activeProfile} media={available} mediaURL={mediaURL}
+            resolvedMedia={resolvedMedia} queryCanvas={queryCanvas} nodeId={node.id} references={references}
+            kinds={generationKinds} mentions={mentionReferences} removeMention={removeMention}
+            chooseMode={type === 'video' && (!mode || mode === 't2v') ? changeMode : undefined}
+            setReferences={changeReferences} onSelect={attachReference} uploadReference={uploadReference}
+            attachAsset={attachAsset} locate={actions.locate} preview={actions.preview} disabled={blocked} />
         </div>
         {promptOpen && <Modal open title="编辑提示词" closeLabel="关闭提示词编辑器" onClose={closePrompt}
           className="drama-node-prompt-dialog" contentClassName="drama-node-prompt-dialog-content" backdropBlur={false}
@@ -1005,8 +1076,7 @@ function NodeEditor({
             </span>
             <Button size="sm" variant="primary" onClick={closePrompt}>完成编辑</Button>
           </>}>
-          <textarea ref={expandedPromptInput} aria-label="提示词" data-modal-autofocus defaultValue={prompt} disabled={blocked}
-            className={'drama-node-prompt-dialog-input ' + interactions} {...promptEvents} />
+          <PromptEditor {...promptProps} autoFocus className="drama-node-prompt-dialog-input" />
         </Modal>}
       </>}
       {!generation && <div className="drama-node-creative-controls">
@@ -1048,7 +1118,7 @@ function NodeEditor({
   }
 
   const showReferences = supportsRefs && (type !== 'video' ||
-    Boolean(referenceMode && referenceMode !== 't2v') || references.length > 0)
+    Boolean(referenceMode && referenceMode !== 't2v') || references.length > 0 || mentionReferences.length > 0)
   return <form ref={formRef} className={'drama-node-editor ' + interactions} onSubmit={save} aria-label={formLabel}
     onChange={() => setDirty(true)} onKeyDown={event => {
       if (event.key === 'Escape' && !event.nativeEvent.isComposing && event.keyCode !== 229) {
@@ -1066,15 +1136,16 @@ function NodeEditor({
           importFile={importFile} onSelect={setAssetSource} />}
         {type === 'video' && <MenuSelect label="视频方式" value={mode} placeholder="选择方式" onChange={changeMode}
           items={Object.entries(modeLabels).map(([id, label]) => ({ id, label }))} />}
-        {hasPrompt && <label className="drama-node-field">{type === 'video' ? '完整视频提示词' : '提示词'}
-          <textarea name="prompt" rows={4} value={prompt} onChange={event => setPrompt(event.target.value)} />
-        </label>}
+        {hasPrompt && <div className="drama-node-field">{type === 'video' ? '完整视频提示词' : '提示词'}
+          <PromptEditor ref={promptInput} {...promptProps} ariaLabel={type === 'video' ? '完整视频提示词' : '提示词'} disabled={blocked || saving} />
+        </div>}
         {!hasPrompt && <label className="drama-node-field">正文
           <textarea name="description" rows={3} defaultValue={content[textField] ?? ''} />
         </label>}
         {supportsRefs && <div ref={referenceArea}>
           {showReferences ? <MediaReferences mode={referenceMode} profile={activeProfile} media={available} mediaURL={mediaURL}
             resolvedMedia={resolvedMedia} queryCanvas={queryCanvas} nodeId={node.id} references={references}
+            kinds={generationKinds} mentions={mentionReferences} removeMention={removeMention}
             setReferences={changeReferences} onSelect={attachReference} uploadReference={uploadReference}
             attachAsset={attachAsset} locate={actions.locate} preview={actions.preview} disabled={blocked || saving} />
             : <MenuSelect label="添加参考素材" value="" placeholder="选择参考生成方式" onChange={changeMode}
@@ -1180,13 +1251,13 @@ function AssetSources({ type, queryCanvas, asset, importFile, onSelect }) {
   </div>
 }
 
-function referenceLabel(mode, references, position, known) {
+function referenceLabel(mode, kinds, position) {
   if (mode === 'i2v') return position === 0 ? '首帧' : '尾帧'
   if (mode === 'v2v') return '源视频'
-  const kind = known.get(references[position])?.type
+  const kind = kinds[position]
   if (mode === 't2i') return textTypes.has(kind) ? '文本参考' : '参考图片'
   if (mode === 'r2v' && mediaTypes.has(kind)) {
-    const ordinal = references.slice(0, position + 1).filter(id => known.get(id)?.type === kind).length
+    const ordinal = kinds.slice(0, position + 1).filter(type => type === kind).length
     return '@' + nodeLabels[kind] + ordinal
   }
   return '参考 ' + (position + 1)
@@ -1194,32 +1265,35 @@ function referenceLabel(mode, references, position, known) {
 
 function ReferenceModeMenu({ disabled, choose }) {
   const [open, setOpen] = useState(false)
-  return <div className="drama-node-reference-strip">
-    <Menu open={open} portal compact onClose={() => setOpen(false)}
-      items={['i2v', 'r2v', 'v2v'].map(id => ({ id, label: modeLabels[id] }))}
-      onSelect={id => { choose(id); setOpen(false) }}
-      anchor={<button type="button" className="drama-node-reference-add" aria-label="添加参考素材" aria-haspopup="menu"
-        title="选择参考生成方式" disabled={disabled} onClick={() => setOpen(true)}>
-        <IconPlusOutlineRegular size={15} /><span>参考素材</span>
-      </button>} />
-  </div>
+  return <Menu open={open} portal compact onClose={() => setOpen(false)}
+    items={['i2v', 'r2v', 'v2v'].map(id => ({ id, label: modeLabels[id] }))}
+    onSelect={id => { choose(id); setOpen(false) }}
+    anchor={<button type="button" className="drama-node-reference-add" aria-label="添加参考素材" aria-haspopup="menu"
+      title="选择参考生成方式" disabled={disabled} onClick={() => setOpen(true)}>
+      <IconPlusOutlineRegular size={15} /><span>参考素材</span>
+    </button>} />
 }
 
 function MediaReferences({ compact, mode, profile, media, mediaURL, resolvedMedia, queryCanvas, nodeId, references,
-  setReferences, onSelect, uploadReference, attachAsset, locate, preview, disabled }) {
+  kinds, mentions, removeMention, chooseMode, setReferences, onSelect, uploadReference, attachAsset, locate, preview, disabled }) {
   const [search, setSearch] = useState('')
   const [pickerOpen, setPickerOpen] = useState(false)
   const totalLimit = mode === 'r2v' ? profile?.limits?.maxReferences ?? 32 : 32
+  const mentionedKeys = new Set(mentions.filter(mention => mention.item).map(mention => promptAssetKey(mention.item)))
   const allowedKinds = [...mediaTypes, ...textTypes].filter(kind => {
-    const count = references.filter(id => media.get(id)?.type === kind).length
-    return references.length < totalLimit && count < referenceLimit(mode, kind, profile)
+    const count = kinds.filter(type => type === kind).length
+    return !chooseMode && kinds.length < totalLimit && count < referenceLimit(mode, kind, profile)
   })
   const types = allowedKinds.join(',')
   const { nodes: results, error } = useSourceSearch(queryCanvas, !compact || pickerOpen ? types : '', search)
   const known = new Map([...results.map(node => [node.id, node]), ...media])
+  const alreadyMentioned = item => {
+    const asset = resolvedMedia?.get(item.id) ?? item
+    return isMedia(asset) && mentionedKeys.has(promptAssetKey(asset))
+  }
   const q = search.trim().toLowerCase()
   const available = [...known.values()].filter(node => !node.deleted && node.id !== nodeId &&
-    allowedKinds.includes(node.type) && !references.includes(node.id) &&
+    allowedKinds.includes(node.type) && !references.includes(node.id) && !alreadyMentioned(node) &&
     (nodeName(node) + ' ' + savedText(node) + ' ' + shotLabel(node)).toLowerCase().includes(q))
   const labels = {
     i2v: [profile?.limits?.lastFrame ? '首帧与尾帧图片' : '首帧图片', '图片素材'],
@@ -1255,7 +1329,8 @@ function MediaReferences({ compact, mode, profile, media, mediaURL, resolvedMedi
         onChange={id => { if (known.has(id)) select(known.get(id)) }} />
       {uploadKinds.length > 0 && <>
         {attachAsset && <ProjectReferenceSelect types={uploadKinds.join(',')} queryCanvas={queryCanvas}
-          disabled={disabled} search={search} excluded={[nodeId, ...references]} attachAsset={attachAsset} onSelect={select} />}
+          disabled={disabled} search={search} excluded={[nodeId, ...references]} alreadyMentioned={alreadyMentioned}
+          attachAsset={attachAsset} onSelect={select} />}
         <FileAction label="上传参考素材" disabled={disabled}
           accept={uploadKinds.map(kind => kind + '/*').join(',')}
           onFile={uploadReference && (async file => select(await uploadReference(file)))} />
@@ -1268,22 +1343,33 @@ function MediaReferences({ compact, mode, profile, media, mediaURL, resolvedMedi
     const closePicker = () => { setPickerOpen(false); setSearch('') }
     return <>
       <div className="drama-node-reference-strip" aria-label={legend}>
-        {!!references.length && <div className="drama-node-reference-track" onWheel={event => {
+        {(references.length > 0 || mentions.length > 0) && <div className="drama-node-reference-track" onWheel={event => {
           const track = event.currentTarget
           if (!event.deltaX && track.scrollWidth > track.clientWidth) track.scrollLeft += event.deltaY
-        }}>{references.map((id, index) => {
-          const item = known.get(id)
-          const asset = resolvedMedia?.get(id) ?? item
-          const label = referenceLabel(mode, references, index, known)
-          const title = label + ' · ' + (item ? nodeName(item) : '等待素材')
-          return <ReferenceSlot key={id} id={id} item={item} asset={asset} title={title} label={label} disabled={disabled}
-            index={index} count={references.length} mediaURL={mediaURL} locate={locate} preview={preview}
-            move={delta => move(index, delta)} remove={() => setReferences(references.filter(ref => ref !== id))} />
-        })}</div>}
-        {types ? <button type="button" className="drama-node-reference-add" aria-label={'添加' + slot}
+        }}>
+          {references.map((id, index) => {
+            const item = known.get(id)
+            const asset = resolvedMedia?.get(id) ?? item
+            const label = referenceLabel(mode, kinds, index)
+            const title = label + ' · ' + (item ? nodeName(item) : '等待素材')
+            return <ReferenceSlot key={id} id={id} kind={item?.type} asset={asset} title={title} label={label} disabled={disabled}
+              index={index} count={references.length} mediaURL={mediaURL} locate={locate} preview={preview}
+              move={delta => move(index, delta)} remove={() => setReferences(references.filter(ref => ref !== id))} />
+          })}
+          {mentions.map((mention, index) => {
+            const { ids, item, kind, name, inputPosition } = mention
+            const position = references.length + index
+            const label = item ? referenceLabel(mode, kinds, inputPosition) : '已失效'
+            return <ReferenceSlot key={kind + ':' + ids[0]} mentionId={ids[0]} kind={kind} asset={item}
+              title={label + ' · ' + name} label={label} disabled={disabled} index={position} mediaURL={mediaURL}
+              preview={preview} remove={() => removeMention(mention)} />
+          })}
+        </div>}
+        {chooseMode ? <ReferenceModeMenu disabled={disabled} choose={chooseMode} />
+          : types ? <button type="button" className="drama-node-reference-add" aria-label={'添加' + slot}
           aria-haspopup="dialog" title={'添加' + slot} disabled={disabled} onClick={() => setPickerOpen(true)}>
           <IconPlusOutlineRegular size={15} /><span>{slot}</span>
-        </button> : !references.length && <span className="drama-node-caption">当前模型无可用参考槽</span>}
+        </button> : !references.length && !mentions.length && <span className="drama-node-caption">当前模型无可用参考槽</span>}
       </div>
       {pickerOpen && <Modal open title="添加参考素材" closeLabel="关闭参考素材选择" backdropBlur={false}
         onClose={closePicker}>{picker}</Modal>}
@@ -1293,14 +1379,14 @@ function MediaReferences({ compact, mode, profile, media, mediaURL, resolvedMedi
   return <fieldset className="drama-node-editor-references">
     <legend>{legend}</legend>
     {picker}
-    {!types && !references.length && mode === 'r2v' && <small>所选模型未配置可用的参考素材。</small>}
-    {references.length > 0 && <ol>{references.map((id, index) => {
+    {!types && !references.length && !mentions.length && mode === 'r2v' && <small>所选模型未配置可用的参考素材。</small>}
+    {(references.length > 0 || mentions.length > 0) && <ol>{references.map((id, index) => {
       const item = known.get(id)
       const asset = resolvedMedia?.get(id) ?? item
       const url = asset?.type === 'image' && isMedia(asset) ? mediaURL?.(asset) : undefined
       const ready = referenceReady(item, resolvedMedia)
       const excerpt = item && textTypes.has(item.type) && savedText(item)
-      const label = referenceLabel(mode, references, index, known)
+      const label = referenceLabel(mode, kinds, index)
       return <li key={id}>
         {url ? <img src={url} loading="lazy" decoding="async" alt="" /> : <NodeIcon type={item?.type} size={14} />}
         <span title={excerpt || (item ? nodeName(item) : id)}>{label}
@@ -1317,23 +1403,30 @@ function MediaReferences({ compact, mode, profile, media, mediaURL, resolvedMedi
         <Button size="sm" aria-label={'移除参考 ' + (index + 1)}
           onClick={() => setReferences(references.filter(ref => ref !== id))}>移除</Button>
       </li>
-    })}</ol>}
+    })}{mentions.map((mention, index) => <li key={mention.kind + ':' + mention.ids[0]}>
+      <NodeIcon type={mention.kind} size={14} />
+      <span>{mention.name}{!mention.item && '（已失效）'}</span>
+      {mention.item && <QuickAction label="查看参考" onClick={() => preview?.(mention.item)}><IconFullscreenOutlineRegular size={13} /></QuickAction>}
+      <Button size="sm" title="从提示词移除引用" aria-label={'移除参考 ' + (references.length + index + 1)}
+        disabled={disabled} onClick={() => removeMention(mention)}>移除</Button>
+    </li>)}</ol>}
   </fieldset>
 }
 
-function ReferenceSlot({ id: sourceId, item, asset, title, label, disabled, index, count, mediaURL, locate, preview, move, remove }) {
+function ReferenceSlot({ id: sourceId, mentionId, kind, asset, title, label, disabled, index, count, mediaURL, locate, preview, move, remove }) {
   const [menu, setMenu] = useState(false)
-  const url = asset?.type === 'image' && isMedia(asset) ? mediaURL?.(asset) : undefined
+  const url = isMedia(asset) ? mediaURL?.(asset) : undefined
   const canPreview = isMedia(asset) && preview
-  return <div className="drama-node-reference-slot">
+  const removeLabel = mentionId ? '从提示词移除引用' : '移除引用'
+  return <div className="drama-node-reference-slot" data-mention-asset-id={mentionId}>
     <Menu open={menu} portal compact onClose={() => setMenu(false)}
       items={[
-        { id: 'view', label: canPreview ? '查看素材' : '定位节点', disabled: !canPreview && !locate },
+        ...(canPreview || locate ? [{ id: 'view', label: canPreview ? '查看素材' : '定位节点' }] : []),
         ...(count > 1 ? [
           { id: 'left', label: '前移', disabled: disabled || index === 0 },
           { id: 'right', label: '后移', disabled: disabled || index === count - 1 },
         ] : []),
-        { id: 'remove', label: '移除引用', disabled },
+        { id: 'remove', label: removeLabel, disabled },
       ]} onSelect={id => {
         setMenu(false)
         if (id === 'view') canPreview ? preview(asset) : locate?.(sourceId)
@@ -1341,20 +1434,21 @@ function ReferenceSlot({ id: sourceId, item, asset, title, label, disabled, inde
         else move(id === 'left' ? -1 : 1)
       }} anchor={<button type="button" className="drama-node-reference-thumb" aria-label={title}
         aria-haspopup="menu" aria-expanded={menu} title={title} onClick={() => setMenu(true)}>
-        {url ? <img src={url} alt="" loading="lazy" decoding="async" /> :
-          <NodeIcon type={item?.type} size={16} />}
+        {url && asset.type === 'image' ? <img src={url} alt="" loading="lazy" decoding="async" /> :
+          url && asset.type === 'video' ? <video src={url} muted playsInline preload="metadata" aria-hidden="true" /> :
+            <NodeIcon type={kind} size={16} />}
         <span>{label}</span>
       </button>} />
     <button type="button" className="drama-node-reference-remove" aria-label={'移除参考 ' + (index + 1)}
-      title="移除引用" disabled={disabled} onClick={remove}>×</button>
+      title={removeLabel} disabled={disabled} onClick={remove}>×</button>
   </div>
 }
 
-function ProjectReferenceSelect({ types, queryCanvas, disabled, search, excluded, attachAsset, onSelect }) {
+function ProjectReferenceSelect({ types, queryCanvas, disabled, search, excluded, alreadyMentioned, attachAsset, onSelect }) {
   const { nodes, error: searchError } = useSourceSearch(queryCanvas, types, search, true)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
-  const choices = nodes.filter(node => types.split(',').includes(node.type) && !excluded.includes(node.id))
+  const choices = nodes.filter(node => types.split(',').includes(node.type) && !excluded.includes(node.id) && !alreadyMentioned(node))
   return <>
     <MenuSelect label="从项目资产添加" value="" items={choices.map(node => ({ id: node.id, label: nodeName(node) }))}
       placeholder={choices.length ? '选择项目素材' : '暂无匹配素材'} disabled={disabled || busy}

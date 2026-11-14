@@ -1,6 +1,7 @@
 package studio
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -216,6 +217,20 @@ func updateNode(ctx context.Context, tx *sql.Tx, args updateNodeArgs) (editResul
 		return editResult{}, invalid("节点 content 必须是 JSON 对象")
 	}
 	preserveContentField(content, previous, "providerTaskId")
+	if len(content["promptDoc"]) > 0 && bytes.Equal(previous["promptDoc"], content["promptDoc"]) {
+		var oldPrompt, newPrompt string
+		if kind == "prompt" {
+			oldPrompt, newPrompt = nodeText(json.RawMessage(raw)), nodeText(args.Content)
+		} else {
+			_ = json.Unmarshal(previous["prompt"], &oldPrompt)
+			if json.Unmarshal(content["prompt"], &newPrompt) != nil {
+				newPrompt = oldPrompt
+			}
+		}
+		if oldPrompt != newPrompt {
+			delete(content, "promptDoc")
+		}
+	}
 	if args.ReferenceSources != nil {
 		if kind != "video" && kind != "shot" && kind != "image" {
 			return editResult{}, invalid("只有图片、视频和镜头支持在节点编辑中替换有序输入")
@@ -231,6 +246,11 @@ func updateNode(ctx context.Context, tx *sql.Tx, args updateNodeArgs) (editResul
 	if err := validateNode(NodeInput{ID: args.ID, Type: kind, Content: encoded}); err != nil {
 		return editResult{}, err
 	}
+	encoded, err = normalizePromptDoc(kind, encoded)
+	if err != nil {
+		return editResult{}, err
+	}
+
 	if args.ReferenceSources != nil {
 		if err := replaceReferences(ctx, tx, args.ID, kind, orderedSources(previous), *args.ReferenceSources); err != nil {
 			return editResult{}, err

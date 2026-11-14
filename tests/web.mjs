@@ -764,37 +764,37 @@ test('New canvas nodes are persisted and usable immediately from the picker', { 
   })
 })
 
-async function inputLayoutTest(page, textarea) {
+async function inputLayoutTest(page, input) {
   const viewport = flow(page).locator('.react-flow__viewport')
-  const draft = textarea.locator('xpath=ancestor::article[1]')
+  const draft = input.locator('xpath=ancestor::article[1]')
   const position = draft.locator('xpath=ancestor::div[contains(@class,"react-flow__node")][1]')
-  const bounds = await textarea.boundingBox()
+  const bounds = await input.boundingBox()
   assert.ok(bounds && bounds.height > 16)
   const before = await viewport.evaluate(element => element.style.transform)
   const nodeBefore = await position.evaluate(element => element.style.transform)
   const point = { x: bounds.x + Math.min(30, bounds.width / 4), y: bounds.y + 13 }
-  const target = await textarea.evaluate((element, point) => {
+  const target = await input.evaluate((element, point) => {
     const hit = document.elementFromPoint(point.x, point.y)
-    return hit === element ? '' : hit?.outerHTML.slice(0, 180) ?? 'outside viewport'
+    return element.contains(hit) ? '' : hit?.outerHTML.slice(0, 180) ?? 'outside viewport'
   }, point)
-  assert.equal(target, '', 'textarea drag starts outside the editor')
+  assert.equal(target, '', 'text drag starts outside the editor')
   await page.mouse.move(point.x, point.y)
   await page.mouse.down()
   await page.mouse.move(point.x + 46, point.y + 10, { steps: 9 })
   await page.mouse.up()
-  const selectedText = await textarea.evaluate(element => element.selectionEnd - element.selectionStart)
-  assert.ok(selectedText > 0, 'text drag did not select text')
-  await textarea.press('Control+a')
-  assert.equal(await textarea.evaluate(element => element.selectionEnd - element.selectionStart === element.value.length), true)
-  await textarea.press('Backspace')
-  assert.equal(await textarea.inputValue(), '')
+  const selectedText = () => input.evaluate(() => document.getSelection().toString())
+  assert.ok(await selectedText(), 'text drag did not select text')
+  await input.press('Control+a')
+  assert.equal(await selectedText(), await input.innerText())
+  await input.press('Backspace')
+  assert.equal(await input.textContent(), '')
   assert.equal(await draft.count(), 1, 'editing shortcut deleted the draft')
   const scrollText = Array.from({ length: 32 }, (_, i) => `第 ${i + 1} 行，滚轮只滚动节点中的长文本。`).join('\n')
-  await textarea.fill(scrollText)
-  await textarea.evaluate(element => { element.scrollTop = 0 })
+  await input.fill(scrollText)
+  await input.evaluate(element => { element.scrollTop = 0 })
   await page.mouse.move(point.x, point.y)
   await page.mouse.wheel(0, 380)
-  await poll(() => textarea.evaluate(element => element.scrollTop > 0), 'wheel did not scroll the textarea')
+  await poll(() => input.evaluate(element => element.scrollTop > 0), 'wheel did not scroll the editor')
   assert.equal(await viewport.evaluate(element => element.style.transform), before, 'text wheel/drag moved the canvas')
   assert.equal(await position.evaluate(element => element.style.transform), nodeBefore, 'text selection dragged the node')
 }
@@ -1897,7 +1897,7 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
         const node = element.closest('article')
         const cardBox = node.getBoundingClientRect()
         const canvas = element.closest('.drama-flow').getBoundingClientRect()
-        const prompt = element.querySelector('textarea[name="prompt"]')
+        const prompt = element.querySelector('[role="textbox"][aria-label="提示词"]')
         return { height: element.offsetHeight, width: element.offsetWidth, nodeWidth: node.offsetWidth,
           top: box.top, bottom: box.bottom, cardBottom: cardBox.bottom, canvasBottom: canvas.bottom,
           centerOffset: Math.abs(box.left + box.width / 2 - cardBox.left - cardBox.width / 2),
@@ -1962,7 +1962,8 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
         return element.clientHeight / Number.parseFloat(style.lineHeight)
       })
       assert.ok(promptHeight >= 2 && promptHeight <= 4, 'the prompt editor did not open at its compact height')
-      const longPrompt = Array.from({ length: 100 }, (_, index) => String(index + 1) + ' ' + prompt).join('\n')
+      const lines = Array.from({ length: 100 }, (_, index) => String(index + 1) + ' ' + prompt)
+      const longPrompt = lines.join('\n')
       const collapsedHeight = await promptBox.evaluate(element => element.offsetHeight)
       await editor.getByRole('button', { name: '展开提示词', exact: true }).click()
       const promptDialog = page.getByRole('dialog', { name: '编辑提示词', exact: true })
@@ -1974,7 +1975,7 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       await page.evaluate(text => navigator.clipboard.writeText(text), longPrompt)
       await expandedPrompt.press('Control+a')
       await expandedPrompt.press('Control+v')
-      assert.equal(await expandedPrompt.inputValue(), longPrompt)
+      assert.deepEqual(await expandedPrompt.locator('p').allTextContents(), lines)
       assert.ok(await expandedPrompt.evaluate(element => element.scrollHeight > element.clientHeight),
         'the 100-line prompt could not scroll inside the editor')
       await expandedPrompt.evaluate(element => { element.scrollTop = 0 })
@@ -1985,7 +1986,7 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       await page.keyboard.press('Escape')
       await promptDialog.waitFor({ state: 'hidden' })
       assert.equal(await promptBox.evaluate(element => element.offsetHeight), collapsedHeight)
-      assert.equal(await promptBox.inputValue(), longPrompt)
+      assert.deepEqual(await promptBox.locator('p').allTextContents(), lines)
       await poll(async () => (await query(page, ticket, { id: first.id })).nodes[0].content.prompt === longPrompt,
         'closing the full prompt dialog lost the long edit')
       assert.deepEqual(await nodeGeometry(first), zoomedGeometry, 'the prompt dialog moved the node or its handles')
@@ -1993,12 +1994,12 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       await expandedPrompt.fill(prompt)
       await poll(async () => (await query(page, ticket, { id: first.id })).nodes[0].content.prompt === prompt,
         'changing the expanded prompt did not autosave')
-      await expandedPrompt.press('End')
+      await expandedPrompt.press('Control+End')
       const inputSession = await page.context().newCDPSession(page)
       try {
         // Chromium dispatches the same composition/input events used by the OS input method.
         await inputSession.send('Input.imeSetComposition', { text: '草', selectionStart: 1, selectionEnd: 1 })
-        assert.equal(await expandedPrompt.inputValue(), prompt + '草')
+        assert.equal(await expandedPrompt.innerText(), prompt + '草')
         await delay(550)
         assert.equal((await query(page, ticket, { id: first.id })).nodes[0].content.prompt, prompt,
           'an uncommitted IME composition leaked into the saved prompt')
@@ -2010,9 +2011,29 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       }
       await promptDialog.getByRole('button', { name: '完成编辑', exact: true }).click()
       await promptDialog.waitFor({ state: 'hidden' })
-      await promptBox.press('End')
-      await promptBox.press('Backspace')
-      assert.equal(await promptBox.inputValue(), prompt)
+      await poll(() => editor.getByRole('button', { name: '展开提示词', exact: true }).evaluate(button =>
+        document.activeElement === button), 'closing the expanded prompt did not restore focus to its opener')
+      await poll(async () => (await promptBox.innerText()) === prompt + '。', 'the compact prompt did not reflect the expanded edit')
+      const promptSelection = () => promptBox.evaluate(element => {
+        const selection = document.getSelection()
+        const range = document.createRange()
+        range.selectNodeContents(element)
+        const inEditor = selection.rangeCount > 0 && element.contains(selection.focusNode)
+        if (inEditor) range.setEnd(selection.focusNode, selection.focusOffset)
+        return { focused: document.activeElement === element, collapsed: selection.isCollapsed,
+          untilCaret: inEditor ? range.toString() : null, value: element.innerText }
+      })
+      await promptBox.focus()
+      await page.keyboard.press('Control+End')
+      const beforeBackspace = await promptSelection()
+      assert.deepEqual(beforeBackspace, { focused: true, collapsed: true, untilCaret: prompt + '。', value: prompt + '。' },
+        'Control+End did not move the focused prompt editor caret to the last character')
+      await page.keyboard.press('Backspace')
+      try {
+        await poll(async () => (await promptBox.innerText()) === prompt, 'Backspace did not remove the last prompt character')
+      } catch (error) {
+        throw new Error(`${error.message}. Before ${JSON.stringify(beforeBackspace)}. After ${JSON.stringify(await promptSelection())}`)
+      }
       assert.ok(!(await query(page, ticket, { id: first.id })).nodes[0].deleted)
       const inlineBase = prompt.replace('固定中景', '固定远景')
       const insertAt = inlineBase.indexOf('固定远景')
@@ -2034,9 +2055,19 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       const inlineIME = await page.context().newCDPSession(page)
       const inlineInput = await promptBox.elementHandle()
       const assertComposition = async text => {
-        const state = await promptBox.evaluate((input, initial) => ({ value: input.value, start: input.selectionStart,
-          end: input.selectionEnd, sameInput: input === initial,
-          focusElsewhere: document.activeElement === input ? null : document.activeElement?.tagName }), inlineInput)
+        const state = await promptBox.evaluate((input, initial) => {
+          const selection = document.getSelection()
+          const textUntil = (node, offset) => {
+            if (!input.contains(node)) return -1
+            const range = document.createRange()
+            range.selectNodeContents(input)
+            range.setEnd(node, offset)
+            return range.toString().length
+          }
+          return { value: input.innerText, start: textUntil(selection.anchorNode, selection.anchorOffset),
+            end: textUntil(selection.focusNode, selection.focusOffset), sameInput: input === initial,
+            focusElsewhere: document.activeElement === input ? null : document.activeElement?.tagName }
+        }, inlineInput)
         assert.deepEqual(state, { value: withCandidate(text), start: insertAt + text.length,
           end: insertAt + text.length, sameInput: true, focusElsewhere: null })
       }
@@ -2044,7 +2075,10 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       try {
         await promptBox.fill(inlineBase)
         await poll(() => savePending, 'the committed inline edit did not reach autosave')
-        await promptBox.evaluate((input, offset) => input.setSelectionRange(offset, offset), insertAt)
+        await promptBox.evaluate((input, offset) => {
+          const text = document.createTreeWalker(input, NodeFilter.SHOW_TEXT).nextNode()
+          document.getSelection().collapse(text, offset)
+        }, insertAt)
         await inlineIME.send('Input.imeSetComposition', { text: 'yun', selectionStart: 3, selectionEnd: 3 })
         await assertComposition('yun')
         const refetch = page.waitForResponse(response => {
@@ -2410,6 +2444,353 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       await narrowDurationPopover.waitFor({ state: 'hidden' })
       await screenshot(page, 'compact-editor-narrow.png')
       console.info(`Node editor PASS: ${editorGeometry.width}×${editorGeometry.height} CSS px, prompt/IME autosave, focus/viewport, parameter popover and real PNG request`)
+    })
+  } finally {
+    await new Promise(resolve => endpoint.close(resolve))
+  }
+})
+
+test('Native prompt asset mentions survive reload and send real assets without canvas links', {
+  timeout: 90_000, skip: !hasImage || !existsSync(projectImageAsset),
+}, async () => {
+  const requests = []
+  const endpoint = createHTTPServer(async (request, response) => {
+    const chunks = []
+    for await (const chunk of request) chunks.push(chunk)
+    requests.push({ method: request.method, path: request.url, body: JSON.parse(Buffer.concat(chunks).toString()) })
+    response.writeHead(422, { 'Content-Type': 'application/json' }).end('{"error":"Local request capture"}')
+  })
+  await new Promise((resolve, reject) => endpoint.once('error', reject).listen(0, '127.0.0.1', resolve))
+  try {
+    await withWeb(async ({ page, context, records, home }) => {
+      const [record] = records
+      const providers = (action, data) => ok(page, 'providers', { action, data })
+      const configured = await providers('channel_save', { channel: {
+        name: '素材提及回环', protocol: 'custom-rest', baseUrl: 'http://127.0.0.1:' + endpoint.address().port,
+        advanced: {
+          submitUrl: '/jobs', submitMethod: 'POST', auth: 'none', fields: { references: 'input.references' },
+          taskIdPath: 'id', queryUrl: '/jobs/{taskId}', statusPath: 'status',
+          statusMap: { done: 'completed', error: 'failed' }, outputUrlPath: 'url',
+        },
+      } })
+      const [channel] = configured.channels
+      const standardName = '提及回环两图预设'
+      const limitedName = '提及回环单图预设'
+      const saveProfile = (revision, name, model, images) => providers('provider_save', { revision, profile: {
+        name, model, channelId: channel.id, modes: ['r2v'], limits: { maxReferences: images, references: { image: images } },
+      } })
+      const standard = await saveProfile(configured.revision, standardName, 'mention-r2v', 2)
+      const limited = await saveProfile(standard.revision, limitedName, 'mention-single', 1)
+      const profileId = name => limited.profiles.find(profile => profile.name === name).id
+
+      await select(page, record)
+      await open(page, record)
+      await sidebarMode(page, 'fullscreen').click()
+      let ticket = await ticketFor(page, record.sessionId)
+      const canvasImage = await pick(page, '图片', ticket, 'image')
+      const chooser = page.waitForEvent('filechooser')
+      await card(page, canvasImage.id).getByRole('button', { name: '上传图片', exact: true }).click()
+      await (await chooser).setFiles(imageAsset)
+      const canvasAssetId = await poll(async () => (await query(page, ticket, { id: canvasImage.id })).nodes[0]?.content.assetId,
+        'the canvas image upload did not save')
+      const canvasName = '画布小鸭'
+      await editDetails(page, canvasImage.id, { 节点名称: canvasName, 集: 'MENTION' })
+      await clickBlank(page)
+      await poll(async () => (await query(page, ticket, { id: canvasImage.id })).nodes[0]?.episodeId === 'MENTION',
+        'the canvas image rename and episode did not save')
+      const project = { id: randomUUID(), type: 'image', episodeId: 'LIBRARY',
+        content: { title: '项目餐厅', path: 'assets/images/mention-restaurant.png' } }
+      const projectDirectory = join(home, record.workspaceName, 'assets', 'images')
+      await mkdir(projectDirectory, { recursive: true })
+      await copyFile(projectImageAsset, join(projectDirectory, 'mention-restaurant.png'))
+      const legacy = '固定中景，人物停顿后抬起左手。'
+      const target = { id: randomUUID(), type: 'video', episodeId: 'MENTION', content: {
+        title: '素材提及验收', mode: 'r2v', profileId: profileId(standardName), prompt: legacy,
+      } }
+      await append(page, ticket, [project, target])
+      await card(page, target.id).waitFor()
+      const initial = await query(page, ticket)
+      assert.equal(initial.nodes.find(node => node.id === target.id).content.promptDoc, undefined)
+      const toolbar = panel(page).getByRole('toolbar', { name: '画布工具', exact: true })
+      await toolbar.getByRole('button', { name: '筛选', exact: true }).click()
+      await panel(page).getByRole('textbox', { name: '集', exact: true }).fill('MENTION')
+      await page.keyboard.press('Escape')
+      await card(page, project.id).waitFor({ state: 'detached' })
+      await fit(page)
+      await card(page, target.id).locator('.drama-node-titlebar').click()
+      const editor = nodeEditor(page, target.id)
+      const prompt = editor.getByRole('textbox', { name: '提示词', exact: true })
+      const savedNode = async () => (await query(page, ticket, { id: target.id })).nodes[0]
+      assert.equal(await prompt.innerText(), legacy)
+      const mentions = prompt.locator('[data-asset-mention]')
+      const mentionSlots = editor.locator('.drama-node-reference-strip [data-mention-asset-id]')
+      const assertMentionStrip = async () => {
+        await mentionSlots.nth(1).waitFor()
+        assert.deepEqual(await mentionSlots.evaluateAll(slots => slots.map(slot => slot.dataset.mentionAssetId)),
+          [canvasAssetId, project.id])
+        for (const [index, slot] of (await mentionSlots.all()).entries()) {
+          const thumb = slot.getByRole('button', { name: new RegExp('^@图片' + (index + 1) + ' · '), exact: false })
+          assert.ok(await thumb.locator('img').evaluate(async img => {
+            await img.decode()
+            return img.naturalWidth > 0
+          }), 'the inline reference strip thumbnail did not decode')
+        }
+      }
+      const candidates = page.getByRole('listbox', { name: '引用资产', exact: true })
+      const chooseAsset = async name => {
+        await candidates.getByRole('option', { name: new RegExp(name, 'u') }).click()
+        await candidates.waitFor({ state: 'hidden' })
+      }
+      await prompt.press('Control+End')
+      await page.keyboard.insertText(' 参考 ')
+      await prompt.press('@')
+      const canvasOption = candidates.getByRole('option', { name: /画布小鸭/u })
+      await canvasOption.waitFor()
+      await candidates.getByRole('option', { name: /项目餐厅/u }).waitFor()
+      await prompt.press('ArrowDown')
+      assert.notEqual(await canvasOption.getAttribute('aria-selected'), 'true')
+      await prompt.press('ArrowUp')
+      assert.equal(await canvasOption.getAttribute('aria-selected'), 'true')
+      await screenshot(page, 'prompt-asset-picker.png')
+      await prompt.press('Enter')
+      await candidates.waitFor({ state: 'hidden' })
+      await mentions.first().waitFor()
+      await page.keyboard.insertText(' 保留主体，沿用 ')
+      await prompt.press('@')
+      await candidates.waitFor()
+      await prompt.press('Escape')
+      await candidates.waitFor({ state: 'hidden' })
+      assert.equal(await prompt.evaluate(element => document.activeElement === element), true)
+      await prompt.press('Backspace')
+      await prompt.press('@')
+      await page.keyboard.insertText('项目')
+      await chooseAsset(project.content.title)
+      await page.keyboard.insertText(' 的构图。')
+
+      await poll(async () => (await savedNode()).content.promptDoc?.content?.some(block =>
+        block.content?.filter(item => item.type === 'assetMention').length === 2), 'the document did not save both asset atoms')
+      const mentionContent = (await savedNode()).content
+      const atoms = mentionContent.promptDoc.content.flatMap(block => block.content ?? [])
+        .filter(item => item.type === 'assetMention')
+      assert.deepEqual(atoms.map(({ attrs }) => [attrs.assetId, attrs.assetType, attrs.label]),
+        [[canvasAssetId, 'image', canvasName], [project.id, 'image', project.content.title]])
+      assert.equal(mentionContent.prompt, legacy + ` 参考 @${canvasName} 保留主体，沿用 @${project.content.title} 的构图。`)
+      assert.ok(!mentionContent.textList?.length)
+      assert.deepEqual(mentionContent.mixedListOrder ?? [], [])
+      assert.equal((await query(page, ticket)).edges.filter(edge => edge.target === target.id).length, 0)
+      assert.equal((await query(page, ticket, { type: 'image' })).nodes.length, 2, 'mentioning a project asset cloned it into a node')
+      await assertMentionStrip()
+
+      await prompt.press('Control+End')
+      const inputSession = await page.context().newCDPSession(page)
+      try {
+        await inputSession.send('Input.imeSetComposition', { text: 'jing', selectionStart: 4, selectionEnd: 4 })
+        assert.match(await prompt.innerText(), /jing$/u)
+        await delay(500)
+        assert.equal((await savedNode()).content.prompt, mentionContent.prompt, 'uncommitted pinyin persisted in the document')
+        await inputSession.send('Input.insertText', { text: '景。' })
+        await poll(async () => (await savedNode()).content.prompt.endsWith('景。'), 'IME commit did not append Chinese text')
+        assert.equal(await mentions.count(), 2)
+      } finally {
+        await inputSession.detach()
+      }
+      const committedPrompt = (await savedNode()).content.prompt
+      // ProseMirror groups adjacent changes for 500ms. Start a distinct clipboard undo step.
+      await delay(550)
+
+      await context.grantPermissions(['clipboard-read', 'clipboard-write'])
+      await page.evaluate(() => navigator.clipboard.writeText(' 补充：镜头停一拍。'))
+      await prompt.press('Control+v')
+      await poll(async () => (await savedNode()).content.prompt.endsWith(' 补充：镜头停一拍。'), 'paste did not preserve the new text')
+      assert.equal(await mentions.count(), 2, 'plain text paste lost asset atoms')
+      await prompt.press('Control+z')
+      await poll(async () => (await savedNode()).content.prompt === committedPrompt, 'undo did not restore the committed text before paste')
+      assert.equal(await mentions.count(), 2, 'editor undo lost asset atoms')
+
+      await prompt.focus()
+      await page.keyboard.press('Control+a')
+      await poll(() => prompt.evaluate(element => {
+        const selection = document.getSelection()
+        if (document.activeElement !== element || !selection.rangeCount || selection.isCollapsed) return false
+        return selection.getRangeAt(0).cloneContents().querySelectorAll('[data-asset-mention]').length === 2
+      }), 'Ctrl+A did not select both asset atoms')
+      await page.keyboard.press('Control+c')
+      await poll(() => page.evaluate(async expectedIds => {
+        const clipboard = await navigator.clipboard.read()
+        const entry = clipboard.find(item => item.types.includes('text/html'))
+        if (!entry) return false
+        const html = await (await entry.getType('text/html')).text()
+        const copied = new DOMParser().parseFromString(html, 'text/html')
+        const atoms = [...copied.querySelectorAll('[data-asset-mention]')]
+        return atoms.length === expectedIds.length && atoms.every((atom, i) => atom.dataset.assetId === expectedIds[i])
+      }, [canvasAssetId, project.id]), 'Ctrl+C did not serialize both asset atoms to the clipboard')
+      await page.keyboard.press('Control+End')
+      await page.keyboard.press('Control+v')
+      await poll(async () => (await savedNode()).content.promptDoc.content.flatMap(block => block.content ?? [])
+        .filter(item => item.type === 'assetMention').length === 4, 'rich paste flattened the copied asset atoms')
+      await prompt.press('Control+z')
+      await poll(async () => (await savedNode()).content.promptDoc.content.flatMap(block => block.content ?? [])
+        .filter(item => item.type === 'assetMention').length === 2, 'undo did not restore the original asset atoms after rich paste')
+      await assertMentionStrip()
+
+      await mentionSlots.first().getByRole('button', { name: '移除参考 1', exact: true }).click()
+      await poll(async () => (await savedNode()).content.prompt === committedPrompt.replace('@' + canvasName, ''),
+        'removing a mention from the strip did not remove the matching prompt atom')
+      assert.equal(await mentionSlots.count(), 1)
+      assert.equal(await mentions.count(), 1)
+      assert.deepEqual((await savedNode()).content.mixedListOrder ?? [], [])
+      assert.equal((await query(page, ticket)).edges.filter(edge => edge.target === target.id).length, 0)
+      assert.equal((await query(page, ticket, { type: 'image' })).nodes.length, 2, 'removing a mention affected the source asset')
+      await prompt.press('Control+z')
+      await poll(async () => (await savedNode()).content.prompt === committedPrompt, 'undo did not restore the removed strip reference')
+      await assertMentionStrip()
+
+      const oneAtom = mentions.locator('button').first()
+      await oneAtom.evaluate(button => {
+        const atom = button.closest('[data-asset-mention]')
+        const wrapper = atom.parentElement
+        const selection = document.getSelection()
+        wrapper.closest('[contenteditable="true"]').focus()
+        selection.collapse(wrapper, Array.from(wrapper.childNodes).indexOf(atom) + 1)
+      })
+      await prompt.press('Backspace')
+      await poll(async () => (await savedNode()).content.prompt === committedPrompt.replace('@' + canvasName, ''),
+        'Backspace did not delete the whole mention atom without changing neighboring text')
+      assert.equal(await mentions.count(), 1)
+      await prompt.press('Control+z')
+      await poll(async () => (await savedNode()).content.prompt === committedPrompt, 'undo did not restore the deleted asset mention')
+
+      const projectRename = '已重命名的餐厅门口夜景固定中景第二场次未裁切全分辨率素材20261114最终修订版本.png'
+      const beforeRename = (await savedNode()).content.promptDoc
+      const existing = (await query(page, ticket, { id: project.id })).nodes[0]
+      await operate(page, ticket, 'update_node', { id: project.id, revision: existing.revision,
+        operationId: randomUUID(), episodeId: project.episodeId, content: { ...existing.content, title: projectRename } })
+      await mentions.getByText('@' + projectRename, { exact: true }).waitFor()
+      assert.equal(await mentions.nth(1).getAttribute('data-asset-id'), project.id)
+      assert.deepEqual((await savedNode()).content.promptDoc, beforeRename)
+
+      await editor.getByRole('button', { name: '展开提示词', exact: true }).click()
+      const longEditor = page.getByRole('dialog', { name: '编辑提示词', exact: true })
+      const expandedPrompt = longEditor.getByRole('textbox', { name: '提示词', exact: true })
+      const longMention = expandedPrompt.locator('[data-asset-id="' + project.id + '"][data-asset-mention]')
+      const geometry = await longMention.evaluate(atom => {
+        const wrapper = atom.parentElement
+        const button = atom.querySelector('button').getBoundingClientRect()
+        const label = atom.querySelector('.drama-prompt-token-label')
+        const text = wrapper.nextSibling
+        const range = document.createRange()
+        range.setStart(text, 1)
+        range.setEnd(text, 2)
+        const next = range.getBoundingClientRect()
+        return { wrapperWidth: wrapper.getBoundingClientRect().width, buttonWidth: button.width,
+          labelWidth: label.clientWidth, fullLabelWidth: label.scrollWidth,
+          followingGap: next.left - button.right, textSharesLine: next.top < button.bottom && next.bottom > button.top }
+      })
+      assert.ok(geometry.fullLabelWidth > geometry.labelWidth, 'the long asset label was not truncated')
+      assert.ok(Math.abs(geometry.wrapperWidth - geometry.buttonWidth) <= 1, JSON.stringify(geometry))
+      assert.ok(geometry.textSharesLine && geometry.followingGap >= 0 && geometry.followingGap < 12, JSON.stringify(geometry))
+      await expandedPrompt.focus()
+      await expandedPrompt.press('Control+End')
+      await longMention.evaluate(atom => {
+        const wrapper = atom.parentElement
+        const paragraph = wrapper.parentElement
+        document.getSelection().collapse(paragraph, Array.from(paragraph.childNodes).indexOf(wrapper) + 1)
+      })
+      await page.keyboard.insertText('紧邻引用')
+      await poll(async () => (await savedNode()).content.prompt === committedPrompt.replace(' 的构图。', '紧邻引用 的构图。'),
+        'typing beside the long mention changed the reference or inserted text at the wrong position')
+      await expandedPrompt.press('Control+z')
+      await poll(async () => (await savedNode()).content.prompt === committedPrompt, 'undo beside the long mention did not restore the text')
+      await longEditor.getByRole('button', { name: '完成编辑', exact: true }).click()
+      await longEditor.waitFor({ state: 'hidden' })
+
+      const model = editor.getByRole('button', { name: '生成预设', exact: true })
+      const chooseProfile = async name => {
+        await model.click()
+        await page.getByRole('menuitem', { name, exact: true }).click()
+        await poll(async () => (await savedNode()).content.profileId === profileId(name), 'the model change did not persist')
+      }
+      await chooseProfile(limitedName)
+      const generate = editor.getByRole('button', { name: '生成…', exact: true })
+      await poll(() => generate.isDisabled(), 'a model allowing one image accepted two asset mentions')
+      await editor.getByRole('status').filter({ hasText: /上限|最多|不支持/u }).waitFor()
+      assert.equal(await mentions.count(), 2, 'changing models silently removed incompatible mentions')
+      const blocked = await request(page, 'operation', { ticket, action: 'generateR2V', data: {
+        nodeId: target.id, profileId: profileId(limitedName), confirmed: true, operationId: randomUUID(),
+      } })
+      assert.equal(blocked.status, 400, blocked.body.error)
+      assert.match(blocked.body.error, /上限|最多|不支持/u)
+      await chooseProfile(standardName)
+
+      const saved = (await savedNode()).content
+      await page.reload({ waitUntil: 'domcontentloaded' })
+      await panel(page).and(page.locator(`[data-session-id="${record.sessionId}"][data-canvas-id]`)).waitFor()
+      ticket = await ticketFor(page, record.sessionId)
+      assert.deepEqual((await savedNode()).content, saved)
+      await fit(page)
+      await card(page, target.id).locator('.drama-node-titlebar').click()
+      await mentions.nth(1).waitFor()
+      assert.equal(await mentions.count(), 2)
+      await assertMentionStrip()
+      assert.equal(requests.length, 0, 'editing mentions unexpectedly called the model')
+      assert.equal((await operate(page, ticket, 'tasks', {})).tasks.length, 0)
+      const panelOverflow = await editor.evaluate(form => {
+        const bounds = form.parentElement.getBoundingClientRect()
+        return Object.fromEntries(['.drama-prompt-input', '.drama-node-creative-controls',
+          '.drama-node-reference-strip', '.drama-node-generate'].map(selector => [selector,
+          Math.max(0, form.querySelector(selector).getBoundingClientRect().right - bounds.right)]))
+      })
+      assert.ok(Object.values(panelOverflow).every(overflow => overflow <= 1), JSON.stringify(panelOverflow))
+      await screenshot(page, 'prompt-asset-mentions.png')
+      await mentions.nth(1).getByRole('button', { name: '@' + projectRename, exact: true }).click()
+      const details = page.getByRole('dialog', { name: '引用素材详情', exact: true })
+      await details.getByText(projectRename, { exact: true }).waitFor()
+      await details.getByRole('button', { name: '预览素材', exact: true }).click()
+      const preview = page.getByRole('dialog', { name: projectRename, exact: true })
+      assert.ok(await preview.getByRole('img', { name: projectRename, exact: true }).evaluate(async image => {
+        await image.decode()
+        return image.naturalWidth > 0
+      }))
+      await preview.getByRole('button', { name: '关闭预览', exact: true }).click()
+      await preview.waitFor({ state: 'hidden' })
+      await generate.click()
+      await page.getByRole('dialog', { name: '确认生成', exact: true })
+        .getByRole('button', { name: '确认提交', exact: true }).click()
+      const outgoing = await poll(() => requests[0], 'the worker did not call the configured endpoint with mentions')
+      assert.deepEqual([outgoing.method, outgoing.path], ['POST', '/jobs'])
+      assert.equal(outgoing.body.model, 'mention-r2v')
+      assert.equal(outgoing.body.prompt, legacy + ' 参考 @图片1 保留主体，沿用 @图片2 的构图。景。')
+      const references = outgoing.body.input.references
+      assert.deepEqual(references.map(ref => ref.type), ['image', 'image'])
+      const files = await Promise.all([imageAsset, projectImageAsset].map(file => readFile(file)))
+      for (const [index, ref] of references.entries()) {
+        assert.match(ref.url, /^data:image\/png;base64,/u)
+        assert.deepEqual(Buffer.from(ref.url.split(',')[1], 'base64'), files[index])
+      }
+      assert.equal((await query(page, ticket)).edges.filter(edge => edge.target === target.id).length, 0)
+      await poll(async () => (await operate(page, ticket, 'tasks', {})).tasks.some(task =>
+        task.nodeId === target.id && task.status === 'failed'), 'the local capture rejection did not settle')
+      assert.equal(requests.length, 1)
+
+      const mediaPath = join(projectDirectory, 'mention-restaurant.png')
+      const missingPath = join(projectDirectory, 'mention-restaurant-offline.png')
+      await rename(mediaPath, missingPath)
+      try {
+        await page.reload({ waitUntil: 'domcontentloaded' })
+        await panel(page).and(page.locator(`[data-session-id="${record.sessionId}"][data-canvas-id]`)).waitFor()
+        ticket = await ticketFor(page, record.sessionId)
+        await fit(page)
+        await card(page, target.id).locator('.drama-node-titlebar').click()
+        await mentions.nth(1).getByRole('button').waitFor()
+        assert.match(await mentions.nth(1).getByRole('button').getAttribute('title'), /失效/u)
+        await editor.getByRole('status').filter({ hasText: /找不到引用素材/u }).waitFor()
+        assert.ok(await editor.getByRole('button', { name: '重新生成…', exact: true }).isDisabled())
+        assert.deepEqual((await savedNode()).content.promptDoc, saved.promptDoc)
+        assert.equal(requests.length, 1, 'a reference without its local file reached the endpoint')
+        await screenshot(page, 'prompt-asset-missing.png')
+      } finally {
+        await rename(missingPath, mediaPath)
+      }
     })
   } finally {
     await new Promise(resolve => endpoint.close(resolve))
