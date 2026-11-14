@@ -1180,7 +1180,7 @@ export function CanvasViewport({
     {assetPicker && <AssetPicker type={assetPicker.type} queryCanvas={queryCanvas} mediaURL={mediaURL}
       close={() => setAssetPicker(null)} choose={pickAsset} />}
     {preview && <Modal open onClose={() => setPreview(null)} title={nodeTitle(preview) || nodeLabels[preview.type]}
-      closeLabel="关闭预览" contentClassName="drama-v2-preview-modal">
+      closeLabel="关闭预览" className={preview.type === 'audio' ? undefined : 'drama-v2-preview-modal'}>
       <div className="drama-v2-preview">
         {preview.type === 'image' && <img src={mediaURL(preview)} alt={nodeTitle(preview) || '图片预览'} />}
         {preview.type === 'video' && <video controls playsInline preload="metadata" src={mediaURL(preview)} aria-label="视频预览" />}

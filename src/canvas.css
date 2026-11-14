@@ -171,9 +171,20 @@
 .drama-canvas-content .drama-edge-version .react-flow__edge-path { stroke-dasharray: 5 4; }
 .drama-canvas-content .react-flow__edge-text { fill: var(--drama-muted); }
 .drama-canvas-content .react-flow__edge-textbg { fill: var(--drama-fill); }
-.drama-v2-preview-modal { width: min(740px, calc(100vw - 48px)); }
+.drama-v2-preview-modal[role='dialog'] {
+  width: min(1040px, 100%);
+  max-height: 100%;
+  overflow: auto;
+}
+.drama-v2-preview-modal h2 {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .drama-v2-preview {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   place-items: center;
   background: var(--dsw-alias-bg-module-platform);
   border-radius: var(--dsw-radius-md);
@@ -209,6 +220,6 @@
 .drama-v2-preview :is(img, video) {
   display: block;
   max-inline-size: 100%;
-  max-block-size: 66dvh;
+  max-block-size: min(74dvh, max(1px, calc(100dvh - 128px - 2 * max(24px, var(--dsh-frame-overlay-top, 24px)))));
   object-fit: contain;
 }

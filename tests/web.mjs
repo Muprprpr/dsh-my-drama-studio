@@ -960,6 +960,27 @@ async function decodeVideoFrame(player) {
   })
 }
 
+async function assertUncroppedPreview(image) {
+  const geometry = await image.evaluate(async img => {
+    await img.decode()
+    const frame = img.parentElement.getBoundingClientRect()
+    const modal = img.closest('[role="dialog"]').getBoundingClientRect()
+    const box = img.getBoundingClientRect()
+    const fit = getComputedStyle(img).objectFit
+    const fitsInside = (inner, outer) => inner.left >= outer.left - 1 && inner.right <= outer.right + 1 &&
+      inner.top >= outer.top - 1 && inner.bottom <= outer.bottom + 1
+    const viewport = { left: 0, top: 0, right: document.documentElement.clientWidth, bottom: document.documentElement.clientHeight }
+    return { naturalWidth: img.naturalWidth, naturalHeight: img.naturalHeight, width: box.width, height: box.height,
+      fit, contained: fitsInside(box, frame) && fitsInside(box, modal) && fitsInside(box, viewport) }
+  })
+  const { naturalWidth, naturalHeight, width, height, fit, contained } = geometry
+  assert.ok(naturalWidth > 100 && naturalHeight > 100 && width > 100 && height > 100, JSON.stringify(geometry))
+  assert.ok(contained, 'the preview image overflows its media panel or viewport: ' + JSON.stringify(geometry))
+  assert.ok(fit === 'contain' || fit === 'scale-down' || Math.abs(width / height - naturalWidth / naturalHeight) <= .01,
+    'the preview can crop or distort the image aspect ratio: ' + JSON.stringify(geometry))
+  return geometry
+}
+
 async function addExistingMedia(page, ticket, workspace) {
   const imageId = randomUUID()
   const videoId = randomUUID()
@@ -1093,9 +1114,47 @@ test('U2 U3 U5 new nodes, derived drafts, shared Sessions, media and native them
       assert.ok(await image.evaluate(async element => { await element.decode(); return element.naturalWidth > 100 }))
       await screenshot(page, '25-after-image-card.png')
       await card(page, imageId).getByRole('button', { name: '查看大图', exact: true }).click()
-      await page.getByRole('dialog').last().locator('img').waitFor()
+      const preview = page.getByRole('dialog', { name: '黄色毛绒小鸭', exact: true })
+      const previewImage = preview.getByRole('img', { name: '黄色毛绒小鸭', exact: true })
+      const wide = await assertUncroppedPreview(previewImage)
       await screenshot(page, '26-after-image-preview.png')
-      await page.getByRole('button', { name: '关闭预览', exact: true }).click()
+      const viewport = page.viewportSize()
+      try {
+        await page.setViewportSize({ width: 560, height: 780 })
+        const narrow = await assertUncroppedPreview(previewImage)
+        assert.ok(narrow.width < wide.width && narrow.naturalWidth === wide.naturalWidth,
+          'the same full image did not fit down to a narrower window')
+        await screenshot(page, '26-after-image-preview-narrow.png')
+      } finally {
+        await page.setViewportSize(viewport)
+      }
+      await preview.getByRole('button', { name: '关闭预览', exact: true }).click()
+
+      const portrait = await image.evaluate(async source => {
+        await source.decode()
+        const rotated = document.createElement('canvas')
+        rotated.width = Math.min(720, source.naturalHeight)
+        const scale = rotated.width / source.naturalHeight
+        rotated.height = Math.round(source.naturalWidth * scale)
+        const context = rotated.getContext('2d')
+        context.translate(rotated.width, 0)
+        context.rotate(Math.PI / 2)
+        context.drawImage(source, 0, 0, rotated.height, rotated.width)
+        return rotated.toDataURL('image/png').split(',')[1]
+      })
+      const portraitNode = { id: randomUUID(), type: 'image',
+        content: { title: '竖版图片预览验收', path: 'assets/images/portrait-preview.png' } }
+      await writeFile(join(home, a.workspaceName, portraitNode.content.path), Buffer.from(portrait, 'base64'))
+      await append(page, first, [portraitNode])
+      await card(page, portraitNode.id).waitFor()
+      await fit(page)
+      await card(page, portraitNode.id).getByRole('button', { name: '查看大图', exact: true }).click()
+      const portraitPreview = page.getByRole('dialog', { name: portraitNode.content.title, exact: true })
+      const tall = await assertUncroppedPreview(portraitPreview.getByRole('img', { name: portraitNode.content.title, exact: true }))
+      assert.ok(tall.naturalHeight > tall.naturalWidth && Math.abs(tall.naturalHeight / tall.naturalWidth -
+        wide.naturalWidth / wide.naturalHeight) <= .01, 'the fixture did not produce a portrait image')
+      await screenshot(page, '26-after-image-preview-portrait.png')
+      await portraitPreview.getByRole('button', { name: '关闭预览', exact: true }).click()
     } else console.info('MEDIA DATA BLOCKED: set DRAMA_UIUX_IMAGE to a real workspace image')
     if (hasVideo) {
       const videoCard = card(page, videoId)
@@ -2747,10 +2806,7 @@ test('Native prompt asset mentions survive reload and send real assets without c
       await details.getByText(projectRename, { exact: true }).waitFor()
       await details.getByRole('button', { name: '预览素材', exact: true }).click()
       const preview = page.getByRole('dialog', { name: projectRename, exact: true })
-      assert.ok(await preview.getByRole('img', { name: projectRename, exact: true }).evaluate(async image => {
-        await image.decode()
-        return image.naturalWidth > 0
-      }))
+      await assertUncroppedPreview(preview.getByRole('img', { name: projectRename, exact: true }))
       await preview.getByRole('button', { name: '关闭预览', exact: true }).click()
       await preview.waitFor({ state: 'hidden' })
       await generate.click()
