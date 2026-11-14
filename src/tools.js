@@ -22,7 +22,7 @@ const append = {
   edges: { type: 'array', items: edge },
 }
 
-export function registerTools(ctx, workspaceFor, kernel, keys, protectNodes) {
+export function registerTools(ctx, workspaceFor, kernel, keys) {
   for (const [action, description, parameters] of [
     ['context', 'Read the current native Session, its Workspace Canvas binding and generation permission.', object({})],
     ['query', 'Read shared creative nodes and references for this Session’s Canvas. Filter by shot, type or source Session.', object(query)],
@@ -43,20 +43,7 @@ export function registerTools(ctx, workspaceFor, kernel, keys, protectNodes) {
         const sessionId = exec.agent?.session.id
         if (!sessionId) throw new StudioError(403, 'A native DSH Agent Session is required')
         const workspace = await workspaceFor(ctx, sessionId)
-        if (action === 'query' || action === 'submit') protectNodes(exec.agent, [data.id, data.nodeId])
-        if (action === 'append') protectNodes(exec.agent, [
-          ...(data.nodes ?? []).flatMap(item => [item.id, item.basedOn]),
-          ...(data.edges ?? []).flatMap(item => [item.source, item.target]),
-        ])
         const result = await kernel(sessionId, workspace, action, data, exec.signal)
-        if (action === 'query') protectNodes(exec.agent, [
-          ...result.nodes.flatMap(item => [item.id, item.basedOn]),
-          ...(result.referenceNodes ?? []).map(item => item.id),
-          ...result.edges.flatMap(item => [item.source, item.target]),
-          ...Object.values(result.resolvedMedia ?? {}).map(item => item.id),
-          ...Object.values(result.mentionedAssets ?? {}).map(item => item.id),
-        ])
-        if (action === 'append') protectNodes(exec.agent, result.ids ?? [])
         return action === 'context' ? { ...result, workspacePath: workspace.path } : result
       },
     })

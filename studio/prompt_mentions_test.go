@@ -17,7 +17,7 @@ func TestPromptMentionsJoinGenerationSnapshotWithoutGraphMutation(t *testing.T) 
 	s := New(providerFixture{})
 	defer s.Close()
 	bindSession(t, s, dir, "a")
-	s.SetHumanWriteCheck(func(context.Context, string, string, []string, []string) (bool, error) { return true, nil })
+	s.SetHumanWriteCheck(func(context.Context, string, string, []string) (bool, error) { return true, nil })
 	frame, audio, draft := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	assetID := uuid.NewString() + ".png"
 	imagePath := "assets/images/" + assetID

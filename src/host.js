@@ -80,29 +80,14 @@ const browserActions = new Set(['context', 'bind', 'disconnect', 'query', 'appen
 
 export async function apply(ctx, config) {
   const activity = new EventEmitter().setMaxListeners(0)
-  const agentDependencies = new Map()
   function workspaceActivity(sessionIds, connected) {
     const members = new Set(sessionIds)
-    const active = connected.filter(id => members.has(id) && ctx.agents.get(id)?.status === 'running')
-    const agentLockedNodeIds = [...new Set(active.flatMap(id => [...(agentDependencies.get(id) ?? [])]))].sort()
-    return { aiRunning: active.length > 0, agentLockedNodeIds }
+    return { aiRunning: connected.some(id => members.has(id) && ctx.agents.get(id)?.status === 'running') }
   }
 
-  function checkHumanWrite(workspaceId, sessionId, connected, nodeIds) {
+  function checkHumanWrite(workspaceId, sessionId, connected) {
     const members = ctx.workspaceRegistry.get(workspaceId)?.sessionIds
-    if (!members?.includes(sessionId)) return false
-    const { agentLockedNodeIds } = workspaceActivity(members, connected)
-    const protectedIds = new Set(agentLockedNodeIds)
-    return Array.isArray(nodeIds) && nodeIds.every(id => !protectedIds.has(id))
-  }
-
-  function protectNodes(agent, ids) {
-    if (ctx.agents.get(agent.id) !== agent || agent.status !== 'running') return
-    const current = agentDependencies.get(agent.id) ?? new Set()
-    const count = current.size
-    for (const id of ids) if (typeof id === 'string' && id) current.add(id)
-    agentDependencies.set(agent.id, current)
-    if (count !== current.size) activity.emit('change', agent.id)
+    return Boolean(members?.includes(sessionId)) && !workspaceActivity(members, connected).aiRunning
   }
 
   const kernel = await startKernel(ctx, checkHumanWrite)
@@ -110,14 +95,8 @@ export async function apply(ctx, config) {
   const signingKey = randomBytes(32)
   const lifetime = new AbortController()
   ctx.effect(() => () => lifetime.abort())
-  ctx.on('agent/status', ({ agent, status }) => {
-    if (status === 'idle') agentDependencies.delete(agent.id)
-    activity.emit('change', agent.id)
-  })
-  ctx.on('agent/disposed', ({ agent }) => {
-    agentDependencies.delete(agent.id)
-    activity.emit('change', agent.id)
-  })
+  ctx.on('agent/status', ({ agent }) => activity.emit('change', agent.id))
+  ctx.on('agent/disposed', ({ agent }) => activity.emit('change', agent.id))
 
   async function connectedSessions(sessionId, workspace, signal) {
     return (await kernel(sessionId, workspace, 'connected_sessions', {}, signal)).sessionIds
@@ -269,7 +248,7 @@ export async function apply(ctx, config) {
     return streamMedia(req, res, workspace.path, node?.type, node?.content.path)
   }, 'GET')
 
-  registerTools(ctx, workspaceFor, kernel, keys, protectNodes)
+  registerTools(ctx, workspaceFor, kernel, keys)
   void recoverWorkspaces(ctx, kernel, lifetime.signal)
   console.info('[my-drama-studio] My Drama Studio Host loaded')
 }

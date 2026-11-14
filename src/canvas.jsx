@@ -20,6 +20,7 @@ const minZoom = 0.15
 const maxZoom = 2
 const focusDuration = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 280
 const clipboardType = 'web application/x-dsh-drama-nodes+json'
+const activityLock = 'AI 工作中，结束后可编辑。'
 const edgeId = ({ source, target }) => JSON.stringify([source, target])
 const inEditor = event => event.target instanceof Element &&
   Boolean(event.target.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"]'))
@@ -77,7 +78,7 @@ function usePositions(key) {
 }
 
 export function CanvasViewport({
-  snapshot, filters, setFilters, append, mutate, agentLockedNodeIds = [], mediaURL, uploadFile,
+  snapshot, filters, setFilters, append, mutate, aiRunning, mediaURL, uploadFile,
   submitGeneration, changeTask, queryCanvas, generationProfiles = [], generationDefaults,
 }) {
   const { nodes, edges, hasMore, status, tasks = [], referenceNodes = [], lockedNodeIds = [] } = snapshot
@@ -124,9 +125,10 @@ export function CanvasViewport({
   const index = useMemo(() => new Map([...referenceNodes, ...nodes].map(node => [node.id, node])), [nodes, referenceNodes])
   const resolvedMedia = useMemo(() => new Map(Object.entries(snapshot.resolvedMedia ?? {})), [snapshot.resolvedMedia])
   const mentionedAssets = snapshot.mentionedAssets
-  const locked = new Set([...agentLockedNodeIds, ...lockedNodeIds])
+  const locked = new Set(lockedNodeIds)
   latestLocks.current = locked
-  const lockReason = id => locked.has(id) ? '执行中使用的节点，结束后可编辑。' : ''
+  const taskLockReason = id => locked.has(id) ? '执行中使用的节点，结束后可编辑。' : ''
+  const lockReason = id => aiRunning && !id.startsWith('draft-') ? activityLock : taskLockReason(id)
   const taskIndex = useMemo(() => {
     const map = new Map()
     for (const task of tasks) {
@@ -214,7 +216,9 @@ export function CanvasViewport({
       ariaLabel: nodeTitle(node) || nodeLabels[node.type],
       data: {
         node, compact: compact.includes(node.id), isFocused: editorFocus?.id === node.id,
-        actions: node.deleted ? { preview: setPreview, locate } : { ...actions, mutationReason: lockReason(node.id) },
+        actions: node.deleted ? { preview: setPreview, locate } : {
+          ...actions, mutationReason: lockReason(node.id), taskLockReason: taskLockReason(node.id),
+        },
         draft, editor: draft && editorFor(draft), rename: rename?.id === node.id ? rename.token : undefined,
         referenceFocus: referenceFocus?.id === node.id ? referenceFocus.token : undefined,
         index, edges, resolvedMedia, mentionedAssets, mediaURL, generationProfiles, generationDefaults,
@@ -368,6 +372,7 @@ export function CanvasViewport({
   }
 
   function renameNode(id) {
+    if (lockReason(id)) return
     selectNode(id)
     setRename({ id, token: crypto.randomUUID() })
   }
@@ -448,6 +453,7 @@ export function CanvasViewport({
   }
 
   async function stepHistory(redo) {
+    if (aiRunning) { setEdgeError(activityLock); return }
     const from = redo ? history.current.redo : history.current.undo
     const to = redo ? history.current.undo : history.current.redo
     const command = from.at(-1)
@@ -531,8 +537,11 @@ export function CanvasViewport({
 
   async function pickAsset(asset) {
     await runCanvas(async () => {
-      if (assetPicker.node) await assignAsset(assetPicker.node, asset.content)
-      else await createAssetNode(asset, assetPicker.at, true)
+      if (assetPicker.node) {
+        const issue = lockReason(assetPicker.node.id)
+        if (issue) throw new Error(issue)
+        await assignAsset(assetPicker.node, asset.content)
+      } else await createAssetNode(asset, assetPicker.at, true)
       setAssetPicker(null)
     })
   }
@@ -592,6 +601,12 @@ export function CanvasViewport({
   function choosePreset(preset) {
     const { at, seed } = picker
     setPicker(null)
+    if (aiRunning) {
+      const initial = seed && preset.type === 'video' && preset.mode === ''
+        ? { ...preset, mode: defaultVideoInputMode(seed.type) } : preset
+      openEditor({ preset: initial, seed, group: groupFor(seed, filters), at })
+      return
+    }
     void runCanvas(async () => {
       const id = crypto.randomUUID()
       const { type, mode } = preset
@@ -623,7 +638,7 @@ export function CanvasViewport({
     const from = index.get(source)
     const to = index.get(target)
     if (!from || !to || from.deleted || to.deleted || source === target) return { error: '请选择另一个可用节点' }
-    if (lockReason(target)) return { error: lockReason(target) }
+    if (taskLockReason(target)) return { error: taskLockReason(target) }
     if (edges.some(edge => edge.source === source && edge.target === target) || referenceIds(to).includes(source)) {
       return { error: '此来源已连接' }
     }
@@ -638,7 +653,10 @@ export function CanvasViewport({
       if (!mediaTypes.has(from.type)) return { error: '视频节点只接受图片、视频或音频输入' }
       const mode = videoMode(to)
       if (mode === 'asset') return { error: '请先为视频节点选择生成方式' }
+      // A draft with no saved mode can accept media without changing its settings.
+      if (aiRunning && !to.content.mode) return { to, ordered, content }
       const nextMode = !mode || mode === 't2v' ? defaultVideoInputMode(from.type) : mode
+      if (aiRunning && nextMode !== mode) return { error: '此连线需要修改视频生成方式，AI 结束后可操作。' }
       const profile = resolveProfile(profileCandidates(generationProfiles, nextMode), nextMode === mode ? content.profileId : undefined)
       const count = kind => kinds.filter(item => item === kind).length
       if (kinds.length > (profile?.limits?.maxReferences || 32) ||
@@ -670,7 +688,7 @@ export function CanvasViewport({
     if (error) { setEdgeError(error); return }
     await runCanvas(async () => {
       pinLayout()
-      if (mutableSources(to)) {
+      if (!aiRunning && mutableSources(to)) {
         await editWithHistory('update_node', { id: target, revision: to.revision, ...groupOf(to),
           content, referenceSources: ordered })
       } else {
@@ -799,7 +817,7 @@ export function CanvasViewport({
   }
 
   function arrange() {
-    if (!ordered.length) return
+    if (aiRunning || !ordered.length) return
     const measured = ordered.map(node => {
       const size = flow.current?.getNode(node.id)?.measured
       const estimate = dimensions(node)
@@ -1093,7 +1111,7 @@ export function CanvasViewport({
       </div>}
       <CanvasToolbar filters={filters} update={filter} filterGroup={setFilters} groups={groups} collapsed={collapsed}
         toggleGroup={group => setCollapsed(current => current.includes(group) ? current.filter(id => id !== group) : [...current, group])}
-        fit={fitCanvas} arrange={arrange} add={() => openPicker()} setAddAnchor={addAnchor}
+        fit={fitCanvas} arrange={arrange} arrangeDisabled={Boolean(aiRunning)} add={() => openPicker()} setAddAnchor={addAnchor}
         chooseAsset={() => setAssetPicker({})}
         tasksOpen={tasksOpen} toggleTasks={() => setTasksOpen(value => !value)} activeTasks={tasks.filter(taskActive).length} />
       <CanvasCorners showMap={showMap} toggleMap={() => setShowMap(value => !value)} boxSelect={boxSelect}
@@ -1126,7 +1144,7 @@ export function CanvasViewport({
         items={[
           ...(lockReason(contextNode.id) ? [{ id: 'activity', type: 'label', text: lockReason(contextNode.id) }] : []),
           { id: 'rename', label: '重命名', disabled: Boolean(lockReason(contextNode.id)) },
-          { id: 'edit', label: '编辑节点' },
+          { id: 'edit', label: lockReason(contextNode.id) ? '查看节点' : '编辑节点' },
           { id: 'delete', label: '删除节点 · Delete', disabled: Boolean(lockReason(contextNode.id)), danger: true },
           { id: 'copy', label: '复制 · Ctrl+C' }, { id: 'duplicate', label: '复制为新节点 · Ctrl+D' },
           { id: 'references', label: '添加参考素材', disabled: Boolean(lockReason(contextNode.id)) ||
@@ -1178,6 +1196,7 @@ export function CanvasViewport({
       </div>
     </Modal>}
     {assetPicker && <AssetPicker type={assetPicker.type} queryCanvas={queryCanvas} mediaURL={mediaURL}
+      disabled={Boolean(assetPicker.node && lockReason(assetPicker.node.id))}
       close={() => setAssetPicker(null)} choose={pickAsset} />}
     {preview && <Modal open onClose={() => setPreview(null)} title={nodeTitle(preview) || nodeLabels[preview.type]}
       closeLabel="关闭预览" className={preview.type === 'audio' ? undefined : 'drama-v2-preview-modal'}>
@@ -1190,7 +1209,7 @@ export function CanvasViewport({
   </div>
 }
 
-function AssetPicker({ type, queryCanvas, mediaURL, close, choose }) {
+function AssetPicker({ type, queryCanvas, mediaURL, close, choose, disabled }) {
   const [query, setQuery] = useState('')
   const [offset, setOffset] = useState(0)
   const [page, setPage] = useState(null)
@@ -1210,7 +1229,7 @@ function AssetPicker({ type, queryCanvas, mediaURL, close, choose }) {
         onChange={event => { setQuery(event.target.value); setOffset(0); setPage(null) }} />
       {error && <p role="alert">{error}</p>}
       {page ? <div className="drama-v2-asset-list">{page.nodes.filter(isMedia).map(node => <button type="button"
-        key={node.id} className="drama-v2-asset-option" onClick={() => choose(node)}>
+        key={node.id} className="drama-v2-asset-option" disabled={disabled} onClick={() => choose(node)}>
         {node.type === 'image' && <img alt="" src={mediaURL(node)} loading="lazy" />}
         {node.type === 'video' && <video src={mediaURL(node)} muted playsInline preload="metadata" aria-hidden="true" />}
         <span>{nodeTitle(node) || node.content.path || nodeLabels[node.type]}</span>

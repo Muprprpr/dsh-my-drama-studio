@@ -207,7 +207,7 @@ function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
     const controller = new AbortController()
     subscribe(ticket, session.status.eventSeq, controller.signal, batch => {
       if (typeof batch.aiRunning === 'boolean') {
-        setActivity({ ticket, running: batch.aiRunning, nodeIds: batch.agentLockedNodeIds ?? [] })
+        setActivity({ ticket, running: batch.aiRunning })
         return
       }
       if (!batch.events.length || batch.events.some(event => event.type === 'binding' || event.type === 'permission')) {
@@ -272,7 +272,6 @@ function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
     ? view?.result : null
   const status = snapshot?.status ?? session?.status
   const aiRunning = activity?.ticket === ticket ? activity?.running : status?.aiRunning
-  const agentLockedNodeIds = activity && activity.ticket === ticket ? activity.nodeIds : status?.agentLockedNodeIds
   const issue = error || sessionError
   return <section className="drama-shell" data-testid="drama-canvas" data-session-id={sessionId}
     data-workspace-id={session?.status.workspaceId} data-canvas-id={session?.status.canvasId ?? undefined}>
@@ -285,11 +284,11 @@ function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
         <StateDot state="done" size={7} />{status.connectedSessions} 个会话
       </span>}
       {connected && aiRunning === true && <span className="drama-shell-connected drama-shell-activity"
-        role="status" title="正在保护本轮使用的节点和依赖">AI 工作中</span>}
+        role="status" title="可以查看和新增节点或连线。AI 结束后可以修改或删除已有内容。">AI 工作中</span>}
     </header>
     <div className="drama-shell-body">
       {connected && snapshot ? <CanvasViewport key={status.canvasId + ':' + sessionId} snapshot={snapshot} filters={filters}
-        setFilters={setFilters} append={append} mutate={mutate} agentLockedNodeIds={agentLockedNodeIds}
+        setFilters={setFilters} append={append} mutate={mutate} aiRunning={aiRunning}
         uploadFile={(type, file) => uploadMedia(ticket, type, file)}
         mediaURL={node => mediaURL(ticket, node)}
         generationProfiles={providerData?.profiles ?? []} generationDefaults={providerData?.generation}

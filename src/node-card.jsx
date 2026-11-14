@@ -68,13 +68,13 @@ function MenuSelect({ label, value, items, onChange, disabled = false, placehold
   const id = useId()
   return <div className="drama-node-field">
     {!compact && <label id={id}>{label}</label>}
-    <Menu open={open} portal compact autoFocus minWidthFromAnchor selectedId={value}
+    <Menu open={open && !disabled} portal compact autoFocus minWidthFromAnchor selectedId={value}
       onClose={() => setOpen(false)}
-      onSelect={id => { onChange(id); setOpen(false) }}
+      onSelect={id => { if (!disabled) onChange(id); setOpen(false) }}
       items={items}
       anchor={<Button size="sm" className="drama-node-select" aria-label={compact ? label : undefined}
         aria-labelledby={compact ? undefined : id}
-        aria-haspopup="menu" aria-expanded={open} disabled={disabled || items.length === 0}
+        aria-haspopup="menu" aria-expanded={open && !disabled} disabled={disabled || items.length === 0}
         onClick={() => setOpen(current => !current)}>
         <span title={selected?.title ?? selected?.label}>{selected?.label ?? placeholder}</span>
         <IconChevronDownOutlineRegular size={14} />
@@ -356,7 +356,7 @@ export function GraphNode({ data, selected }) {
     data-drama-draft={draft && !draft.edit ? 'true' : undefined}
     data-drama-editing={draft?.edit ? 'true' : undefined}>
     {saved && <Handle className="drama-port drama-port-input" type="target" id="in" position={Position.Left}
-      isConnectable={!node.deleted && mode !== 'asset' && !locked}
+      isConnectable={!node.deleted && mode !== 'asset' && !actions.taskLockReason}
       aria-label={generationNode ? '生成参考输入' : '节点引用输入'} />}
     {saved && <Handle className="drama-lineage-port" type="target" id="lineage" position={Position.Left}
       isConnectable={false} aria-hidden="true" />}
@@ -750,7 +750,7 @@ function NodeEditor({
     issue,
     !savedProfile?.configured && '请选择已配置的生成预设。',
   ].find(Boolean)
-  const unavailable = mutationReason || (promptComposing && '请先完成提示词输入。') ||
+  const unavailable = actions.taskLockReason || (promptComposing && '请先完成提示词输入。') ||
     (saving && '正在保存修改。') ||
     (dirty && (compact ? error || '正在保存修改。' : '请先保存修改。')) || generationIssue
   const blocked = Boolean(edit && mutationReason)
@@ -889,7 +889,9 @@ function NodeEditor({
         revision.current = result.revision
       } else {
         const edges = new Set(ordered)
-        if (!supportsRefs && textTypes.has(type) && seed?.id && seed.id !== base?.id) edges.add(seed.id)
+        if (seed && seed.id !== base?.id && (type === 'shot' ? !seeded : !supportsRefs && textTypes.has(type))) {
+          edges.add(seed.id)
+        }
         await append({ nodes: [{ id, type, basedOn: base?.id, content: next, ...fields }],
           edges: [...edges].map(source => ({ source, target: id })) })
       }
@@ -1042,7 +1044,7 @@ function NodeEditor({
               {parameters.map(param => param.fixed
                 ? <span className="drama-focus-param-chip is-fixed" key={param.key} title={param.label}>{param.summary}</span>
                 : <NodeParameterPopover key={param.key} label={param.label} value={param.summary} disabled={blocked}
-                  open={openParameter === param.key} onToggle={() => setOpenParameter(current => current === param.key ? '' : param.key)}
+                  open={!blocked && openParameter === param.key} onToggle={() => setOpenParameter(current => current === param.key ? '' : param.key)}
                   onClose={() => setOpenParameter(current => current === param.key ? '' : current)}>
                   {param.numeric ? <DurationControl param={param} update={next => updateParam(param.key, next)} />
                     : param.options.length ? <div className="drama-param-options" role="group" aria-label={param.label}>
@@ -1130,7 +1132,7 @@ function NodeEditor({
     <div className="drama-node-editor-fields">
       <fieldset className="drama-node-settings" disabled={blocked || saving}>
         {!edit && <label className="drama-node-field">节点名称
-          <Input ref={titleInput} name="title" defaultValue={nodeTitle(base ?? { content })} placeholder={nodeLabels[type]} />
+          <Input ref={titleInput} name="title" defaultValue={base ? nodeTitle(base) : preset?.label} placeholder={nodeLabels[type]} />
         </label>}
         {!edit && assetNode && <AssetSources type={type} queryCanvas={queryCanvas} asset={asset}
           importFile={importFile} onSelect={setAssetSource} />}

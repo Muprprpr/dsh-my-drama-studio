@@ -18,7 +18,7 @@ export function IconButton({ icon: Icon, label, children, ...props }) {
 }
 
 export function CanvasToolbar({ filters, update, filterGroup, groups, collapsed, toggleGroup,
-  fit, arrange, add, setAddAnchor, chooseAsset, tasksOpen, toggleTasks, activeTasks = 0,
+  fit, arrange, arrangeDisabled, add, setAddAnchor, chooseAsset, tasksOpen, toggleTasks, activeTasks = 0,
 }) {
   const [popover, setPopover] = useState('')
   const root = useRef(null)
@@ -48,7 +48,7 @@ export function CanvasToolbar({ filters, update, filterGroup, groups, collapsed,
       <IconButton label="筛选" icon={IconSlidersTwoOutlineRegular} onClick={() => open('filters')} aria-expanded={popover === 'filters'} />
       <div className="drama-v2-tool-divider" aria-hidden="true" />
       <IconButton label="适配视图" icon={IconFullscreenOutlineRegular} onClick={fit} />
-      <IconButton label="整理节点" icon={IconWorkspaceTreeOutlineRegular} onClick={arrange} />
+      <IconButton label="整理节点" icon={IconWorkspaceTreeOutlineRegular} disabled={arrangeDisabled} onClick={arrange} />
       {toggleTasks && <IconButton label="任务" icon={IconChecklistOutlineRegular} aria-expanded={tasksOpen}
         onClick={() => { setPopover(''); toggleTasks() }}>{activeTasks > 0 && <span className="drama-v2-task-count">{activeTasks}</span>}</IconButton>}
     </div>

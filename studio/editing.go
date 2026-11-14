@@ -12,13 +12,13 @@ import (
 
 var (
 	humanWriteOnly      = &requestError{http.StatusForbidden, "只有通过 DSH Web 的人工操作可以修改已有节点或连线"}
-	workspaceBusy       = &requestError{http.StatusLocked, "节点或引用正在被使用，请等待相关任务结束。"}
+	workspaceBusy       = &requestError{http.StatusLocked, "画布正在被 Agent 或生成任务使用，暂不能执行此操作。"}
 	activityUnavailable = &requestError{http.StatusServiceUnavailable, "无法核实 DSH Agent 活动，暂不能修改或删除。"}
 	revisionConflict    = &requestError{http.StatusConflict, "节点已更新，请重新打开编辑。"}
 )
 
 // SetHumanWriteCheck installs the private Host activity check before serving IPC.
-func (s *Service) SetHumanWriteCheck(check func(ctx context.Context, workspaceID, sessionID string, connected, nodeIDs []string) (bool, error)) {
+func (s *Service) SetHumanWriteCheck(check func(ctx context.Context, workspaceID, sessionID string, connected []string) (bool, error)) {
 	s.humanWriteCheck = check
 }
 
@@ -170,6 +170,10 @@ func (s *Service) checkCanvasMutation(ctx context.Context, tx *sql.Tx, r Request
 			return workspaceBusy
 		}
 	}
+	// A new reference may update its target's order without editing an existing edge.
+	if r.Action == "append" {
+		return nil
+	}
 	if s.humanWriteCheck == nil {
 		return activityUnavailable
 	}
@@ -178,7 +182,7 @@ func (s *Service) checkCanvasMutation(ctx context.Context, tx *sql.Tx, r Request
 		return err
 	}
 	// Sample native Agent access at commit while SQLite holds its writer lock.
-	allowed, err := s.humanWriteCheck(ctx, r.WorkspaceID, r.SessionID, sessions, nodeIDs)
+	allowed, err := s.humanWriteCheck(ctx, r.WorkspaceID, r.SessionID, sessions)
 	if err != nil {
 		return activityUnavailable
 	}

@@ -317,8 +317,7 @@ func (s *Service) append(ctx context.Context, p *project, r Request) (any, error
 func appendNodes(ctx context.Context, tx *sql.Tx, session string, nodes []NodeInput, edges []Edge, draft bool) (appendResult, error) {
 	result := appendResult{IDs: make([]string, 0, len(nodes))}
 	checkVideos := make(map[string]struct{})
-	imageEdges := make(map[string][]string)
-	videoEdges := make(map[string][]string)
+	orderedEdges := make(map[string][]string)
 	newNodes := make(map[string]bool, len(nodes))
 	touchedTargets := make(map[string]bool)
 	eventIDs := make([]string, 0, len(nodes)+len(edges)*2)
@@ -383,13 +382,14 @@ func appendNodes(ctx context.Context, tx *sql.Tx, session string, nodes []NodeIn
 				return appendResult{}, invalid("视频节点只接受媒体输入")
 			}
 			checkVideos[edge.Target] = struct{}{}
-			videoEdges[edge.Target] = append(videoEdges[edge.Target], edge.Source)
 		}
 		if target == "image" {
 			if source != "image" && !isTextNode(source) {
 				return appendResult{}, invalid("图片节点只接受图片和文本输入")
 			}
-			imageEdges[edge.Target] = append(imageEdges[edge.Target], edge.Source)
+		}
+		if target == "image" || draft && (target == "video" || target == "shot" && source == "image" && !newNodes[edge.Target]) {
+			orderedEdges[edge.Target] = append(orderedEdges[edge.Target], edge.Source)
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO edges VALUES(?,?)", edge.Source, edge.Target); err != nil {
 			return appendResult{}, err
@@ -399,16 +399,9 @@ func appendNodes(ctx context.Context, tx *sql.Tx, session string, nodes []NodeIn
 		}
 		eventIDs = append(eventIDs, edge.Source, edge.Target)
 	}
-	for target, sources := range imageEdges {
+	for target, sources := range orderedEdges {
 		if err := appendOrderedSources(ctx, tx, target, sources); err != nil {
 			return appendResult{}, err
-		}
-	}
-	if draft {
-		for target, sources := range videoEdges {
-			if err := appendOrderedSources(ctx, tx, target, sources); err != nil {
-				return appendResult{}, err
-			}
 		}
 	}
 	for id := range checkVideos {

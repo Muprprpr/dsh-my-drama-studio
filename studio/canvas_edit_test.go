@@ -16,7 +16,7 @@ func TestCanvasVideoDraftCanSaveMediaBeforePrompt(t *testing.T) {
 	s := New(providerFixture{})
 	defer s.Close()
 	bindSession(t, s, dir, "a")
-	s.SetHumanWriteCheck(func(context.Context, string, string, []string, []string) (bool, error) { return true, nil })
+	s.SetHumanWriteCheck(func(context.Context, string, string, []string) (bool, error) { return true, nil })
 	image, note, video, appended := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
 	sources := []string{image}
 	noPrompt := json.RawMessage(`{"mode":"i2v"}`)
@@ -89,7 +89,7 @@ func TestCanvasReferencesWaitResolveAndProtectTaskInput(t *testing.T) {
 	s := New(providerFixture{})
 	defer s.Close()
 	bindSession(t, s, dir, "a")
-	s.SetHumanWriteCheck(func(context.Context, string, string, []string, []string) (bool, error) { return true, nil })
+	s.SetHumanWriteCheck(func(context.Context, string, string, []string) (bool, error) { return true, nil })
 	image, video, independent := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	content := json.RawMessage(`{"mode":"i2v","prompt":"Continue the motion in @image1."}`)
 	_, err := editCall(s, dir, "a", "human", "append", appendArgs{
@@ -130,6 +130,15 @@ func TestCanvasReferencesWaitResolveAndProtectTaskInput(t *testing.T) {
 	if err != workspaceBusy {
 		t.Fatalf("active input could be removed: %v", err)
 	}
+	if _, err := editCall(s, dir, "a", "human", "append", appendArgs{
+		operation: operation{ID: "link-into-locked-task-input"},
+		Edges:     []Edge{{Source: independent, Target: image}},
+	}); err != workspaceBusy {
+		t.Fatalf("active task input accepted a new reference: %v", err)
+	}
+	if source := mustCall(t, s, dir, "a", "query", queryArgs{ID: image}).(queryResult); len(source.Edges) != 0 {
+		t.Fatalf("rejected reference changed task input: %+v", source.Edges)
+	}
 	mustEdit(t, s, dir, "a", "update_node", updateNodeArgs{
 		nodeRevisionArgs: nodeRevisionArgs{operation: operation{ID: "edit-independent"}, ID: independent, Revision: 1},
 		Content:          json.RawMessage(`{"text":"This node is still editable."}`),
@@ -158,7 +167,7 @@ func TestCanvasBatchDeleteRestoreKeepsAssetsAndOrderedEdges(t *testing.T) {
 	s := New(providerFixture{})
 	defer s.Close()
 	bindSession(t, s, dir, "a")
-	s.SetHumanWriteCheck(func(context.Context, string, string, []string, []string) (bool, error) { return true, nil })
+	s.SetHumanWriteCheck(func(context.Context, string, string, []string) (bool, error) { return true, nil })
 	first, last, video, duplicate := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
 	prompt := "Transition from @image1 to @image2."
 	content := fmt.Sprintf(`{"mode":"i2v","prompt":%q,"mixedListOrder":[%q,%q]}`, prompt, first, last)

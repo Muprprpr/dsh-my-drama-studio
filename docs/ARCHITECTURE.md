@@ -6,7 +6,7 @@ DSH 原生 Web 负责 Workspace、Session、对话和侧栏生命周期。一个
 
 一个规范化目录对应一个 `.drama-studio/studio.db`。Canvas UUID 与项目一起保存。SQLite WAL 保存会话绑定、节点、引用、幂等操作结果、增量事件和任务。会话布局属于视图。节点和边的更改与事件一起提交，浏览器通过经 DSH 认证的 SSE 恢复或刷新快照。
 
-人工改删请求由 Host 标记为 `human`。Go 在 SQLite 写事务里检查版本、引用和活跃生成任务的输入，再把改动涉及的节点与已连接 Session ID 交给 Host 核对。Host 通过原生 Agent 状态及本轮 Studio 工具访问的节点确定保护范围。操作与保护范围相交时返回 423，版本冲突返回 409。SSE 同步 Agent 活动和保护范围，Agent 结束或释放时清除本轮记录。
+人工改删和批量恢复请求由 Host 标记为 `human`。Go 在 SQLite 提交前检查活跃生成任务的输入，并将已绑定 Session ID 交给 Host。Host 从当前 Workspace 的原生 Agent 注册表判断是否有任一绑定会话正在运行。有活动 Agent 时，已有节点和连线的改删或恢复返回 423。新增节点和引用不受 Agent 活动限制，引用目标仍受活跃生成任务保护。SSE 同步同一工作区的 `aiRunning` 状态，最后一个绑定 Agent 结束后恢复编辑。
 
 删除节点、移除关联引用及更新目标顺序在同一事务提交。删除后保留节点墓碑、素材文件和历史任务，撤销时按版本恢复引用顺序。上传保留原始字节和扩展名，按类型写入项目的 `assets/images/`、`assets/videos/` 或 `assets/audio/`。导入节点在项目数据库中保存 `assetId` 和相对路径，拖入节点同时保存初始画布坐标。预览 URL 使用当前 Session 的票据生成，资产列表按路径或 URL 合并实例。生成读取当前连接和 `mixedListOrder`，未产出素材的上游节点在生成前等待最近可用结果。
 

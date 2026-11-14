@@ -15,7 +15,7 @@ func TestVideoSubmissionDistinguishesUnsetModeFromLegacyMode(t *testing.T) {
 	s := New(providerFixture{})
 	defer s.Close()
 	bindSession(t, s, dir, "a")
-	s.SetHumanWriteCheck(func(context.Context, string, string, []string, []string) (bool, error) { return true, nil })
+	s.SetHumanWriteCheck(func(context.Context, string, string, []string) (bool, error) { return true, nil })
 	unset, legacy := uuid.NewString(), uuid.NewString()
 	const prompt = "A smooth camera move."
 	_, err := editCall(s, dir, "a", "human", "append", appendArgs{

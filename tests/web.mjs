@@ -856,6 +856,17 @@ async function dragReference(page, source, target) {
   await page.mouse.up()
 }
 
+function edgeInteractionPoint(edge) {
+  return edge.locator('.react-flow__edge-interaction').evaluate(element => {
+    const length = element.getTotalLength()
+    for (const fraction of [.5, .25, .75, .4, .6]) {
+      const point = element.getPointAtLength(length * fraction).matrixTransform(element.getScreenCTM())
+      if (document.elementFromPoint(point.x, point.y) === element) return { x: point.x, y: point.y }
+    }
+    return null
+  })
+}
+
 async function clickBlank(page) {
   const blank = await flow(page).locator('.react-flow__pane').evaluate(pane => {
     const bounds = pane.getBoundingClientRect()
@@ -1325,8 +1336,12 @@ test('Native human CRUD follows live Workspace Agent activity', { timeout: 100_0
     const replacement = note('替换引用来源')
     const linked = note('引用目标')
     const unused = note('同画布未使用节点')
+    const unreadTarget = note('同画布未使用连线目标')
     const separate = note('另一工作区可编辑')
-    await append(page, aTicket, [original, disposable, source, replacement, linked, unused], [{ source: source.id, target: linked.id }])
+    const unrelatedEdge = { source: unused.id, target: unreadTarget.id }
+    await append(page, aTicket, [original, disposable, source, replacement, linked, unused, unreadTarget], [
+      { source: source.id, target: linked.id }, unrelatedEdge,
+    ])
     await append(independent, otherTicket, [separate])
     const mutation = (browser, ticket, action, data) => request(browser, 'operation', {
       ticket, action, data: { operationId: randomUUID(), ...data },
@@ -1378,14 +1393,14 @@ test('Native human CRUD follows live Workspace Agent activity', { timeout: 100_0
     await remove(peer, disposable.id)
     assert.equal((await current(peer, bTicket, disposable.id)).deleted, true)
     assert.ok(!(await query(peer, bTicket)).nodes.some(node => node.id === disposable.id))
+    const archived = await current(peer, bTicket, disposable.id)
 
     // Reopen the peer canvas after the delete refresh before measuring another card.
     await peer.reload({ waitUntil: 'domcontentloaded' })
     await initialize(peer, new URL(url).origin)
-    if (!(await panel(peer).isVisible())) {
-      await select(peer, b)
-      await open(peer, b)
-    }
+    await peer.getByRole('treeitem', { name: /Studio Session B/u }).and(peer.locator('[aria-selected="true"]')).waitFor()
+    const peerCanvas = panel(peer).and(peer.locator(`[data-session-id="${b.sessionId}"][data-canvas-id]`))
+    await peerCanvas.waitFor({ timeout: 2500 }).catch(async () => { await open(peer, b) })
     const unsaved = await edit(peer, original.id)
     const draftText = 'AI 在保存前启动，这段未保存正文仍须保留。'
     await body(unsaved).fill(draftText)
@@ -1419,13 +1434,19 @@ test('Native human CRUD follows live Workspace Agent activity', { timeout: 100_0
     assert.equal((await mutation(independent, otherTicket, 'update_node', update(otherBefore, '独立工作区照常保存。'))).status, 200)
     assert.equal((await current(independent, otherTicket, separate.id)).revision, 2)
     const unusedBefore = await current(peer, bTicket, unused.id)
-    assert.equal((await mutation(peer, bTicket, 'update_node', update(unusedBefore, '同画布中未使用的节点照常保存。'))).status, 200)
+    const unreadBefore = await current(peer, bTicket, unreadTarget.id)
 
     for (const [action, data] of [
       ['update_node', update(edited, '后台请求也不可覆盖')],
       ['delete_node', { id: original.id, revision: edited.revision }],
       ['update_edge', { source: replacement.id, target: linked.id, newSource: source.id, revision: linkTarget.revision }],
       ['delete_edge', { source: replacement.id, target: linked.id, revision: linkTarget.revision }],
+      ['update_node', update(unusedBefore, '无关节点也不能编辑')],
+      ['delete_node', { id: unused.id, revision: unusedBefore.revision }],
+      ['update_edge', { ...unrelatedEdge, newSource: source.id, revision: unreadBefore.revision }],
+      ['delete_edge', { ...unrelatedEdge, revision: unreadBefore.revision }],
+      ['canvas_delete', { nodes: [{ id: unreadTarget.id, revision: unreadBefore.revision }] }],
+      ['canvas_restore', { nodes: [{ id: archived.id, revision: archived.revision }] }],
     ]) {
       const rejected = await mutation(peer, bTicket, action, data)
       assert.equal(rejected.status, 423, action + ' escaped native activity gate: ' + JSON.stringify(rejected.body))
@@ -1434,6 +1455,10 @@ test('Native human CRUD follows live Workspace Agent activity', { timeout: 100_0
       nodes: [{ ...original, content: { description: '批量覆盖也必须失败' } }],
     })).status >= 400)
     assert.equal((await current(peer, bTicket, original.id)).revision, edited.revision)
+    assert.deepEqual((await current(peer, bTicket, unused.id)).content, unusedBefore.content)
+    assert.ok((await query(peer, bTicket, { id: unreadTarget.id })).edges.some(edge => edge.source === unused.id))
+    assert.equal((await current(peer, bTicket, disposable.id)).deleted, true)
+    assert.ok(Array.isArray((await operate(peer, bTicket, 'tasks', {})).tasks))
 
     await page.bringToFront()
     await busy(page).waitFor()
@@ -1441,14 +1466,58 @@ test('Native human CRUD follows live Workspace Agent activity', { timeout: 100_0
     await card(page, original.id).locator('.drama-node-titlebar').click({ button: 'right' })
     assert.ok(await page.getByRole('menuitem', { name: /^删除节点/u }).isDisabled())
     await page.keyboard.press('Escape')
-    const added = await pick(page, '备注', aTicket, 'note')
-    const addition = nodeEditor(page, added.id)
+    await card(page, unused.id).locator('.drama-node-titlebar').click({ button: 'right' })
+    assert.ok(await page.getByRole('menuitem', { name: /^删除节点/u }).isDisabled())
+    await page.keyboard.press('Escape')
+    const oldEdge = graphEdge(page, unused.id, unreadTarget.id)
+    // A horizontal SVG path can have zero bounding-box height despite being clickable.
+    await oldEdge.waitFor({ state: 'attached' })
+    assert.equal(await oldEdge.locator('circle.react-flow__edgeupdater-source').count(), 0)
+    const lockedEdgePoint = await edgeInteractionPoint(oldEdge)
+    assert.ok(lockedEdgePoint, 'locked edge should still be visible and inspectable')
+    await page.mouse.click(lockedEdgePoint.x, lockedEdgePoint.y, { button: 'right' })
+    assert.ok(await page.getByRole('menuitem', { name: '删除连线', exact: true }).isDisabled())
+    await page.keyboard.press('Escape')
+    await panel(page).getByRole('toolbar', { name: '画布工具', exact: true })
+      .getByRole('button', { name: '新增节点', exact: true }).click()
+    const picker = page.getByRole('textbox', { name: '查找节点类型', exact: true })
+    await picker.fill('备注')
+    await picker.press('Enter')
+    const addition = panel(page).getByRole('form', { name: '新建节点', exact: true })
     await addition.getByText('名称与镜头', { exact: true }).click()
     await addition.getByRole('textbox', { name: '节点名称', exact: true }).fill('AI 工作时人工新增')
     await addition.getByRole('textbox', { name: '正文', exact: true }).fill('新增和阅读仍然可用。')
-    await addition.getByRole('button', { name: '保存修改', exact: true }).click()
+    await addition.getByRole('button', { name: '创建节点', exact: true }).click()
     await addition.waitFor({ state: 'hidden' })
     assert.equal((await query(peer, bTicket, { q: 'AI 工作时人工新增' })).nodes.length, 1)
+    await dragReference(page, source.id, unreadTarget.id)
+    await poll(async () => (await query(peer, bTicket, { id: unreadTarget.id })).edges.some(edge => edge.source === source.id),
+      'dragging a new connection while an Agent was running did not persist')
+    const mediaId = randomUUID()
+    const videoId = randomUUID()
+    const blankModeId = randomUUID()
+    const mediaPath = 'assets/images/' + mediaId + '.png'
+    const mediaDir = join(home, a.workspaceName, 'assets', 'images')
+    await mkdir(mediaDir, { recursive: true })
+    await writeFile(join(home, a.workspaceName, mediaPath), Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aIXsAAAAASUVORK5CYII=', 'base64'))
+    const prompt = '安静的室内，中景拍摄演员缓慢走到窗边，停顿后低声说「到了」。只有环境声，开头与结尾各留半拍。'
+    await append(page, aTicket, [
+      { id: mediaId, type: 'image', content: { path: mediaPath, assetId: mediaId + '.png' } },
+      { id: videoId, type: 'video', content: { mode: 'r2v', prompt } },
+      { id: blankModeId, type: 'video', content: { mode: '', prompt } },
+    ])
+    await append(page, aTicket, [], [{ source: mediaId, target: videoId }])
+    const linkedVideo = await query(peer, bTicket, { id: videoId })
+    assert.deepEqual(linkedVideo.edges, [{ source: mediaId, target: videoId }])
+    assert.deepEqual(linkedVideo.nodes[0].content, { mode: 'r2v', prompt, mixedListOrder: [mediaId] })
+    await card(page, blankModeId).waitFor()
+    await dragReference(page, mediaId, blankModeId)
+    const linkedWithoutMode = await poll(async () => {
+      const result = await query(peer, bTicket, { id: blankModeId })
+      return result.edges.some(edge => edge.source === mediaId) && result
+    }, 'an image connection required editing the video mode while the Agent was running')
+    assert.deepEqual(linkedWithoutMode.nodes[0].content, { mode: '', prompt, mixedListOrder: [mediaId] })
 
     assert.equal(await nativeActivity(home, b, 'start'), 'running')
     assert.equal(await nativeActivity(home, b, 'query', original.id), 'running')
@@ -1458,6 +1527,7 @@ test('Native human CRUD follows live Workspace Agent activity', { timeout: 100_0
     assert.equal((await status(peer, b)).aiRunning, true)
     assert.ok(await busy(peer).isVisible())
     assert.ok(await save(unsaved).isDisabled())
+    assert.equal((await mutation(peer, bTicket, 'update_node', update(unusedBefore, '第二个 Agent 仍在运行'))).status, 423)
     await nativeActivity(home, b, 'cancel')
     await peer.bringToFront()
     await busy(peer).waitFor({ state: 'hidden' })
@@ -1468,6 +1538,8 @@ test('Native human CRUD follows live Workspace Agent activity', { timeout: 100_0
     assert.equal((await current(page, aTicket, original.id)).content.description, draftText)
     assert.equal((await current(page, aTicket, original.id)).revision, 3)
     assert.equal((await status(peer, b)).aiRunning, false)
+    assert.equal((await mutation(peer, bTicket, 'update_node', update(unusedBefore, '空闲时同画布节点照常保存。'))).status, 200)
+    assert.equal((await mutation(peer, bTicket, 'canvas_restore', { nodes: [{ id: archived.id, revision: archived.revision }] })).status, 200)
 
     const conflicted = await edit(peer, original.id)
     await body(conflicted).fill('版本冲突也要保留这段未保存正文。')
@@ -1486,7 +1558,7 @@ test('Native human CRUD follows live Workspace Agent activity', { timeout: 100_0
     assert.ok(!graph.nodes.some(node => node.id === replacement.id))
     assert.ok(graph.nodes.some(node => node.id === linked.id))
     assert.ok(!graph.edges.some(edge => edge.source === replacement.id && edge.target === linked.id))
-    console.info('Human edits PASS: same-ID UI save/delete, revisions, edge replacement/delete, native overlapping Agent turns, backend 423, add while busy, draft preservation, workspace isolation and cancellation')
+    console.info('Human edits PASS: same-ID UI save/delete, canvas-wide 423 and UI locks, node/edge append while busy, native overlapping turns, draft preservation, workspace isolation and cancellation')
   })
 })
 
@@ -1528,15 +1600,7 @@ test('Native UI changes and deletes a saved edge', { timeout: 65_000 }, async ()
     await poll(async () => (await query(page, ticket)).edges.some(e => e.source === next.id && e.target === target.id),
       'dragging the saved edge endpoint did not replace its source')
     await edge(next.id).waitFor()
-    const path = edge(next.id).locator('.react-flow__edge-interaction')
-    const hit = await path.evaluate(el => {
-      const length = el.getTotalLength()
-      for (const fraction of [.5, .25, .75, .4, .6]) {
-        const point = el.getPointAtLength(length * fraction).matrixTransform(el.getScreenCTM())
-        if (document.elementFromPoint(point.x, point.y) === el) return { x: point.x, y: point.y }
-      }
-      return null
-    })
+    const hit = await edgeInteractionPoint(edge(next.id))
     assert.ok(hit, 'saved edge was not clickable')
     await page.mouse.click(hit.x, hit.y, { button: 'right' })
     await page.getByRole('menuitem', { name: '删除连线', exact: true }).click()

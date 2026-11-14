@@ -15,7 +15,7 @@ func TestVideoAssetPlaceholderLifecycle(t *testing.T) {
 	s := New(nil)
 	defer s.Close()
 	bindSession(t, s, dir, "a")
-	s.SetHumanWriteCheck(func(context.Context, string, string, []string, []string) (bool, error) { return true, nil })
+	s.SetHumanWriteCheck(func(context.Context, string, string, []string) (bool, error) { return true, nil })
 	asset, image := uuid.NewString(), uuid.NewString()
 	_, err := editCall(s, dir, "a", "human", "append", appendArgs{
 		operation: operation{ID: "create-assets"},

@@ -58,7 +58,7 @@ I2V 映射首帧和可选尾帧，R2V 将参考素材按连接顺序传为 `[{ty
 
 画布交互参考 ComfyUI 和 InvokeAI 的节点库、端口和工作流检查器。 [ComfyUI Nodes](https://docs.comfy.org/basic-concepts/nodes) · [InvokeAI Workflow Editor](https://invoke.ai/features/workflows/adding-nodes/)
 
-Harness 运行时会保护本轮通过 Studio 工具读取或引用的节点及其依赖。生成队列也会保护运行中任务及其输入。其余节点仍可编辑，并可新增节点和上传素材。删除节点会移除画布引用，项目素材文件和历史任务继续保留。
+当前工作区任一已连接的 Agent 运行期间，可以查看画布和任务、新增节点和连接、上传素材。已有节点和连接的修改、删除及恢复会暂停，最后一个 Agent 结束后自动恢复。生成队列继续保护运行中任务及其输入。删除节点会移除画布引用，项目素材文件和历史任务继续保留。
 
 Agent 工具有 `drama_context`、`drama_query`、`drama_append`、`drama_submit` 和 `drama_tasks`。Agent 对画布内容始终只读和追加。项目数据保存在 `.drama-studio/studio.db`。
 

@@ -117,7 +117,7 @@ func TestGenerationRecoveryAndAppendAfterDisconnect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.SetHumanWriteCheck(func(context.Context, string, string, []string, []string) (bool, error) { return true, nil })
+	s.SetHumanWriteCheck(func(context.Context, string, string, []string) (bool, error) { return true, nil })
 	edit := updateNodeArgs{
 		nodeRevisionArgs: nodeRevisionArgs{operation: operation{ID: "edit-during-poll"}, ID: nodeID, Revision: 1},
 		ShotID:           "SH002", Content: json.RawMessage(`{"prompt":"A future shot."}`),
@@ -157,7 +157,7 @@ func TestGenerationRecoveryAndAppendAfterDisconnect(t *testing.T) {
 	if len(query.Nodes) != 1 || query.Nodes[0].BasedOn != nodeID || query.Nodes[0].CreatedBySession != "a" || query.Nodes[0].ShotID != "SH001" {
 		t.Fatalf("result node: %+v", query.Nodes)
 	}
-	s.SetHumanWriteCheck(func(context.Context, string, string, []string, []string) (bool, error) { return true, nil })
+	s.SetHumanWriteCheck(func(context.Context, string, string, []string) (bool, error) { return true, nil })
 	edited := mustEdit(t, s, dir, "b", "update_node", edit)
 	mustEdit(t, s, dir, "b", "delete_node", nodeRevisionArgs{
 		operation: operation{ID: "delete-after-poll"}, ID: nodeID, Revision: edited.Revision,

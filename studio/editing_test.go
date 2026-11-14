@@ -79,7 +79,7 @@ func TestHumanWriteChecksWorkspaceAtCommit(t *testing.T) {
 	var hold atomic.Bool
 	hold.Store(true)
 	entered, resume := make(chan struct{}), make(chan struct{})
-	s.SetHumanWriteCheck(func(ctx context.Context, workspaceID, sessionID string, ids, _ []string) (bool, error) {
+	s.SetHumanWriteCheck(func(ctx context.Context, workspaceID, sessionID string, ids []string) (bool, error) {
 		if workspaceID != "native-workspace" || sessionID != "b" || !slices.Equal(ids, []string{"a", "b"}) {
 			return false, fmt.Errorf("activity check received the wrong identities: %s/%s %v", workspaceID, sessionID, ids)
 		}
@@ -150,12 +150,57 @@ func TestHumanWriteChecksWorkspaceAtCommit(t *testing.T) {
 	}
 }
 
+func TestHumanAppendReferenceWhileWorkspaceIsBusy(t *testing.T) {
+	dir := t.TempDir()
+	s := New(nil)
+	defer s.Close()
+	bindSession(t, s, dir, "a")
+	var checks int
+	s.SetHumanWriteCheck(func(context.Context, string, string, []string) (bool, error) {
+		checks++
+		return false, nil
+	})
+	image := NodeInput{ID: uuid.NewString(), Type: "image", Content: json.RawMessage(`{"path":"assets/images/frame.png"}`)}
+	shot := NodeInput{ID: uuid.NewString(), Type: "shot", Content: json.RawMessage(`{"description":"unchanged"}`)}
+	mustCall(t, s, dir, "a", "append", appendArgs{operation: operation{ID: "setup"}, Nodes: []NodeInput{image, shot}})
+
+	edge := Edge{Source: image.ID, Target: shot.ID}
+	if _, err := editCall(s, dir, "a", "human", "append", appendArgs{
+		operation: operation{ID: "connect"}, Edges: []Edge{edge},
+	}); err != nil || checks != 0 {
+		t.Fatalf("append unexpectedly called workspace write check %d times or failed: %v", checks, err)
+	}
+	result := mustCall(t, s, dir, "a", "query", queryArgs{ID: shot.ID}).(queryResult)
+	if len(result.Nodes) != 1 || !slices.Equal(result.Edges, []Edge{edge}) {
+		t.Fatalf("missing appended reference: %+v", result)
+	}
+	updated := result.Nodes[0]
+	var content map[string]json.RawMessage
+	if err := json.Unmarshal(updated.Content, &content); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Revision != 2 || !slices.Equal(orderedSources(content), []string{image.ID}) ||
+		string(content["description"]) != `"unchanged"` {
+		t.Fatalf("append did not preserve content and update reference order: %+v", updated)
+	}
+	_, err := editCall(s, dir, "a", "human", "canvas_delete", canvasChangeArgs{
+		operation: operation{ID: "delete"}, Edges: []canvasEdgeVersion{{Edge: edge, Revision: updated.Revision}},
+	})
+	if err != workspaceBusy || checks != 1 {
+		t.Fatalf("old edge deletion got %v after %d workspace checks", err, checks)
+	}
+	if after := mustCall(t, s, dir, "a", "query", queryArgs{ID: shot.ID}).(queryResult); !slices.Equal(after.Edges, []Edge{edge}) ||
+		after.Status.EventSeq != result.Status.EventSeq {
+		t.Fatalf("rejected deletion left changes: %+v", after)
+	}
+}
+
 func TestHumanOrderedEdgesStayConsistent(t *testing.T) {
 	dir := t.TempDir()
 	s := New(nil)
 	defer s.Close()
 	bindSession(t, s, dir, "a")
-	s.SetHumanWriteCheck(func(context.Context, string, string, []string, []string) (bool, error) { return true, nil })
+	s.SetHumanWriteCheck(func(context.Context, string, string, []string) (bool, error) { return true, nil })
 	first, second, video, shot, note := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
 	prompt := `{"mode":"i2v","prompt":"延续 @图片1 的动作。","mixedListOrder":[%q]}`
 	mustCall(t, s, dir, "a", "append", appendArgs{operation: operation{ID: "nodes"}, Nodes: []NodeInput{
@@ -236,7 +281,7 @@ func TestHumanWriteMigratesExistingCanvas(t *testing.T) {
 	}
 	s = New(nil)
 	defer s.Close()
-	s.SetHumanWriteCheck(func(context.Context, string, string, []string, []string) (bool, error) { return true, nil })
+	s.SetHumanWriteCheck(func(context.Context, string, string, []string) (bool, error) { return true, nil })
 	id := added.IDs[0]
 	if current := exactNode(t, s, dir, "a", id); current.Revision != 1 || current.Deleted {
 		t.Fatalf("legacy row was not migrated: %+v", current)

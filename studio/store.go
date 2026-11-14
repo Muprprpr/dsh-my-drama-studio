@@ -65,7 +65,7 @@ type Service struct {
 	mu              sync.Mutex
 	projects        map[string]*project
 	provider        providerRegistry
-	humanWriteCheck func(context.Context, string, string, []string, []string) (bool, error)
+	humanWriteCheck func(context.Context, string, string, []string) (bool, error)
 	wake            chan struct{}
 	pollInterval    time.Duration
 	pollTimeout     time.Duration
