@@ -204,6 +204,8 @@ export function CanvasViewport({
       id: node.id,
       type: 'drama',
       position: savedPosition(node) ?? defaultPositions[node.id],
+      // Carry forward React Flow's measurement so a snapshot refresh keeps the node visible.
+      measured: flow.current?.getInternalNode(node.id)?.measured,
       selected: selected.includes(node.id),
       className: 'drama-flow-node' + (editorFocus?.id === node.id ? ' is-editor-focused' : ''),
       draggable: !lockReason(node.id),
@@ -228,6 +230,7 @@ export function CanvasViewport({
       } }
     const editor = editorFor(draft)
     graphNodes.push({ id: draft.id, type: 'drama', position: positions[draft.id] ?? draft.at, selected: selected.includes(draft.id),
+      measured: flow.current?.getInternalNode(draft.id)?.measured,
       className: 'drama-flow-node', dragHandle: '.drama-node-card',
       ariaLabel: (draft.edit ? '编辑 ' : '未保存 ') + nodeLabels[type],
       data: { node, draft: selected.includes(draft.id) ? draft : null, editor, actions: {

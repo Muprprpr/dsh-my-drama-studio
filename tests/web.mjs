@@ -2014,6 +2014,66 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       await promptBox.press('Backspace')
       assert.equal(await promptBox.inputValue(), prompt)
       assert.ok(!(await query(page, ticket, { id: first.id })).nodes[0].deleted)
+      const inlineBase = prompt.replace('固定中景', '固定远景')
+      const insertAt = inlineBase.indexOf('固定远景')
+      const withCandidate = text => inlineBase.slice(0, insertAt) + text + inlineBase.slice(insertAt)
+      const savedInlinePrompt = async () => (await query(page, ticket, { id: first.id })).nodes[0].content.prompt
+      await poll(async () => (await savedInlinePrompt()) === prompt, 'preparing the inline IME fixture did not save')
+      const canvasOperation = '**/api/drama/operation'
+      const saveGate = Promise.withResolvers()
+      let savePending = false
+      const holdPromptSave = async route => {
+        const request = route.request().postDataJSON()
+        if (request.action === 'update_node' && request.data.id === first.id && request.data.content.prompt === inlineBase) {
+          savePending = true
+          await saveGate.promise
+        }
+        await route.continue()
+      }
+      await page.route(canvasOperation, holdPromptSave)
+      const inlineIME = await page.context().newCDPSession(page)
+      const inlineInput = await promptBox.elementHandle()
+      const assertComposition = async text => {
+        const state = await promptBox.evaluate((input, initial) => ({ value: input.value, start: input.selectionStart,
+          end: input.selectionEnd, sameInput: input === initial,
+          focusElsewhere: document.activeElement === input ? null : document.activeElement?.tagName }), inlineInput)
+        assert.deepEqual(state, { value: withCandidate(text), start: insertAt + text.length,
+          end: insertAt + text.length, sameInput: true, focusElsewhere: null })
+      }
+      const beforeInline = await nodeGeometry(first)
+      try {
+        await promptBox.fill(inlineBase)
+        await poll(() => savePending, 'the committed inline edit did not reach autosave')
+        await promptBox.evaluate((input, offset) => input.setSelectionRange(offset, offset), insertAt)
+        await inlineIME.send('Input.imeSetComposition', { text: 'yun', selectionStart: 3, selectionEnd: 3 })
+        await assertComposition('yun')
+        const refetch = page.waitForResponse(response => {
+          if (!response.ok() || !response.url().endsWith('/api/drama/operation')) return false
+          const request = response.request().postDataJSON()
+          return request.action === 'query' && Object.keys(request.data).length === 0
+        })
+        saveGate.resolve()
+        await refetch
+        await poll(async () => (await savedInlinePrompt()) === inlineBase, 'the previous inline edit was not saved')
+        await delay(500)
+        await assertComposition('yun')
+        await inlineIME.send('Input.imeSetComposition', { text: 'yunjing', selectionStart: 7, selectionEnd: 7 })
+        await assertComposition('yunjing')
+        await delay(500)
+        assert.equal(await savedInlinePrompt(), inlineBase, 'provisional pinyin was saved to the video node')
+        await inlineIME.send('Input.insertText', { text: '运镜' })
+        await assertComposition('运镜')
+        await poll(async () => (await savedInlinePrompt()) === withCandidate('运镜'), 'the inline Chinese candidate did not save')
+        await assertComposition('运镜')
+        assert.deepEqual(await nodeGeometry(first), beforeInline, 'IME input moved the node or its handles')
+      } finally {
+        saveGate.resolve()
+        await inlineInput.dispose()
+        await inlineIME.detach()
+        await page.unroute(canvasOperation, holdPromptSave)
+      }
+      await promptBox.fill(prompt)
+      await poll(async () => (await savedInlinePrompt()) === prompt, 'restoring the prompt for the PNG request failed')
       await modelButton.click()
       await page.getByRole('menuitem', { name: profileName, exact: true }).click()
       const viewport = flow(page).locator('.react-flow__viewport')

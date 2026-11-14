@@ -524,7 +524,7 @@ function NodeEditor({
   const promptField = type === 'prompt'
     ? ['text', 'description', 'prompt'].find(field => textValue(content, field)) ?? 'prompt'
     : 'prompt'
-  const storedPrompt = textValue(content, promptField)
+  const storedPrompt = typeof content[promptField] === 'string' ? content[promptField] : ''
   const storedProfileId = textValue(content, 'profileId')
   const [prompt, setPrompt] = useState(storedPrompt)
   const [profileId, setProfileId] = useState(storedProfileId)
@@ -532,11 +532,14 @@ function NodeEditor({
   const [metadata, setMetadata] = useState(() => nodeMetadata(base))
   const [settings, setSettings] = useState('')
   const [promptOpen, setPromptOpen] = useState(false)
+  const [promptComposing, setPromptComposing] = useState(false)
   const [openParameter, setOpenParameter] = useState('')
   const promptInput = useRef(null)
+  const expandedPromptInput = useRef(null)
   const promptExpand = useRef(null)
   const promptScroll = useRef(0)
   const composingPrompt = useRef(false)
+  const promptCompositionEnded = useRef(false)
   const generation = type === 'image' || type === 'video' && mode !== 'asset'
   const hasPrompt = type === 'prompt' || generation
   const assetNode = mediaTypes.has(type) && !(type === 'video' && generation)
@@ -582,7 +585,7 @@ function NodeEditor({
   }, [persistedRefKey, savedMode, edit, compact, compact && dirty, compact && base?.revision])
 
   useEffect(() => {
-    if (!edit || dirty || base.revision < revision.current) return
+    if (!edit || dirty || composingPrompt.current || base.revision < revision.current) return
     revision.current = base.revision
     committed.current = base
     setPrompt(storedPrompt)
@@ -591,7 +594,14 @@ function NodeEditor({
     setAsset(null)
     if (compact) setMetadata(nodeMetadata(base))
     formRef.current?.reset()
-  }, [base?.revision, dirty, edit])
+  }, [base?.revision, dirty, edit, promptComposing])
+
+  useLayoutEffect(() => {
+    if (composingPrompt.current) return
+    for (const input of [promptInput.current, expandedPromptInput.current]) {
+      if (input && input.value !== prompt) input.value = prompt
+    }
+  }, [prompt, promptComposing, promptOpen])
 
   useEffect(() => {
     if (!queryCanvas || !missing) return
@@ -666,16 +676,17 @@ function NodeEditor({
   const issue = referenceIssue(referenceMode, referenceKinds, activeProfile, true)
     || (type === 'video' ? inlineReferenceIssue(prompt, referenceKinds) : '')
   const savedProfile = compact ? activeProfile : resolveProfile(currentProfiles, storedProfileId)
-  const unavailable = mutationReason || [
+  const generationIssue = [
     taskActive(latest ?? {}) && '此节点正在生成。',
-    saving && '正在保存修改。',
-    dirty && (compact ? error || '正在保存修改。' : '请先保存修改。'),
     type === 'video' && !mode && '请选择视频生成方式。',
     !prompt.trim() && !hasTextRef && (type === 'video' ? '生成前请填写完整视频提示词。' : '请填写提示词。'),
     referenceItems.some(item => !referenceReady(item, resolvedMedia)) && '等待上游素材。',
     issue,
     !savedProfile?.configured && '请选择已配置的生成预设。',
   ].find(Boolean)
+  const unavailable = mutationReason || (promptComposing && '请先完成提示词输入。') ||
+    (saving && '正在保存修改。') ||
+    (dirty && (compact ? error || '正在保存修改。' : '请先保存修改。')) || generationIssue
   const blocked = Boolean(edit && mutationReason)
 
   function changeMode(value) {
@@ -704,6 +715,7 @@ function NodeEditor({
   }
 
   function updatePrompt(value) {
+    if (value === prompt) return
     setPrompt(value)
     markDirty()
   }
@@ -892,12 +904,22 @@ function NodeEditor({
   }
 
   const promptEvents = {
-    onCompositionStart: () => { composingPrompt.current = true },
+    onCompositionStart: () => {
+      composingPrompt.current = true
+      promptCompositionEnded.current = false
+      setPromptComposing(true)
+    },
     onCompositionEnd: event => {
       composingPrompt.current = false
+      promptCompositionEnded.current = true
+      setPromptComposing(false)
       updatePrompt(event.currentTarget.value)
     },
-    onChange: event => composingPrompt.current ? setPrompt(event.target.value) : updatePrompt(event.target.value),
+    onKeyUp: () => { promptCompositionEnded.current = false },
+    onBlur: () => { promptCompositionEnded.current = false },
+    onChange: event => {
+      if (!composingPrompt.current && !event.nativeEvent.isComposing) updatePrompt(event.currentTarget.value)
+    },
   }
 
   const effectiveNode = node.revision >= revision.current ? node : committed.current
@@ -911,8 +933,10 @@ function NodeEditor({
       onSubmit={event => event.preventDefault()} onDoubleClick={preventCanvasDoubleClick}
       onKeyDown={event => {
         if (!event.currentTarget.contains(event.target)) return
+        const ended = event.target === promptInput.current && promptCompositionEnded.current
+        promptCompositionEnded.current = false
         if (event.key === 'Escape' && !settings && !promptOpen && !openParameter &&
-            !composingPrompt.current && !event.nativeEvent.isComposing && event.keyCode !== 229) {
+            !composingPrompt.current && !ended && !event.nativeEvent.isComposing && event.keyCode !== 229) {
           if (isFocused) return
           close()
         }
@@ -921,7 +945,7 @@ function NodeEditor({
       {generation && <>
         <div className="drama-node-creative-prompt">
           <textarea ref={promptInput} aria-label="提示词" name="prompt" rows={3}
-            placeholder={type === 'video' ? '描述镜头、动作与声音…' : '描述要生成的画面…'} value={prompt} disabled={blocked}
+            placeholder={type === 'video' ? '描述镜头、动作与声音…' : '描述要生成的画面…'} defaultValue={prompt} disabled={blocked}
             {...promptEvents} />
           <Button ref={promptExpand} size="sm" className="drama-node-prompt-expand" aria-haspopup="dialog" aria-expanded={promptOpen}
             aria-label="展开提示词" title="展开提示词" onClick={() => {
@@ -981,7 +1005,7 @@ function NodeEditor({
             </span>
             <Button size="sm" variant="primary" onClick={closePrompt}>完成编辑</Button>
           </>}>
-          <textarea aria-label="提示词" data-modal-autofocus value={prompt} disabled={blocked}
+          <textarea ref={expandedPromptInput} aria-label="提示词" data-modal-autofocus defaultValue={prompt} disabled={blocked}
             className={'drama-node-prompt-dialog-input ' + interactions} {...promptEvents} />
         </Modal>}
       </>}
@@ -991,8 +1015,8 @@ function NodeEditor({
         <Button size="sm" aria-haspopup="dialog" onClick={() => setSettings('metadata')}>节点详情</Button>
       </div>}
       <div className="drama-node-creative-footer">
-        {(shownError || generation && (prompt.trim() || references.length > 0) && !dirty && unavailable) &&
-          <p className="drama-node-creative-status" role={error ? 'alert' : 'status'}>{shownError || unavailable}</p>}
+        {(shownError || generation && (prompt.trim() || references.length > 0) && generationIssue) &&
+          <p className="drama-node-creative-status" role={error ? 'alert' : 'status'}>{shownError || generationIssue}</p>}
         {generation && <GenerateControl node={effectiveNode} profile={savedProfile} generationDefaults={generationDefaults}
           actions={actions} unavailable={unavailable} latest={latest} />}
       </div>
