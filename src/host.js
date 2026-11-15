@@ -4,6 +4,7 @@ import { startKernel, StudioError } from './kernel.js'
 import { importedMediaURL, importMedia, streamImportedMedia, streamMedia } from './media.js'
 import { registerTools } from './tools.js'
 import { openProfileSettings } from './profile-settings.js'
+import { workflowBridge } from './workflow.js'
 
 export const name = 'my-drama-studio'
 export const inject = ['agents', 'connection', 'webServer', 'workspaceRegistry', 'tools', 'settings', 'credentials', 'profileContext']
@@ -75,8 +76,10 @@ function route(ctx, path, run, method = 'POST', rawBody = false) {
 }
 
 const humanEdits = new Set(['update_node', 'delete_node', 'update_edge', 'delete_edge', 'canvas_delete', 'canvas_restore'])
+const workflowActions = new Set(['workflow_approve', 'workflow_return'])
 const browserActions = new Set(['context', 'bind', 'disconnect', 'query', 'append', 'permission', 'submit_manual', 'tasks',
-  'generateT2V', 'generateI2V', 'generateR2V', 'generateV2V', 'cancel_task', 'resume_task', ...humanEdits])
+  'generateT2V', 'generateI2V', 'generateR2V', 'generateV2V', 'cancel_task', 'resume_task', 'workflow_get', 'workflow_start',
+  ...humanEdits, ...workflowActions])
 
 export async function apply(ctx, config) {
   const activity = new EventEmitter().setMaxListeners(0)
@@ -94,6 +97,7 @@ export async function apply(ctx, config) {
   const providerRequest = await openProfileSettings(ctx, config, kernel)
   const signingKey = randomBytes(32)
   const lifetime = new AbortController()
+  const workflow = workflowBridge(ctx, kernel, workspaceFor, lifetime.signal)
   ctx.effect(() => () => lifetime.abort())
   ctx.on('agent/status', ({ agent }) => activity.emit('change', agent.id))
   ctx.on('agent/disposed', ({ agent }) => activity.emit('change', agent.id))
@@ -148,7 +152,11 @@ export async function apply(ctx, config) {
     if (!browserActions.has(action)) throw new StudioError(400, 'Unknown Studio action')
     const { sessionId, workspace } = await verify(ticket, peer)
     const input = action === 'context' ? keys(data ?? {}) : keysData(data)
-    if (humanEdits.has(action) || action === 'append') return kernel(sessionId, workspace, action, input, undefined, 'human')
+    if (action === 'workflow_get') return workflow.get(sessionId, workspace, input)
+    if (action === 'workflow_start') return workflow.start(sessionId, workspace, input)
+    if (humanEdits.has(action) || workflowActions.has(action) || action === 'append') {
+      return kernel(sessionId, workspace, action, input, undefined, 'human')
+    }
     const result = await kernel(sessionId, workspace, action, input)
     if (action === 'query') await addActivity(result.status, sessionId, workspace)
     else if (action === 'context' || action === 'bind' || action === 'disconnect') {
@@ -248,7 +256,7 @@ export async function apply(ctx, config) {
     return streamMedia(req, res, workspace.path, node?.type, node?.content.path)
   }, 'GET')
 
-  registerTools(ctx, workspaceFor, kernel, keys)
+  registerTools(ctx, workspaceFor, kernel, keys, workflow.authorizeTool)
   void recoverWorkspaces(ctx, kernel, lifetime.signal)
   console.info('[my-drama-studio] My Drama Studio Host loaded')
 }

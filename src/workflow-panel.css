@@ -1,0 +1,149 @@
+.drama-workflow-progress {
+  box-sizing: border-box;
+  width: calc(100% - var(--dsh-composer-side-clearance, 0px) - var(--dsh-composer-side-clearance, 0px));
+  max-width: var(--dsh-composer-card-max-width, 760px);
+  min-width: 0;
+  margin: 0 auto;
+  padding: 5px 8px 6px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: var(--dsw-radius-lg);
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.drama-workflow-progress p,
+.drama-workflow-details p {
+  margin: 0;
+}
+.drama-workflow-steps {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: thin;
+  overscroll-behavior-inline: contain;
+  list-style: none;
+  margin: 0;
+  padding: 2px 1px 3px;
+}
+.drama-workflow-steps li { flex: 0 0 auto; }
+.drama-workflow-steps button {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 25px;
+  padding: 3px 6px;
+  border: 1px solid transparent;
+  border-radius: var(--dsw-radius-sm);
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.drama-workflow-steps button:hover,
+.drama-workflow-steps button[aria-current="step"] {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+.drama-workflow-steps button[aria-current="step"] {
+  border-color: var(--dsw-alias-border-l4);
+  font-weight: 650;
+}
+.drama-workflow-steps button:focus-visible {
+  outline: 1px solid currentColor;
+  outline-offset: -1px;
+}
+.drama-workflow-command,
+.drama-workflow-feedback {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 7px;
+  min-width: 0;
+  margin-block-start: 3px;
+}
+.drama-workflow-command > button {
+  max-width: 100%;
+  min-height: 26px;
+  height: auto;
+  white-space: normal;
+}
+.drama-workflow-current {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 2px 7px;
+  min-width: 0;
+  max-width: 100%;
+  margin-inline-end: auto;
+}
+.drama-workflow-identity {
+  max-width: min(100%, 17em);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.drama-workflow-current span,
+.drama-workflow-feedback p {
+  color: var(--dsw-alias-label-secondary);
+}
+.drama-workflow-feedback p { overflow-wrap: anywhere; }
+.drama-workflow-progress [role="alert"],
+.drama-workflow-details [role="alert"],
+.drama-workflow-current[data-status="failed"] .drama-workflow-state {
+  color: var(--dsw-alias-state-error-primary);
+}
+.drama-workflow-current[data-status="stale"] .drama-workflow-state { color: var(--dsw-alias-state-warn-label); }
+.drama-workflow-details {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.drama-workflow-detail-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.drama-workflow-details summary {
+  cursor: pointer;
+  color: var(--dsw-alias-label-primary);
+}
+.drama-workflow-metadata {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 3px 8px;
+  margin-block: 5px;
+}
+.drama-workflow-metadata dt,
+.drama-workflow-details p,
+.drama-workflow-details span {
+  color: var(--dsw-alias-label-secondary);
+}
+.drama-workflow-metadata dd { margin: 0; }
+.drama-workflow-details ul {
+  margin: 4px 0;
+  padding-inline-start: 18px;
+}
+.drama-workflow-output { padding: 7px 0; }
+.drama-workflow-output + .drama-workflow-output { border-top: 1px solid var(--dsw-alias-border-l2); }
+.drama-workflow-output img,
+.drama-workflow-output audio,
+.drama-workflow-output video {
+  display: block;
+  max-width: 100%;
+  max-height: 260px;
+  margin-block: 4px;
+}
+.drama-workflow-output pre {
+  margin: 4px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+}

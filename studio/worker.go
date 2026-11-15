@@ -43,8 +43,10 @@ type sourceGroup struct {
 
 type generationRequest struct {
 	GenerationInput
-	SourceGroup   *sourceGroup `json:"sourceGroup,omitempty"`
-	SourceNodeIDs []string     `json:"sourceNodeIds,omitempty"`
+	SourceGroup        *sourceGroup `json:"sourceGroup,omitempty"`
+	SourceNodeIDs      []string     `json:"sourceNodeIds,omitempty"`
+	SourceNodeRevision int64        `json:"sourceNodeRevision,omitempty"`
+	ManualConfirmation bool         `json:"manualConfirmation,omitempty"`
 }
 
 func readSourceGroup(ctx context.Context, tx *sql.Tx, id string) (sourceGroup, error) {

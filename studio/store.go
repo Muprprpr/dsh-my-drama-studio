@@ -45,6 +45,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   completed_at TEXT NOT NULL DEFAULT '', output_path TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS tasks_status_created ON tasks(status,created_at);
+CREATE TABLE IF NOT EXISTS workflow_runs (
+  id TEXT PRIMARY KEY, stage_id TEXT NOT NULL, session_id TEXT NOT NULL, status TEXT NOT NULL, record TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS workflow_runs_stage ON workflow_runs(stage_id);
+CREATE UNIQUE INDEX IF NOT EXISTS workflow_runs_active ON workflow_runs((1)) WHERE status IN ('starting','running');
 DROP TRIGGER IF EXISTS nodes_no_update;
 DROP TRIGGER IF EXISTS nodes_no_delete;
 DROP TRIGGER IF EXISTS edges_no_update;
@@ -72,10 +77,12 @@ type Service struct {
 }
 
 type project struct {
-	db      *sql.DB
-	dir     string
-	mu      sync.Mutex
-	changed chan struct{}
+	db                  *sql.DB
+	dir                 string
+	mu                  sync.Mutex
+	changed             chan struct{}
+	workflowOwner       string
+	releaseWorkflowLock func()
 }
 
 var videoActions = map[string]string{
@@ -96,6 +103,7 @@ func (s *Service) Close() error {
 	var result error
 	for _, p := range s.projects {
 		result = errors.Join(result, p.db.Close())
+		p.unlockWorkflow("")
 	}
 	return result
 }
@@ -231,19 +239,22 @@ func (s *Service) Execute(ctx context.Context, r Request) (any, error) {
 		if err := decodeData(r.Data, &struct{}{}); err != nil {
 			return nil, err
 		}
-		if s.provider == nil {
-			return map[string]bool{"recovered": false}, nil
-		}
 		p, err := s.open(ctx, r.WorkspacePath, false)
 		if err == nil && p != nil {
+			err = p.recoverWorkflow(ctx)
+		}
+		if err == nil && p != nil && s.provider != nil {
 			_, err = p.db.ExecContext(ctx, `UPDATE tasks SET status='polling',error='',updated_at=?
 				WHERE status='paused' AND provider_id<>''`, time.Now().UTC().Format(time.RFC3339Nano))
 		}
 		s.wakeWorker()
-		return map[string]bool{"recovered": p != nil}, err
+		return map[string]bool{"recovered": p != nil && s.provider != nil}, err
 	}
 	if strings.TrimSpace(r.SessionID) == "" || strings.TrimSpace(r.WorkspaceID) == "" {
 		return nil, invalid("需要 DSH Session 和 Workspace 身份")
+	}
+	if strings.HasPrefix(r.Action, "workflow_") {
+		return s.executeWorkflow(ctx, r)
 	}
 	var op operation
 	switch r.Action {

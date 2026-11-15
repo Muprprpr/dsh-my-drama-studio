@@ -22,7 +22,7 @@ const append = {
   edges: { type: 'array', items: edge },
 }
 
-export function registerTools(ctx, workspaceFor, kernel, keys) {
+export function registerTools(ctx, workspaceFor, kernel, keys, authorizeWorkflowTool) {
   for (const [action, description, parameters] of [
     ['context', 'Read the current native Session, its Workspace Canvas binding and generation permission.', object({})],
     ['query', 'Read shared creative nodes and references for this Session’s Canvas. Filter by shot, type or source Session.', object(query)],
@@ -43,6 +43,7 @@ export function registerTools(ctx, workspaceFor, kernel, keys) {
         const sessionId = exec.agent?.session.id
         if (!sessionId) throw new StudioError(403, 'A native DSH Agent Session is required')
         const workspace = await workspaceFor(ctx, sessionId)
+        authorizeWorkflowTool(exec.agent, workspace, action, data)
         const result = await kernel(sessionId, workspace, action, data, exec.signal)
         return action === 'context' ? { ...result, workspacePath: workspace.path } : result
       },

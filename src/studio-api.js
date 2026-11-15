@@ -59,7 +59,39 @@ export const generateI2V = (ticket, request, signal) => operation(ticket, 'gener
 export const generateR2V = (ticket, request, signal) => operation(ticket, 'generateR2V', request, signal)
 export const generateV2V = (ticket, request, signal) => operation(ticket, 'generateV2V', request, signal)
 
-export async function subscribe(ticket, after, signal, onBatch, onError) {
+const eventStreams = new Map()
+
+export function subscribe(ticket, after, signal, onBatch, onError) {
+  if (signal.aborted) return
+  let entry = eventStreams.get(ticket)
+  if (!entry) {
+    entry = { controller: new AbortController(), listeners: new Set(), activity: null, batch: null }
+    eventStreams.set(ticket, entry)
+    const stream = entry
+    void readEvents(ticket, after, stream.controller.signal, batch => {
+      if (typeof batch.aiRunning === 'boolean') stream.activity = batch
+      else stream.batch = batch
+      for (const listener of stream.listeners) listener.onBatch(batch)
+    }, error => {
+      for (const listener of stream.listeners) listener.onError(error)
+    }).finally(() => {
+      if (eventStreams.get(ticket) === stream) eventStreams.delete(ticket)
+      stream.listeners.clear()
+    })
+  }
+  const listener = { onBatch, onError }
+  entry.listeners.add(listener)
+  signal.addEventListener('abort', () => {
+    entry.listeners.delete(listener)
+    if (entry.listeners.size || eventStreams.get(ticket) !== entry) return
+    eventStreams.delete(ticket)
+    entry.controller.abort()
+  }, { once: true })
+  if (entry.activity) onBatch(entry.activity)
+  if (entry.batch && (entry.batch.status.eventSeq > after || !entry.batch.events.length)) onBatch(entry.batch)
+}
+
+async function readEvents(ticket, after, signal, onBatch, onError) {
   while (!signal.aborted) {
     try {
       const response = await post('events', { ticket, after }, signal)

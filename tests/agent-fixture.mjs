@@ -2,8 +2,10 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
-import { access, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { access, copyFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
+import { tmpdir } from 'node:os'
+import { basename, dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -13,6 +15,8 @@ export const inject = ['agents', 'connection', 'llm', 'sessionController', 'tool
 
 const provider = 'drama-fixture'
 const model = 'scripted'
+const restartStage = 'content-analysis'
+const restartSkill = 'drama-' + restartStage
 
 export function apply(ctx) {
   const life = new AbortController()
@@ -52,7 +56,10 @@ async function verify(ctx, signal) {
   }
 
   async function ok(response, label) {
-    assert.ok(response.ok, `${label}: HTTP ${response.status}`)
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}))
+      assert.fail(`${label}: HTTP ${response.status} ${error.error ?? ''}`)
+    }
     return response.json()
   }
 
@@ -68,8 +75,11 @@ async function verify(ctx, signal) {
   const op = async (ticket, action, data = {}) => ok(
     await request('operation', { ticket, action, data: { operationId: randomUUID(), ...data } }), action,
   )
+  const readWorkflow = async ticket => ok(await request('operation', { ticket, action: 'workflow_get' }), 'workflow_get')
 
-  const lib = join(dirname(process.execPath), 'resources', 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-llm', 'lib', 'index.js')
+  const cli = process.env.DRAMA_DSH_CLI
+  const lib = cli ? createRequire(cli).resolve('@deepseek-ai/dsh-llm')
+    : join(dirname(process.execPath), 'resources', 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-llm', 'lib', 'index.js')
   const { createUserMessage, LlmAdapter, LlmError } = await import(pathToFileURL(lib).href)
   const script = []
   let offered = []
@@ -177,6 +187,23 @@ async function verify(ctx, signal) {
     assert.equal(restored.status.connected, true)
     assert.equal(restored.status.autoGenerate, false)
     assert.equal(restored.status.aiRunning, false, 'An interrupted native turn was treated as a persistent lock')
+    const workflow = await until(async () => {
+      const view = await readWorkflow(restored.ticket)
+      return view.stages[0]?.status === 'failed' && view
+    }, signal, 'interrupted Workflow recovery')
+    assert.equal(workflow.id, state.workflowId)
+    assert.equal(workflow.stages[0].id, state.stageId)
+    assert.equal(workflow.stages[0].runId, state.runId)
+    assert.equal(workflow.stages[0].skill, restartSkill)
+    assert.equal(workflow.stages[0].sessionId, state.executorSessionId)
+    assert.equal(workflow.stages[0].workspaceId, state.workspaceId)
+    assert.equal(workflow.stages[0].canvasId, state.canvasId)
+    assert.equal(workflow.stages[0].definitionVersion, 1)
+    assert.equal(workflow.stages[0].skillSha256, state.skillSha256)
+    assert.equal(workflow.stages[0].harnessSha256, state.harnessSha256)
+    assert.equal(workflow.stages[0].files.harnessReady, true)
+    assert.equal(workflow.stages[0].files.skillReady, true)
+    assert.ok(workflow.stages[0].error)
     const [note] = (await ok(await request('operation', {
       ticket: restored.ticket, action: 'query', data: { id: state.noteId },
     }), 'read note after restart')).nodes
@@ -188,11 +215,17 @@ async function verify(ctx, signal) {
     await sessions.selectModel({ sessionId: state.sessionId, provider, model })
     await reject(state.sessionId, 'drama_submit', { operationId: randomUUID(), nodeId: state.videoId }, /automatic generation is disabled/i)
     assert.equal((await succeed(state.sessionId, 'drama_query', { type: 'shot' })).nodes.length, 2)
-    console.info(`[drama-agent-fixture] PASS restart: live turn interrupted, Canvas persisted, human edit restored, stale ticket and Agent submit rejected (${nativeCalls} native tool calls)`)
+    console.info(`[drama-agent-fixture] PASS restart: interrupted Workflow recovered, Canvas persisted, human edit restored, stale ticket and Agent submit rejected (${nativeCalls} native tool calls)`)
     return
   }
 
   await mkdir(workspacePath, { recursive: true })
+  const skillPath = join(process.env.DSH_HOME, 'skills', restartSkill)
+  const harnessPath = join(process.env.DSH_HOME, 'drama-studio', 'workflows', 'drama-production', 'stages', restartStage)
+  await mkdir(skillPath, { recursive: true })
+  await mkdir(harnessPath, { recursive: true })
+  await writeFile(join(skillPath, 'SKILL.md'), `---\nname: ${restartSkill}\ndescription: Verify Workflow interruptions.\n---\nCreate a Canvas note.\n`)
+  await writeFile(join(harnessPath, 'harness.md'), 'Keep output on the project Canvas.')
   const workspace = await ctx.workspaceRegistry.create(workspacePath)
   const a = (await sessions.create({ workspaceId: workspace.id })).sessionId
   const b = (await sessions.create({ workspaceId: workspace.id })).sessionId
@@ -402,12 +435,39 @@ async function verify(ctx, signal) {
   assert.equal((await init(b)).status.aiRunning, false)
   await op(rebound.ticket, 'update_node', edit(noteId, 3, 'Editable after Agent disposal'))
 
+  const saved = await readWorkflow(aBound.ticket)
+  const stageId = saved.stages[0].id
+  assert.equal(stageId, restartStage)
+  await op(aBound.ticket, 'permission', { enabled: true })
+  const hold = { entered: false, release: new EventTarget() }
+  script.push({ hold })
+  const { runId } = await op(aBound.ticket, 'workflow_start', { stageId, revision: saved.revision })
+  await until(() => hold.entered, signal, 'running native Workflow turn')
+  const running = await readWorkflow(rebound.ticket)
+  assert.equal(running.stages[0].status, 'running')
+  assert.equal(running.stages[0].runId, runId)
+  assert.match(running.stages[0].skillSha256, /^[a-f0-9]{64}$/u)
+  assert.match(running.stages[0].harnessSha256, /^[a-f0-9]{64}$/u)
+  const workflowAgent = ctx.agents.get(a)
+  const workflowTool = (name, args) => ctx.tools.execute({ agent: workflowAgent, callId: randomUUID(), name,
+    arguments: { operationId: randomUUID(), ...args }, signal })
+  const oldTarget = await workflowTool('drama_append', { edges: [{ source: noteId, target: linkId }] })
+  assert.equal(oldTarget.isError, true)
+  assert.match(oldTarget.content[0].text, /工作流连线只允许指向本轮新建节点/u)
+  const workflowSubmit = await workflowTool('drama_submit', { nodeId: video.id })
+  assert.equal(workflowSubmit.isError, true)
+  assert.match(workflowSubmit.content[0].text, /工作流阶段不授权模型生成/u)
+  const loadSkill = async sessionId => ctx.tools.execute({ agent: (await sessions.resolveAgent(sessionId)).agent,
+    callId: randomUUID(), name: 'skill', arguments: { name: restartSkill }, signal })
+  assert.match((await loadSkill(a)).content[0].text, /固定使用启动时的 Skill 快照/u)
+  assert.equal((await loadSkill(b)).isError, false, 'The Workflow pin blocked an ordinary Session Skill load')
+  await locked(rebound.ticket, 'delete_node', { id: noteId, revision: 4 })
   await writeFile(statePath, JSON.stringify({
     sessionId: b, canvasId: rebound.status.canvasId, ticket: rebound.ticket, videoId: video.id, noteId,
+    workflowId: saved.id, stageId, runId, workspaceId: workspace.id, executorSessionId: a,
+    skillSha256: running.stages[0].skillSha256, harnessSha256: running.stages[0].harnessSha256,
   }))
-  await holdTurn(a, { nodeId: noteId })
-  await locked(rebound.ticket, 'delete_node', { id: noteId, revision: 4 })
-  console.info(`[drama-agent-fixture] PASS native Agent: canvas-wide locks, append while active, overlapping turns, other Workspace isolation, cancel/error/dispose unlock, Agent update/delete rejected, held turn at restart (${nativeCalls} native tool calls)`)
+  console.info(`[drama-agent-fixture] PASS native Agent: canvas-wide locks, append while active, overlapping turns, other Workspace isolation, cancel/error/dispose unlock, Agent update/delete rejected, Workflow old-target and submit rejected, held Workflow at restart (${nativeCalls} native tool calls)`)
 }
 
 async function until(check, signal, label, timeout = 15_000) {
@@ -422,7 +482,7 @@ async function until(check, signal, label, timeout = 15_000) {
 }
 
 async function runFixture() {
-  assert.equal(process.platform, 'win32', 'Requires the Windows Desktop DSH installation')
+  assert.equal(process.platform, 'win32', 'Requires Windows x64 and the native DSH runtime')
   const file = fileURLToPath(import.meta.url)
   const build = resolve(dirname(file), '..', 'dist')
   const sourceHost = join(build, 'host.js')
@@ -430,12 +490,18 @@ async function runFixture() {
   await access(sourceHost)
   await access(sourceKernel)
   const installation = join(process.env.LOCALAPPDATA, 'Programs', 'DeepSeek Harness')
-  const executable = join(installation, 'DeepSeek Harness.exe')
-  const cli = join(installation, 'resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/cli.js')
+  const npmCLI = process.env.DRAMA_DSH_CLI ? resolve(process.env.DRAMA_DSH_CLI) : undefined
+  const executable = npmCLI ? process.execPath : join(installation, 'DeepSeek Harness.exe')
+  const cli = npmCLI ? [npmCLI] : ['--expose-internals',
+    join(installation, 'resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/cli.js')]
   await access(executable)
-  const scratch = resolve(dirname(file), '..', '.runtime')
-  await mkdir(scratch, { recursive: true })
+  if (npmCLI) await access(npmCLI)
+  const scratch = resolve(tmpdir())
   const root = await mkdtemp(join(scratch, 'drama-native-agent-'))
+  if (npmCLI) {
+    const schema = createRequire(npmCLI).resolve('@deepseek-ai/schemastery/package.json')
+    await symlink(dirname(dirname(dirname(schema))), join(root, 'node_modules'), 'junction')
+  }
   const host = join(root, 'host.js')
   await copyFile(sourceHost, host)
   await copyFile(sourceKernel, join(root, 'studio.exe'))
@@ -447,11 +513,11 @@ async function runFixture() {
   await writeFile(overlay, `- insert:\n    - id: my-drama-studio\n      name: ${yaml(host)}\n    - id: ${name}\n      name: ${yaml(fixture)}\n`)
 
   async function launch(expected) {
-    const child = spawn(executable, ['--expose-internals', cli, 'web', '--patch', overlay,
+    const child = spawn(executable, [...cli, 'web', '--patch', overlay,
       '--host', '127.0.0.1', '--port', '0', '--no-open'], {
       windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
       env: {
-        ...process.env, ELECTRON_RUN_AS_NODE: '1', DSH_HOME: join(root, 'home'),
+        ...process.env, ...(npmCLI ? { DRAMA_DSH_CLI: npmCLI } : { ELECTRON_RUN_AS_NODE: '1' }), DSH_HOME: join(root, 'home'),
         DSH_AGENTS_HOME: join(root, 'agents'), DSH_TELEMETRY_DISABLED: '1', DSH_TOOLS_MODE: 'native', DEEPSEEK_API_KEY: '',
       },
     })
@@ -484,6 +550,7 @@ async function runFixture() {
     await launch(`[${name}] PASS restart`)
   } finally {
     assert.equal(dirname(root), scratch)
+    assert.ok(basename(root).startsWith('drama-native-agent-'))
     await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
   }
 }

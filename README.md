@@ -4,16 +4,21 @@
 
 ## 安装与启动
 
-Windows x64。已验证 DeepSeek Harness Desktop **0.2.1-rc.3**、Node.js 24、Go 1.26。Go 模块要求 1.25 或更新版本。
+Windows x64。本文使用 DeepSeek Harness **0.2.1-rc.3**。本地开发可使用仓库内的 npm 版 DSH，或使用已安装的 Desktop。按[本地开发指南](docs/LOCAL-DEVELOPMENT.md)首次准备运行时、构建插件并链接共享依赖。
 
-在仓库根目录执行：
+使用 npm 版 DSH 时，在仓库根目录的同一个 PowerShell 窗口中运行下列命令。
 
 ```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev.ps1
+$runtimeBin = (Resolve-Path -LiteralPath '.\.runtime\dsh-rc3\node_modules\.bin').Path
+$env:Path = "$runtimeBin;$env:Path"
+$env:pnpm_config_store_dir = Join-Path $PWD.Path '.runtime\pnpm-store'
+$env:DSH_HOME = Join-Path $PWD.Path '.runtime\dev-home'
+$env:DSH_AGENTS_HOME = Join-Path $PWD.Path '.runtime\dev-agents'
+$dsh = Join-Path $runtimeBin 'dsh.cmd'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev.ps1 -Launcher $dsh
 ```
 
-构建生成 Host、Browser bundle 和 Windows AMD64 的 `dist/studio.exe`。首次运行 `dev.ps1` 会在当前 DSH Home 的 `web` Profile 注册本地插件，后续启动复用同一 Profile。脚本会显示实际 Home、Profile 和端口，未设置 `DSH_HOME` 时使用 `~/.dsh`。默认端口为 3080。用 `-Port 3081` 改端口，或用 `-Launcher <dsh.cmd>` 指定启动程序。切换到已有 Web Profile 用 `-Profile <name>`，切换插件的本地 checkout 时用 `-Install` 重新链接。
+首次启动会把当前 checkout 链接到开发环境的 `web` Profile。DSH 默认打开浏览器。使用 `-NoOpen` 时，将终端输出的完整启动地址复制到浏览器。进入 Workspace 下的 Session 后，可在输入栏使用 **Drama**。默认端口为 3080，端口被占用时可在启动命令末尾加 `-Port 3081`。
 
 ## 原生 Settings → Drama Studio
 
@@ -61,6 +66,10 @@ I2V 映射首帧和可选尾帧，R2V 将参考素材按连接顺序传为 `[{ty
 当前工作区任一已连接的 Agent 运行期间，可以查看画布和任务、新增节点和连接、上传素材。已有节点和连接的修改、删除及恢复会暂停，最后一个 Agent 结束后自动恢复。生成队列继续保护运行中任务及其输入。删除节点会移除画布引用，项目素材文件和历史任务继续保留。
 
 Agent 工具有 `drama_context`、`drama_query`、`drama_append`、`drama_submit` 和 `drama_tasks`。Agent 对画布内容始终只读和追加。项目数据保存在 `.drama-studio/studio.db`。
+
+## 项目工作流
+
+进入项目会话后，输入框上方显示固定生产阶段。在 DSH 用户目录全局装填一次 `SKILL.md` 和 `harness.md`，所有 Workspace 共用。每个 Workspace 保存自己的进度，同一 Workspace 的各个会话可以查看和接续。点击当前阶段按钮使用当前会话的原生 Agent。视频生成仍由用户在 Canvas 中独立确认。 [装填路径与验收报告](docs/WORKFLOW.md)
 
 ## 卸载
 

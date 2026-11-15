@@ -76,7 +76,7 @@ func (p *project) submit(ctx context.Context, r Request, providers providerRegis
 		if r.Action == "submit" && !status.AutoGenerate {
 			return nil, automaticDisabled
 		}
-		kind, snapshot, err := submissionNode(ctx, tx, args.NodeID)
+		kind, snapshot, revision, err := submissionNode(ctx, tx, args.NodeID)
 		if err != nil {
 			return nil, err
 		}
@@ -105,7 +105,8 @@ func (p *project) submit(ctx context.Context, r Request, providers providerRegis
 		if err != nil {
 			return nil, err
 		}
-		encoded, err := json.Marshal(generationRequest{GenerationInput: input, SourceGroup: &group, SourceNodeIDs: sourceIDs})
+		encoded, err := json.Marshal(generationRequest{GenerationInput: input, SourceGroup: &group, SourceNodeIDs: sourceIDs,
+			SourceNodeRevision: revision, ManualConfirmation: r.Action != "submit"})
 		if err != nil {
 			return nil, err
 		}
@@ -126,13 +127,13 @@ func (p *project) submit(ctx context.Context, r Request, providers providerRegis
 	})
 }
 
-func submissionNode(ctx context.Context, tx *sql.Tx, id string) (kind, snapshot string, err error) {
-	err = tx.QueryRowContext(ctx, "SELECT type,content FROM nodes WHERE id=? AND deleted=0", id).Scan(&kind, &snapshot)
+func submissionNode(ctx context.Context, tx *sql.Tx, id string) (kind, snapshot string, revision int64, err error) {
+	err = tx.QueryRowContext(ctx, "SELECT type,content,revision FROM nodes WHERE id=? AND deleted=0", id).Scan(&kind, &snapshot, &revision)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", "", invalid("待生成节点不存在于当前 Canvas")
+		return "", "", 0, invalid("待生成节点不存在于当前 Canvas")
 	}
 	if err != nil {
-		return "", "", err
+		return "", "", 0, err
 	}
 	var content struct {
 		Mode   *string `json:"mode"`
@@ -141,21 +142,21 @@ func submissionNode(ctx context.Context, tx *sql.Tx, id string) (kind, snapshot 
 		Prompt string  `json:"prompt"`
 	}
 	if (kind != "image" && kind != "video") || json.Unmarshal([]byte(snapshot), &content) != nil {
-		return "", "", invalid("请选择图片或视频生成节点")
+		return "", "", 0, invalid("请选择图片或视频生成节点")
 	}
 	if kind == "video" {
 		if content.Mode != nil && *content.Mode == "" {
-			return "", "", invalid("请先选择视频生成方式")
+			return "", "", 0, invalid("请先选择视频生成方式")
 		}
 		if content.Mode != nil && *content.Mode == "asset" ||
 			content.Mode == nil && (content.Path != "" || content.URL != "") {
-			return "", "", invalid("请选择视频生成草稿")
+			return "", "", 0, invalid("请选择视频生成草稿")
 		}
 		if strings.TrimSpace(content.Prompt) == "" {
-			return "", "", invalid("请先填写视频节点的完整提示词")
+			return "", "", 0, invalid("请先填写视频节点的完整提示词")
 		}
 	}
-	return kind, snapshot, nil
+	return kind, snapshot, revision, nil
 }
 
 func (p *project) tasks(ctx context.Context, r Request) (any, error) {

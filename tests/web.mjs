@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { copyFile, mkdir, mkdtemp, readFile, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { createServer as createHTTPServer } from 'node:http'
 import { createServer } from 'node:net'
+import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -15,6 +16,7 @@ const root = fileURLToPath(new URL('..', import.meta.url))
 const runtime = join(root, '.runtime')
 const fixtureSource = `
 import { watch } from 'node:fs'
+import { createRequire } from 'node:module'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -24,18 +26,53 @@ export const inject = ['sessionController', 'workspaceRegistry', 'tools', 'llm']
 
 export async function apply(ctx) {
   console.info('[drama-web-fixture] PID ' + process.pid)
-  const llm = join(dirname(process.execPath), 'resources', 'app.asar', 'dsh', 'node_modules',
-    '@deepseek-ai', 'dsh-llm', 'lib', 'index.js')
+  const cli = process.env.DRAMA_DSH_CLI
+  const llm = cli ? createRequire(cli).resolve('@deepseek-ai/dsh-llm')
+    : join(dirname(process.execPath), 'resources', 'app.asar', 'dsh', 'node_modules',
+      '@deepseek-ai', 'dsh-llm', 'lib', 'index.js')
   const { LlmAdapter, createMessage, createUserMessage } = await import(pathToFileURL(llm).href)
   const provider = 'drama-web-activity-fixture'
   const model = 'held-turn'
   const queued = []
   const running = new Map()
+  const fixtureModels = ['workflow-A', 'workflow-B', 'workflow-C', 'workflow-Other']
+  const sessionModels = new Map()
+  const workflowTools = new Map()
+  const workflowHolds = new Map()
+  const workflowInputs = new Map()
   ctx.llm.registerAdapter([provider], new class extends LlmAdapter {
     async listModels() {
-      return [{ provider, id: model, name: model }]
+      return [model, ...fixtureModels].map(id => ({ provider, id, name: id }))
     }
     async * stream(options) {
+      const steps = workflowTools.get(options.model)
+      if (steps?.length) {
+        const { call, hold, pause, failure } = steps.shift()
+        workflowInputs.set(options.model, options.messages.flatMap(message =>
+          Array.isArray(message.content) ? message.content.filter(item => item.type === 'text').map(item => item.text) : []))
+        if (hold) await new Promise(resolve => setTimeout(resolve, hold))
+        if (pause) {
+          const gate = Promise.withResolvers()
+          workflowHolds.set(options.model, gate)
+          options.signal?.addEventListener('abort', gate.resolve, { once: true })
+          try { await gate.promise } finally {
+            options.signal?.removeEventListener('abort', gate.resolve)
+            workflowHolds.delete(options.model)
+          }
+        }
+        options.signal?.throwIfAborted()
+        if (failure) throw new Error(failure)
+        if (call) {
+          if (!options.tools?.some(tool => tool.name === call.name)) throw new Error('Missing test tool ' + call.name)
+          yield { type: 'block-start', index: 0, blockType: 'tool-call' }
+          yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: call.id, name: call.name, arguments: JSON.stringify(call.args) } }
+        } else {
+          yield { type: 'block-start', index: 0, blockType: 'text' }
+          yield { type: 'block-end', index: 0, block: { type: 'text', text: 'Workflow step completed.' } }
+        }
+        yield { type: 'finish', reason: { kind: call ? 'tool-calls' : 'stop' } }
+        return
+      }
       const gate = queued.shift()
       if (!gate) throw new Error('No scripted activity turn')
       const signal = options.signal
@@ -55,7 +92,7 @@ export async function apply(ctx) {
       }
     }
   })
-  async function activity({ sessionId, requestId, action, nodeId }) {
+  async function activity({ sessionId, requestId, action, nodeId, steps }) {
     const { agent } = await ctx.sessionController.resolveAgent(sessionId)
     if (!agent) throw new Error('Native activity Agent did not resolve')
     if (action === 'start') {
@@ -84,6 +121,38 @@ export async function apply(ctx) {
       gate.finish.resolve()
     } else if (action === 'cancel') {
       if (!ctx.sessionController.cancel({ sessionId }).accepted) throw new Error('Native cancel rejected')
+    } else if (action === 'workflow-queue') {
+      const selected = sessionModels.get(sessionId)
+      if (!selected) throw new Error('Fixture Session has no workflow model')
+      await ctx.sessionController.selectModel({ sessionId, provider, model: selected })
+      workflowTools.set(selected, steps)
+    } else if (action === 'workflow-held') {
+      return { status: workflowHolds.has(sessionModels.get(sessionId)) }
+    } else if (action === 'workflow-release') {
+      workflowHolds.get(sessionModels.get(sessionId))?.resolve()
+    } else if (action === 'workflow-steer') {
+      const result = await ctx.sessionController.prompt({ sessionId, requestId, mode: 'steer',
+        content: [{ type: 'text', text: nodeId }] }, AbortSignal.timeout(8000))
+      if (!result.accepted) throw new Error('Native steer fixture was rejected')
+    } else if (action === 'workflow-model-input') {
+      return { status: workflowInputs.get(sessionModels.get(sessionId)) }
+    } else if (action === 'workflow-transcript') {
+      return agent.session.snapshotEvents().flatMap(event => {
+        const { type, data } = event
+        if (type === 'user/message') {
+          const context = data.source?.rpcId?.startsWith('drama-workflow:')
+            ? JSON.parse(data.content[0].text.split(String.fromCharCode(10)).find(line => line.startsWith('{'))) : undefined
+          const instructions = data.source?.kind === 'skill-invocation' ? data.content[0]?.text : undefined
+          return [{ type, source: data.source, context, instructions }]
+        }
+        if (type === 'assistant/message') return [{ type, source: data.message.source }]
+        if (type === 'tool/call') return [{ type, name: data.name, arguments: data.arguments }]
+        if (type === 'tool/result' && data.message.isError) return [{
+          type, toolCallId: data.message.toolCallId, error: data.message.content.map(block => block.text ?? '').join(' '),
+        }]
+        if (type === 'turn/end') return [{ type, reason: data.reason.kind }]
+        return []
+      })
     } else if (action !== 'status') throw new Error('Unknown activity test command')
     return { status: agent.status }
   }
@@ -124,6 +193,7 @@ export async function apply(ctx) {
     return () => {
       watcher.close()
       for (const gate of running.values()) gate.finish.resolve()
+      for (const gate of workflowHolds.values()) gate.resolve()
     }
   })
   const records = []
@@ -134,6 +204,7 @@ export async function apply(ctx) {
     for (const suffix of workspaceName === 'Studio Shared' ? ['A', 'B', 'C'] : ['Other']) {
       const name = 'Studio Session ' + suffix
       const { sessionId } = await ctx.sessionController.create({ workspaceId: workspace.id })
+      sessionModels.set(sessionId, 'workflow-' + suffix)
       const { agent } = await ctx.sessionController.resolveAgent(sessionId)
       const session = agent.session
       session.append('turn/start', { turn: 1 })
@@ -149,6 +220,14 @@ export async function apply(ctx) {
       session.append('step/end', { turn: 1, step: 1 })
       session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
       await ctx.sessionController.rename({ sessionId, title: name })
+      if (workspaceName === 'Studio Shared' && process.env.DRAMA_REAL_WORKFLOW === '1') {
+        const provider = 'deepseek-official'
+        const available = await ctx.llm.listModels(provider)
+        const selected = available.find(item => item.id === 'deepseek-chat')
+          ?? available.find(item => item.id === 'deepseek-v4-flash') ?? available[0]
+        if (!selected) throw new Error('DeepSeek API did not offer any models for the fixture')
+        await ctx.sessionController.selectModel({ sessionId, provider, model: selected.id })
+      }
       records.push({ name, workspaceName, sessionId, workspaceId: workspace.id })
     }
   }
@@ -172,6 +251,7 @@ test('Windows launcher reports an occupied Web port before loading the profile',
     const result = spawnSync('powershell.exe', [
       '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', join(root, 'scripts', 'dev.ps1'),
       '-Profile', 'port-check', '-Port', String(port), '-NoOpen',
+      ...(dshCLI ? ['-Launcher', dshCLI] : []),
     ], {
       cwd: root, encoding: 'utf8', windowsHide: true, timeout: 10_000,
       env: { ...process.env, DSH_HOME: join(runtime, randomUUID()) },
@@ -200,6 +280,7 @@ const hasImage = existsSync(imageAsset)
 const hasVideo = existsSync(videoAsset)
 const capture = process.env.DRAMA_UIUX_CAPTURE === '1'
 const studioExecutable = process.env.DRAMA_UIUX_STUDIO_EXE
+const dshCLI = process.env.DRAMA_DSH_CLI ? resolve(process.env.DRAMA_DSH_CLI) : undefined
 
 async function screenshot(page, file) {
   if (!capture) return
@@ -207,10 +288,12 @@ async function screenshot(page, file) {
   await page.screenshot({ path: join(evidence, file), animations: 'disabled' })
 }
 
-async function withWeb(run, { providerFixture = false } = {}) {
+async function withWeb(run, { providerFixture = false, realWorkflow = false, workflowFixture = false } = {}) {
   assert.ok(chrome, 'Install Chrome or Edge for native DSH Web verification')
   await mkdir(runtime, { recursive: true })
-  const home = await mkdtemp(join(runtime, 'web-'))
+  const homeRoot = workflowFixture ? tmpdir() : runtime
+  const homePrefix = workflowFixture ? 'drama-workflow-' : 'web-'
+  const home = await mkdtemp(join(homeRoot, homePrefix))
   const profile = join(home, 'profiles', 'web')
   const fixture = join(home, 'fixture.mjs')
   const entryRoot = join(profile, 'node_modules', 'dsh-my-drama-studio')
@@ -222,8 +305,14 @@ async function withWeb(run, { providerFixture = false } = {}) {
   }))
   await writeFile(fixture, fixtureSource)
   const port = await freePort()
-  const env = { ...process.env, DSH_HOME: home, DSH_AGENTS_HOME: join(home, 'agents'), DSH_TELEMETRY_DISABLED: '1', DEEPSEEK_API_KEY: '' }
-  const isolatedPlugin = providerFixture || studioExecutable
+  const env = { ...process.env, DSH_HOME: home, DSH_AGENTS_HOME: join(home, 'agents'), DSH_TELEMETRY_DISABLED: '1',
+    DRAMA_DSH_CLI: dshCLI, DRAMA_REAL_WORKFLOW: realWorkflow ? '1' : '',
+    DEEPSEEK_API_KEY: realWorkflow ? process.env.DEEPSEEK_API_KEY : '' }
+  if (realWorkflow) {
+    assert.ok(env.DEEPSEEK_API_KEY, 'Set DEEPSEEK_API_KEY for the real Workflow acceptance run')
+    delete env.DEEPSEEK_BASE_URL
+  }
+  const isolatedPlugin = providerFixture || studioExecutable || dshCLI
   if (isolatedPlugin) {
     await mkdir(join(entryRoot, 'dist'), { recursive: true })
     for (const file of ['package.json', 'dsh.bundle.patch', 'dist/host.js', 'dist/client.js']) {
@@ -237,7 +326,7 @@ async function withWeb(run, { providerFixture = false } = {}) {
       })
       assert.equal(compile.status, 0, compile.stderr || compile.error?.message)
       env.DRAMA_UIUX_PROVIDER_FIXTURE = resolve(videoAsset)
-    } else await copyFile(studioExecutable, executable)
+    } else await copyFile(studioExecutable ?? join(root, 'dist', 'studio.exe'), executable)
   } else await symlink(root, entryRoot, 'junction')
   await writeFile(join(profile, 'cordis.patch.yml'), `- id: ui-settings-models
   config:
@@ -249,11 +338,12 @@ async function withWeb(run, { providerFixture = false } = {}) {
   const launch = `$launcher = Join-Path $env:LOCALAPPDATA 'Programs/DeepSeek Harness/resources/runtime/cli/bin/dsh.cmd'
 & $launcher web --host 127.0.0.1 --port ${port} --no-open
 exit $LASTEXITCODE`
-  const [shell, args] = isolatedPlugin ? ['pwsh.exe', ['-NoProfile', '-Command', launch]]
+  const [shell, args] = dshCLI ? [process.execPath, [dshCLI, 'web', '--host', '127.0.0.1', '--port', String(port), '--no-open']]
+    : isolatedPlugin ? ['pwsh.exe', ['-NoProfile', '-Command', launch]]
     : ['powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', join(root, 'scripts', 'dev.ps1'),
       '-Port', String(port), '-NoOpen']]
   const dsh = spawn(shell, args, {
-    cwd: root, windowsHide: true, env,
+    cwd: workflowFixture ? home : root, windowsHide: true, env,
   })
   let output = ''
   let launchError
@@ -290,7 +380,8 @@ exit $LASTEXITCODE`
     passed = true
   } catch (error) {
     await page?.screenshot({ path: join(home, 'failure.png'), animations: 'disabled' }).catch(() => {})
-    throw new Error(redact(`${error.stack}\nTest profile: ${home}\nBrowser errors:\n${[...pageErrors, ...consoleErrors].join('\n')}\nDSH output:\n${output.split(/\r?\n/u).slice(0, 25).join('\n')}`))
+    const diagnostics = `${error.stack}\nTest profile: ${home}\nBrowser errors:\n${[...pageErrors, ...consoleErrors].join('\n')}\nDSH output:\n${output.split(/\r?\n/u).slice(0, 25).join('\n')}`
+    throw new Error(redact(realWorkflow ? diagnostics.replaceAll(env.DEEPSEEK_API_KEY, '[redacted]') : diagnostics))
   } finally {
     const closingBrowser = browser?.close()
     const pid = output.match(/\[drama-web-fixture\] PID (\d+)/u)?.[1]
@@ -309,8 +400,8 @@ exit $LASTEXITCODE`
     if (!isolatedPlugin) await unlink(entryRoot)
     if (passed) {
       const target = resolve(home)
-      assert.equal(dirname(target), resolve(runtime))
-      assert.ok(basename(target).startsWith('web-'))
+      assert.equal(dirname(target), resolve(homeRoot))
+      assert.ok(basename(target).startsWith(homePrefix))
       await rm(target, { recursive: true, maxRetries: 4, retryDelay: 120 })
     }
   }
@@ -393,10 +484,10 @@ async function poll(fn, label, timeout = 10_000) {
   throw new Error(label)
 }
 
-async function nativeActivity(home, record, action, nodeId) {
+async function nativeActivity(home, record, action, nodeId, steps) {
   const requestId = randomUUID()
   const temporary = join(home, 'activity-' + requestId + '.tmp')
-  await writeFile(temporary, JSON.stringify({ sessionId: record.sessionId, requestId, action, nodeId }))
+  await writeFile(temporary, JSON.stringify({ sessionId: record.sessionId, requestId, action, nodeId, steps }))
   await rename(temporary, join(home, 'activity-request-' + requestId + '.json'))
   const result = await poll(async () => {
     try {
@@ -406,26 +497,26 @@ async function nativeActivity(home, record, action, nodeId) {
     }
   }, 'native activity command did not return: ' + action)
   assert.ok(!result.error, result.error)
-  return result.status
+  return action === 'workflow-transcript' ? result : result.status
 }
 
-async function frameWidth(page, expected) {
-  const width = (await panel(page).boundingBox())?.width ?? 0
+async function frameWidth(pane, expected) {
+  const width = (await pane.boundingBox())?.width ?? 0
   return expected ? Math.abs(width - expected) < 12 : width
 }
 
-async function resizeRightbar(page, target) {
+async function resizeRightbar(page, target, pane = panel(page)) {
   const handle = page.locator('[data-side="rightbar"]').first()
   await handle.waitFor()
   const bounds = await handle.boundingBox()
-  const current = await frameWidth(page)
+  const current = await frameWidth(pane)
   const x = bounds.x + bounds.width / 2
   const y = bounds.y + Math.min(85, bounds.height / 2)
   await page.mouse.move(x, y)
   await page.mouse.down()
   await page.mouse.move(x + current - target, y, { steps: 12 })
   await page.mouse.up()
-  await poll(() => frameWidth(page, target), `native rightbar did not resize to ${target} CSS px`)
+  await poll(() => frameWidth(pane, target), `native rightbar did not resize to ${target} CSS px`)
 }
 
 async function assertCanvasLayout(page) {
@@ -451,6 +542,441 @@ async function setPermission(page, enabled) {
   await poll(async () => (await status.textContent())?.includes(enabled ? '自动' : '手动'), 'permission pill did not update')
   if (await toggle.isVisible()) await page.keyboard.press('Escape')
 }
+
+async function openWorkflow(page, record) {
+  await select(page, record)
+  const pane = page.getByTestId('drama-workflow').and(page.locator('[data-session-id="' + record.sessionId + '"]'))
+  await pane.waitFor()
+  return pane
+}
+
+const fixedWorkflowIds = ['content-analysis', 'shooting-script', 'storyboard', 'asset-binding', 'video-deployment', 'video-generation', 'final-review']
+const fixedWorkflowNames = ['内容分析', '拍摄脚本制作', '分镜制作', '素材抽卡与绑定', '视频节点部署', '视频生成', '成片验收']
+
+async function installWorkflowFiles(home, id, harness, method) {
+  const name = 'drama-' + id
+  const skillDir = join(home, 'skills', name)
+  const harnessDir = join(home, 'drama-studio', 'workflows', 'drama-production', 'stages', id)
+  await mkdir(harnessDir, { recursive: true })
+  await writeFile(join(harnessDir, 'harness.md'), harness)
+  if (method) {
+    await mkdir(skillDir, { recursive: true })
+    const header = ['---', 'name: ' + name, 'description: Workflow acceptance ' + id, '---', '', method]
+    await writeFile(join(skillDir, 'SKILL.md'), header.join('\n'))
+  }
+}
+
+const sha256 = text => createHash('sha256').update(text).digest('hex')
+
+function workflowCalls(...calls) {
+  return [...calls.map(({ name, args }, index) => ({ hold: index === 0 ? 450 : 0, call: { id: randomUUID(), name, args } })), {}]
+}
+
+function workflowNote(type, content) {
+  return { name: 'drama_append', args: { operationId: randomUUID(), nodes: [{ id: randomUUID(), type, content }] } }
+}
+
+test('Workflow dock runs three installed stages through the native Agent', { timeout: 300_000 }, async () => {
+  const realWorkflow = process.env.DRAMA_REAL_WORKFLOW === '1'
+  await withWeb(async ({ page, records, home }) => {
+    const [a, b, c, other] = records
+    const pane = await openWorkflow(page, a)
+    let action = pane.getByTestId('drama-workflow-action')
+    const ticket = await ticketFor(page, a.sessionId)
+    const get = () => operate(page, ticket, 'workflow_get', {})
+    const initial = await get()
+    assert.equal(initial.id, 'drama-production')
+    assert.deepEqual(initial.stages.map(({ id, name }) => [id, name]), fixedWorkflowIds.map((id, index) => [id, fixedWorkflowNames[index]]))
+    assert.ok(initial.stages.every(stage => stage.status === 'not_started'))
+    assert.equal(initial.stages[0].files.skillPath, join(home, 'skills', 'drama-content-analysis', 'SKILL.md'))
+    assert.equal(initial.stages[0].files.harnessPath, join(home, 'drama-studio', 'workflows', 'drama-production', 'stages', 'content-analysis', 'harness.md'))
+    assert.equal(initial.stages[0].files.skillReady, false)
+    assert.equal(initial.stages[0].files.harnessReady, false)
+    assert.equal(await pane.locator('form, textarea, input[type=text]').count(), 0)
+    assert.equal(await page.locator('[data-rightbar-col] [data-dockkit-tab]').filter({ hasText: 'Drama Workflow' }).count(), 0)
+    await pane.getByRole('button', { name: '查看缺失路径', exact: true }).click()
+    const details = page.getByRole('dialog', { name: fixedWorkflowNames[0], exact: true })
+    await details.getByText(initial.stages[0].files.skillPath, { exact: true }).waitFor()
+    await details.getByText(initial.stages[0].files.harnessPath, { exact: true }).waitFor()
+    await details.getByRole('button', { name: '关闭阶段详情', exact: true }).click()
+    const editor = page.locator('[data-composer-input][contenteditable=true]')
+    await editor.waitFor()
+    assert.ok(await pane.evaluate(element => {
+      const input = document.querySelector('[data-composer-input][contenteditable=true]')
+      return input && element.getBoundingClientRect().bottom <= input.getBoundingClientRect().top + 1
+    }), 'workflow progress is not above the native composer')
+
+    const harnesses = [
+      'Create one independent Canvas note. Use the exact test marker specified in the loaded Skill. Do not modify existing nodes.',
+      'Read the approved analysis and copy its marker into one new Canvas script node.',
+      'Read the approved script and use its marker in one new Canvas shot node.',
+    ]
+    const methods = [
+      'Immediately call drama_append with exactly {"operationId":"fixed-analysis-1","nodes":[{"type":"note","content":{"title":"Workflow analysis","description":"APRICOT-PLAN"}}]}. Do not add arguments. After success, return its ID and stop.',
+      'Call drama_query with {"id":"<approved analysis node ID>"}. Read its description. Then call drama_append with {"operationId":"fixed-script-1","nodes":[{"type":"script","content":{"text":"<the analysis description copied exactly>"}}]}. These are the only fields. After success, return the new ID and stop.',
+      'Call drama_query with {"id":"<approved script node ID>"}. Copy its text verbatim into the description of a new shot. Use drama_append arguments {"operationId":"fixed-shot-1","nodes":[{"type":"shot","content":{"description":"<script text>"}}]}. Then stop.',
+    ]
+    const stages = fixedWorkflowIds.slice(0, methods.length)
+    for (const [index, id] of stages.entries()) await installWorkflowFiles(home, id, harnesses[index], methods[index])
+    await poll(async () => (await get()).stages.slice(0, 3).every(stage => stage.files.skillReady && stage.files.harnessReady),
+      'Native Skill catalog did not discover new global files', 20_000)
+    await poll(() => action.filter({ hasText: '开始内容分析' }).isEnabled(), 'Workflow did not recognize new stage files in the open Session', 20_000)
+    const layoutKey = 'dsh.sidebar-right.v1.' + a.sessionId
+    await page.evaluate(({ key, sessionId }) => {
+      const layout = {
+        nodes: { pane1: { kind: 'pane', id: 'pane1', host: 'dock', tabs: ['tab2'], activeTabId: 'tab2' } },
+        tabs: { tab2: { id: 'tab2', kind: 'drama-workflow', contentId: 'sidebar://drama-workflow', title: 'Drama Workflow' } },
+        rootId: 'pane1', floats: [], activePaneId: 'pane1', expanded: true, mode: 'push',
+      }
+      localStorage.setItem(key, JSON.stringify({ bySession: { [sessionId]: { layout, minted: 2 } } }))
+    }, { key: layoutKey, sessionId: a.sessionId })
+    await page.reload({ waitUntil: 'domcontentloaded' })
+    await openWorkflow(page, a)
+    await poll(() => page.evaluate(key => !localStorage.getItem(key)?.includes('"drama-workflow"'), layoutKey),
+      'Old Workflow tab still occupied the native sidebar after reload')
+
+    const waitStatus = (index, status) => poll(async () => {
+      const current = (await get()).stages[index]
+      if (current.status === 'failed') {
+        const executor = records.find(record => record.sessionId === current.sessionId) ?? a
+        const events = realWorkflow ? await nativeActivity(home, executor, 'workflow-transcript') : []
+        const tools = events.filter(event => event.type === 'tool/call' || event.type === 'tool/result').slice(-12)
+        assert.fail(tools.length ? current.error + '\n' + JSON.stringify(tools) : current.error)
+      }
+      return current.status === status && current
+    }, 'Stage ' + (index + 1) + ' did not enter ' + status, 90_000)
+    const queue = (record, ...calls) => !realWorkflow && nativeActivity(home, record, 'workflow-queue', undefined, workflowCalls(...calls))
+    await queue(a, workflowNote('note', { title: 'Workflow analysis', description: 'APRICOT-PLAN' }))
+    await action.filter({ hasText: '开始内容分析' }).click()
+    if (!realWorkflow) await waitStatus(0, 'running')
+    const analysis = await waitStatus(0, 'review')
+    assert.equal(analysis.sessionId, a.sessionId)
+    assert.ok(analysis.startedAt && analysis.finishedAt)
+    assert.equal(analysis.workspaceId, a.workspaceId)
+    assert.equal(analysis.canvasId, (await ok(page, 'init', { sessionId: a.sessionId })).status.canvasId)
+    assert.equal(analysis.definitionVersion, 1)
+    for (const peer of [b, c]) {
+      await openWorkflow(page, peer)
+      const peerTicket = await ticketFor(page, peer.sessionId)
+      const observed = (await operate(page, peerTicket, 'workflow_get', {})).stages[0]
+      assert.deepEqual(observed, analysis, 'The same workspace exposed different progress or artifact versions')
+    }
+    const executorPane = await openWorkflow(page, b)
+    action = executorPane.getByTestId('drama-workflow-action')
+    await queue(b, { name: 'drama_query', args: { id: analysis.outputs[0].id } }, workflowNote('script', { text: 'APRICOT-PLAN' }))
+    await action.filter({ hasText: /确认.*开始拍摄脚本/u }).click()
+    const script = await waitStatus(1, 'review')
+    assert.deepEqual(script.inputs, analysis.outputs)
+    assert.equal(script.sessionId, b.sessionId)
+    assert.equal((await get()).stages[0].approvals.at(-1).sessionId, b.sessionId)
+    assert.match(JSON.stringify((await query(page, ticket, { id: script.outputs[0].id })).nodes[0].content), /APRICOT-PLAN/u)
+    await queue(b, { name: 'drama_query', args: { id: script.outputs[0].id } }, workflowNote('shot', { description: 'APRICOT-PLAN' }))
+    await action.filter({ hasText: /确认.*开始分镜/u }).click()
+    const storyboard = await waitStatus(2, 'review')
+    assert.deepEqual(storyboard.inputs, script.outputs)
+    assert.equal(storyboard.sessionId, b.sessionId)
+    const shot = storyboard.outputs[0].id
+    assert.equal((await query(page, ticket, { id: shot })).nodes[0].type, 'shot')
+    await action.filter({ hasText: /确认分镜/u }).click()
+    await waitStatus(2, 'approved')
+
+    await open(page, b)
+    await card(page, shot).waitFor()
+    await page.reload({ waitUntil: 'domcontentloaded' })
+    const shared = await openWorkflow(page, b)
+    await shared.locator('[data-testid="drama-workflow-current"][data-stage-id="asset-binding"]').waitFor()
+    const sharedTicket = await ticketFor(page, b.sessionId)
+    const sharedView = await operate(page, sharedTicket, 'workflow_get', {})
+    assert.deepEqual(sharedView.stages.slice(0, 3).map(stage => stage.status), ['approved', 'approved', 'approved'])
+    const isolated = await openWorkflow(page, other)
+    await isolated.locator('[data-testid="drama-workflow-current"][data-stage-id="content-analysis"]').waitFor()
+    const otherTicket = await ticketFor(page, other.sessionId)
+    const otherView = await operate(page, otherTicket, 'workflow_get', {})
+    assert.ok(otherView.stages.every(stage => stage.status === 'not_started'))
+    assert.deepEqual(otherView.stages.map(({ id, name, skill, files }) => ({ id, name, skill, files })),
+      sharedView.stages.map(({ id, name, skill, files }) => ({ id, name, skill, files })))
+    for (const record of [a, other]) {
+      assert.equal(existsSync(join(home, record.workspaceName, '.agents', 'skills')), false)
+      assert.equal(existsSync(join(home, record.workspaceName, 'workflows')), false)
+    }
+
+    await openWorkflow(page, a)
+    const original = (await query(page, ticket, { id: analysis.outputs[0].id })).nodes[0]
+    await operate(page, ticket, 'update_node', { operationId: randomUUID(), id: original.id, revision: original.revision,
+      content: { ...original.content, description: 'APRICOT-PLAN updated manually' } })
+    await operate(page, ticket, 'workflow_return', { operationId: randomUUID(), stageId: stages[0], runId: analysis.runId })
+    await operate(page, ticket, 'workflow_approve', { operationId: randomUUID(), stageId: stages[0], runId: analysis.runId,
+      outputs: [{ id: original.id, revision: original.revision + 1 }] })
+    await waitStatus(1, 'stale')
+    await waitStatus(2, 'stale')
+    assert.equal((await query(page, ticket, { id: shot })).nodes[0].deleted ?? false, false)
+
+    const [first, continued] = await Promise.all([a, b].map(record => nativeActivity(home, record, 'workflow-transcript')))
+    assert.ok(!continued.some(event => event.source?.rpcId === 'drama-workflow:' + analysis.runId))
+    const transcript = [...first, ...continued]
+    const invocations = transcript.filter(event => event.source?.kind === 'skill-invocation')
+    assert.deepEqual(invocations.map(event => event.source.name), stages.map(id => 'drama-' + id))
+    assert.deepEqual(transcript.flatMap(event => event.context ?
+      [[event.context.skill, event.context.harness, event.context.approvedInputs]] : []), [
+      ['drama-' + stages[0], harnesses[0], []], ['drama-' + stages[1], harnesses[1], analysis.outputs], ['drama-' + stages[2], harnesses[2], script.outputs],
+    ])
+    for (const [index, stage] of [analysis, script, storyboard].entries()) {
+      assert.equal(stage.skillSha256, sha256(invocations[index].instructions))
+      assert.equal(stage.harnessSha256, sha256(harnesses[index]))
+    }
+    const realModels = [...new Set(transcript.filter(event => event.source?.provider === 'deepseek-official').map(event => event.source.model))]
+    if (realWorkflow) assert.ok(realModels.length, JSON.stringify(transcript))
+    assert.ok(transcript.filter(event => event.type === 'tool/call' && event.name === 'drama_append').length >= 3)
+    assert.ok(transcript.some(event => event.type === 'tool/call' && event.name === 'drama_query'))
+    assert.equal((await operate(page, ticket, 'tasks', {})).tasks.length, 0)
+    const source = realWorkflow ? 'DeepSeek API (' + realModels.join(', ') + ')' : 'scripted model'
+    console.info('Workflow evidence: 3 globally installed Skills loaded through two independent Sessions via ' + source + ', confirmed revisions, Canvas outputs and zero generation tasks')
+  }, { realWorkflow, workflowFixture: true })
+})
+
+test('Workflow dock checks files, native chat, failed runs and generation permission', { timeout: 85_000 }, async () => {
+  await withWeb(async ({ page, records, home }) => {
+    const [record] = records
+    const id = fixedWorkflowIds[0]
+    await installWorkflowFiles(home, id, '   ')
+    const pane = await openWorkflow(page, record)
+    const action = pane.getByTestId('drama-workflow-action')
+    const ticket = await ticketFor(page, record.sessionId)
+    const get = () => operate(page, ticket, 'workflow_get', {})
+    const readState = (status, previousId) => poll(async () => {
+      const stage = (await get()).stages[0]
+      return stage.status === status && stage.runId !== previousId && stage
+    }, 'Stage did not enter ' + status)
+    const queue = (...steps) => nativeActivity(home, record, 'workflow-queue', undefined, steps)
+    const files = (await get()).stages[0].files
+    assert.equal(files.skillReady, false)
+    assert.equal(files.harnessReady, false)
+    assert.ok(files.issues.length >= 2)
+    await page.setViewportSize({ width: 815, height: 850 })
+    assert.ok(await pane.evaluate(element => element.scrollWidth <= element.clientWidth + 1), 'narrow Workflow overflowed')
+
+    await queue({})
+    await page.locator('[data-composer-input][contenteditable=true]').fill('Native chat still sends beside the Workflow dock')
+    await page.getByRole('button', { name: 'Send message', exact: true }).click()
+    await page.getByText('Workflow step completed.', { exact: true }).waitFor()
+    assert.equal((await get()).stages[0].runId, undefined)
+
+    await installWorkflowFiles(home, id, 'Append one Canvas analysis note.', 'Create a one-line note with drama_append.')
+    await poll(async () => {
+      const { files } = (await get()).stages[0]
+      return files.skillReady && files.harnessReady
+    }, 'Global files did not become ready')
+    await queue({ failure: 'Scripted native model stream failure' })
+    await action.filter({ hasText: '开始内容分析' }).click()
+    const failed = await readState('failed')
+    assert.match(failed.error, /DSH Agent 执行失败/u)
+
+    await queue({ hold: 2500 })
+    const calls = []
+    page.on('request', request => {
+      if (request.url().endsWith('/api/drama/operation') && request.postDataJSON()?.action === 'workflow_start') calls.push(request)
+    })
+    await action.filter({ hasText: '重试' }).evaluate(button => { button.click(); button.click() })
+    const running = await readState('running', failed.runId)
+    assert.equal(calls.length, 1)
+    await nativeActivity(home, record, 'cancel')
+    const cancelled = await readState('failed', failed.runId)
+    assert.equal(cancelled.runId, running.runId)
+    assert.match(cancelled.error, /取消/u)
+
+    await setPermission(page, true)
+    const output = workflowNote('note', { text: 'Recovery fixture output' })
+    const submitId = randomUUID()
+    await queue(...workflowCalls(output).slice(0, 1), { call: { id: submitId, name: 'drama_submit', args: {
+      operationId: randomUUID(), nodeId: output.args.nodes[0].id,
+    } } }, {})
+    await action.filter({ hasText: '重试' }).click()
+    const ready = await readState('review', cancelled.runId)
+    const transcript = await nativeActivity(home, record, 'workflow-transcript')
+    assert.match(transcript.find(event => event.toolCallId === submitId)?.error ?? '', /工作流阶段不授权模型生成/u)
+    assert.equal((await operate(page, ticket, 'tasks', {})).tasks.length, 0)
+    await action.filter({ hasText: /确认内容分析/u }).click()
+    const approved = await readState('approved')
+    assert.deepEqual(approved.outputs, ready.outputs)
+    const next = (await get()).stages[1]
+    assert.equal(next.status, 'not_started')
+    assert.equal(next.files.skillReady, false)
+    assert.equal(next.files.harnessReady, false)
+  }, { workflowFixture: true })
+})
+
+test('Workflow dock shares one package but fences runs and pins revisions per workspace', { timeout: 120_000 }, async () => {
+  await withWeb(async ({ page, records, home }) => {
+    const [a, b, c, other] = records
+    const oldHarness = 'Respect fixture GLOBAL-HARNESS-V1.', newHarness = 'Respect fixture GLOBAL-HARNESS-V2.'
+    const oldSkill = 'Use the pinned instructions GLOBAL-SKILL-V1.', newSkill = 'Use the pinned instructions GLOBAL-SKILL-V2.'
+    for (const id of fixedWorkflowIds.slice(0, 3)) await installWorkflowFiles(home, id, oldHarness, oldSkill)
+    const observer = await openWorkflow(page, c)
+    const tickets = new Map(await Promise.all(records.map(async record => [record.sessionId, await ticketFor(page, record.sessionId)])))
+    const call = (record, action, data = {}) => operate(page, tickets.get(record.sessionId), action, data)
+    for (const record of [a, b, other]) await call(record, 'bind', { operationId: randomUUID() })
+    const get = record => call(record, 'workflow_get')
+    const firstA = await get(a), firstOther = await get(other)
+    assert.deepEqual(firstA.stages, firstOther.stages)
+    assert.ok(firstA.stages.slice(0, 3).every(stage => stage.files.skillReady && stage.files.harnessReady))
+    const waitStage = (record, index, status) => poll(async () => {
+      const stage = (await get(record)).stages[index]
+      if (stage.status === 'failed') assert.fail(stage.error)
+      return stage.status === status && stage
+    }, record.name + ' did not reach ' + status + ' for stage ' + (index + 1), 25_000)
+    const starter = async (record, index) => {
+      const view = await get(record)
+      return request(page, 'operation', {
+        ticket: tickets.get(record.sessionId), action: 'workflow_start', data: {
+          operationId: randomUUID(), stageId: view.stages[index].id, revision: view.revision,
+          previousApproval: view.stages[index - 1]?.approvalId, expectedRunId: view.stages[index].runId,
+        },
+      })
+    }
+    const queue = (record, steps) => nativeActivity(home, record, 'workflow-queue', undefined, steps)
+    const produce = async (record, index, description, approve = true) => {
+      await queue(record, workflowCalls(workflowNote('note', { description })))
+      const admission = await starter(record, index)
+      assert.equal(admission.status, 200, admission.body.error)
+      const review = await waitStage(record, index, 'review')
+      if (approve) await call(record, 'workflow_approve', {
+        operationId: randomUUID(), stageId: review.id, runId: review.runId, outputs: review.outputs,
+      })
+      return review
+    }
+    await produce(a, 0, 'Workspace A analysis')
+    await produce(a, 1, 'Workspace A script')
+    assert.ok((await get(other)).stages.every(stage => stage.status === 'not_started'))
+    for (const contender of [a, b]) {
+      const prepared = workflowCalls(workflowNote('note', { description: 'Workspace A pinned storyboard' }))
+      await queue(contender, [{ ...prepared[0], pause: true }, ...prepared.slice(1)])
+    }
+    const starts = await Promise.all([a, b].map(record => starter(record, 2)))
+    assert.deepEqual(starts.map(item => item.status).sort(), [200, 409])
+    const winner = [a, b][starts.findIndex(item => item.status === 200)]
+    const live = await waitStage(c, 2, 'running')
+    const conflict = starts.find(item => item.status === 409).body.error
+    assert.ok(conflict.includes(live.runId) && conflict.includes(winner.sessionId) && conflict.includes('storyboard'), conflict)
+    await observer.locator('[data-testid="drama-workflow-executor"][data-session-id="' + winner.sessionId + '"]').waitFor()
+    await poll(() => nativeActivity(home, winner, 'workflow-held'), 'Workspace A model was not paused')
+    assert.equal(live.harnessSha256, sha256(oldHarness))
+    const oldTranscript = await nativeActivity(home, winner, 'workflow-transcript')
+    const oldInvocation = oldTranscript.find(event => event.source?.name === 'drama-storyboard' && event.instructions)
+    assert.match(oldInvocation?.instructions ?? '', /GLOBAL-SKILL-V1/u)
+    assert.equal(live.skillSha256, sha256(oldInvocation.instructions))
+
+    await installWorkflowFiles(home, 'storyboard', newHarness, newSkill)
+    const localShadow = join(home, other.workspaceName, '.dsh', 'skills', 'drama-storyboard')
+    await mkdir(localShadow, { recursive: true })
+    await writeFile(join(localShadow, 'SKILL.md'), ['---', 'name: drama-storyboard',
+      'description: Existing fixture workspace shadow', '---', '', 'WORKSPACE-SHADOW-MUST-NOT-LOAD'].join('\n'))
+    await produce(other, 0, 'Workspace B analysis')
+    assert.equal((await get(c)).stages[2].status, 'running', 'Another workspace advanced Workspace A')
+    await produce(other, 1, 'Workspace B script')
+    const fresh = await produce(other, 2, 'Workspace B updated storyboard', false)
+    assert.equal(fresh.workspaceId, other.workspaceId)
+    assert.equal(fresh.sessionId, other.sessionId)
+    assert.equal(fresh.harnessSha256, sha256(newHarness))
+    assert.notEqual(fresh.skillSha256, live.skillSha256)
+    const newTranscript = await nativeActivity(home, other, 'workflow-transcript')
+    const newInvocation = newTranscript.find(event => event.source?.name === 'drama-storyboard' && event.instructions)
+    assert.match(newInvocation?.instructions ?? '', /GLOBAL-SKILL-V2/u)
+    assert.doesNotMatch(newInvocation.instructions, /WORKSPACE-SHADOW-MUST-NOT-LOAD/u)
+    assert.equal(fresh.skillSha256, sha256(newInvocation.instructions))
+
+    await nativeActivity(home, winner, 'workflow-steer', '/drama-storyboard FIXTURE-NATIVE-STEER')
+    await nativeActivity(home, winner, 'workflow-release')
+    const settled = await waitStage(c, 2, 'review')
+    assert.equal(settled.runId, live.runId)
+    assert.equal(settled.skillSha256, live.skillSha256)
+    assert.equal(settled.harnessSha256, live.harnessSha256)
+    assert.notEqual(settled.canvasId, fresh.canvasId)
+    assert.notEqual(settled.outputs[0].id, fresh.outputs[0].id)
+    const frozen = (await nativeActivity(home, winner, 'workflow-model-input')).join('\n')
+    assert.match(frozen, /FIXTURE-NATIVE-STEER/u)
+    assert.match(frozen, /GLOBAL-SKILL-V1/u)
+    assert.match(frozen, /GLOBAL-HARNESS-V1/u)
+    assert.doesNotMatch(frozen, /GLOBAL-(?:SKILL|HARNESS)-V2/u)
+    assert.equal((await call(a, 'query', { id: fresh.outputs[0].id })).nodes.length, 0)
+    assert.equal((await call(other, 'query', { id: settled.outputs[0].id })).nodes.length, 0)
+  }, { workflowFixture: true })
+})
+
+test('Workflow dock separates Canvas video authorization from final film approval', { timeout: 160_000, skip: !hasVideo }, async () => {
+  await withWeb(async ({ page, records, home }) => {
+    const [record] = records
+    await configureVideoFixture(page)
+    for (const id of fixedWorkflowIds) {
+      await installWorkflowFiles(home, id, 'Use only the supplied synthetic inputs.', 'Follow the fixture stage.')
+    }
+    const pane = await openWorkflow(page, record)
+    const action = pane.getByTestId('drama-workflow-action')
+    const ticket = await ticketFor(page, record.sessionId)
+    const get = () => operate(page, ticket, 'workflow_get', {})
+    const waitStatus = (index, status) => poll(async () => {
+      const stage = (await get()).stages[index]
+      if (stage.status === 'failed') assert.fail(stage.error)
+      return stage.status === status && stage
+    }, 'Stage ' + fixedWorkflowIds[index] + ' did not enter ' + status)
+    const queue = (...calls) => nativeActivity(home, record, 'workflow-queue', undefined, workflowCalls(...calls))
+    const draft = workflowNote('video', { title: 'Workflow fixture video', mode: 't2v',
+      prompt: '固定中景。人物推开餐厅门，在门口停顿。', params: { duration: 8 } })
+    for (let index = 0; index <= 4; index++) {
+      await queue(index === 4 ? draft : workflowNote('note', { text: fixedWorkflowIds[index] }))
+      const text = index ? '开始' + fixedWorkflowNames[index] : '开始内容分析'
+      await action.filter({ hasText: text }).click()
+      await waitStatus(index, 'review')
+    }
+    await action.filter({ hasText: /^确认视频节点部署$/u }).click()
+    await waitStatus(4, 'approved')
+    const draftId = draft.args.nodes[0].id
+    assert.equal((await get()).stages[5].generation.state, 'waiting')
+    assert.equal((await operate(page, ticket, 'tasks', {})).tasks.length, 0)
+    await action.filter({ hasText: '打开画布生成视频' }).click()
+    const source = card(page, draftId)
+    await source.locator('.drama-node-titlebar').click()
+    await source.getByRole('button', { name: '生成…', exact: true }).click()
+    assert.equal((await operate(page, ticket, 'tasks', {})).tasks.length, 0)
+    await page.getByRole('dialog', { name: '确认生成', exact: true })
+      .getByRole('button', { name: '确认提交', exact: true }).click()
+    await poll(async () => (await get()).stages[5].generation.state === 'processing', 'Video generation did not track the existing task')
+    await writeFile(join(home, 'allow-fixture-result'), '')
+    const task = await poll(async () => {
+      const { tasks } = await operate(page, ticket, 'tasks', {})
+      return (await get()).stages[5].generation.state === 'ready' && tasks.find(item => item.status === 'completed')
+    }, 'Downloaded video did not reach Workflow result readiness', 25_000)
+    await queue({ name: 'drama_query', args: { id: task.resultNodeId } })
+    await action.filter({ hasText: '核对生成结果' }).click()
+    const generation = await waitStatus(5, 'review')
+    assert.equal(generation.outputs[0].id, task.resultNodeId)
+    assert.match(task.outputPath, /^assets\/native-results\/[^/]+\.mp4$/u)
+    const downloaded = join(home, record.workspaceName, task.outputPath)
+    await rename(downloaded, downloaded + '.held')
+    try {
+      assert.equal((await get()).stages[5].needsRerun, true)
+      await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+      await action.filter({ hasText: '打开画布检查任务' }).waitFor()
+    } finally {
+      await rename(downloaded + '.held', downloaded)
+    }
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+    await queue(workflowNote('note', { text: 'The final fixture film is ready for review.' }))
+    await action.filter({ hasText: '开始成片验收' }).click()
+    const reviewStage = await waitStatus(6, 'review')
+    assert.deepEqual(reviewStage.inputs, generation.outputs)
+    await pane.getByRole('button', { name: '查看成片', exact: true }).click()
+    const details = page.getByRole('dialog', { name: '成片验收', exact: true })
+    const player = details.locator('video')
+    await player.waitFor()
+    assert.ok(await decodeVideoFrame(player))
+    await details.getByRole('button', { name: '关闭阶段详情', exact: true }).click()
+    await action.filter({ hasText: '验收影片' }).click()
+    await waitStatus(6, 'approved')
+    const completed = await get()
+    assert.ok(completed.stages.every(stage => stage.status === 'approved'))
+    assert.equal((await operate(page, ticket, 'tasks', {})).tasks.length, 1)
+  }, { providerFixture: true, workflowFixture: true })
+})
 
 test('U1 native composer menu and Canvas shell', { timeout: 75_000 }, async () => {
   await withWeb(async ({ page, records, home }) => {
@@ -1645,25 +2171,30 @@ test('Native deletion preserves source content and removes its live references',
   })
 })
 
+async function configureVideoFixture(page) {
+  const settings = (action, data) => ok(page, 'providers', { action, data })
+  const configured = await settings('channel_save', {
+    channel: { name: '本地验收渠道', protocol: 'openai-video', baseUrl: 'https://video.example.com' },
+    apiKey: 'uiux-local-fixture-token',
+  })
+  const models = await settings('provider_save', {
+    revision: configured.revision,
+    profile: {
+      name: '本地验收夹具', channelId: configured.channels[0].id, model: 'fixture-video', modes: ['t2v'],
+      defaults: { duration: 4 }, limits: { durationMin: 1, durationMax: 12 },
+    },
+  })
+  await settings('generation_save', {
+    revision: models.revision,
+    generation: { defaultModelId: models.profiles[0].id, maxConcurrent: 2, outputDirectory: 'assets/native-results' },
+  })
+  return { settings, configured }
+}
+
 test('U4 native task drawer follows real Go worker in isolated provider fixture', { timeout: 150_000, skip: !hasVideo }, async () => {
   await withWeb(async ({ page, records, home }) => {
     const [a] = records
-    const settings = (action, data) => ok(page, 'providers', { action, data })
-    const configured = await settings('channel_save', {
-      channel: { name: '本地验收渠道', protocol: 'openai-video', baseUrl: 'https://video.example.com' },
-      apiKey: 'uiux-local-fixture-token',
-    })
-    const models = await settings('provider_save', {
-      revision: configured.revision,
-      profile: {
-        name: '本地验收夹具', channelId: configured.channels[0].id, model: 'fixture-video', modes: ['t2v'],
-        defaults: { duration: 4 }, limits: { durationMin: 1, durationMax: 12 },
-      },
-    })
-    await settings('generation_save', {
-      revision: models.revision,
-      generation: { defaultModelId: models.profiles[0].id, maxConcurrent: 2, outputDirectory: 'assets/native-results' },
-    })
+    const { settings, configured } = await configureVideoFixture(page)
     await select(page, a)
     await open(page, a)
     const ticket = await ticketFor(page, a.sessionId)
