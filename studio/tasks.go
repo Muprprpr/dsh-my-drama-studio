@@ -76,8 +76,18 @@ func (p *project) submit(ctx context.Context, r Request, providers providerRegis
 		return nil, err
 	}
 	return p.write(ctx, r, args.ID, func(tx *sql.Tx, status Status) (any, error) {
-		if r.Action == "submit" && !status.AutoGenerate {
-			return nil, automaticDisabled
+		if r.Action == "submit" {
+			if !status.AutoGenerate {
+				return nil, automaticDisabled
+			}
+			var stageRunning bool
+			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM workflow_turns WHERE session_id=? AND status='running')`,
+				r.SessionID).Scan(&stageRunning); err != nil {
+				return nil, err
+			}
+			if stageRunning {
+				return nil, &requestError{http.StatusForbidden, "工作流阶段需要在 Canvas 手动授权生成"}
+			}
 		}
 		kind, snapshot, revision, err := submissionNode(ctx, tx, args.NodeID)
 		if err != nil {

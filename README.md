@@ -73,7 +73,7 @@ Agent 工具有 `drama_context`、`drama_query`、`drama_append`、`drama_submit
 
 ## 项目工作流
 
-进入项目会话后，输入框上方显示固定生产阶段。在 DSH 用户目录全局装填一次 `SKILL.md` 和 `harness.md`，所有 Workspace 共用。每个 Workspace 保存自己的进度，同一 Workspace 的各个会话可以查看和接续。点击当前阶段按钮使用当前会话的原生 Agent。视频生成仍由用户在 Canvas 中独立确认。 [装填路径与验收报告](docs/WORKFLOW.md)
+进入项目会话后，输入框上方显示固定生产阶段。在 DSH 用户目录全局装填 `SKILL.md` 和 `harness.md` 后，点击任一阶段仅激活当前 Session。继续使用原生聊天框进行讨论与迭代，打开 **阶段产物** 查看文档、媒体和历史版本。生成交接预览并确认后，Workspace 保存所选版本，当前 Session 启动下一阶段。视频生成由用户在 Canvas 中独立确认。 [装填路径与交接规则](docs/WORKFLOW.md)
 
 ## 卸载
 

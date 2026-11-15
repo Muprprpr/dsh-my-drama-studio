@@ -145,3 +145,12 @@ export function mediaURL(ticket, node) {
     return undefined
   }
 }
+
+export function artifactMediaURL(ticket, { artifactId, version, node }) {
+  if (!node) return undefined
+  if (node.content?.path || node.content?.assetId) {
+    const query = new URLSearchParams({ ticket, artifactId, version })
+    return '/api/drama/media?' + query
+  }
+  return node.content ? mediaURL(ticket, node) : undefined
+}

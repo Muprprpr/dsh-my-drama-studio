@@ -49,7 +49,30 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
   id TEXT PRIMARY KEY, stage_id TEXT NOT NULL, session_id TEXT NOT NULL, status TEXT NOT NULL, record TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS workflow_runs_stage ON workflow_runs(stage_id);
-CREATE UNIQUE INDEX IF NOT EXISTS workflow_runs_active ON workflow_runs((1)) WHERE status IN ('starting','running');
+DROP INDEX IF EXISTS workflow_runs_active;
+CREATE TABLE IF NOT EXISTS workflow_sessions (
+  session_id TEXT PRIMARY KEY, stage_id TEXT NOT NULL, activation INTEGER NOT NULL,
+  skill_sha TEXT NOT NULL DEFAULT '', harness_sha TEXT NOT NULL DEFAULT '',
+  pending_handoff TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS workflow_turns (
+  id TEXT PRIMARY KEY, session_id TEXT NOT NULL, stage_id TEXT NOT NULL, activation INTEGER NOT NULL,
+  status TEXT NOT NULL, input_key TEXT NOT NULL, skill_sha TEXT NOT NULL, harness_sha TEXT NOT NULL,
+  started_at TEXT NOT NULL, finished_at TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS workflow_turns_running ON workflow_turns(session_id) WHERE status='running';
+CREATE TABLE IF NOT EXISTS workflow_artifacts (
+  id TEXT NOT NULL, version INTEGER NOT NULL, stage_id TEXT NOT NULL, session_id TEXT NOT NULL,
+  input_key TEXT NOT NULL, record TEXT NOT NULL, PRIMARY KEY(id,version)
+);
+CREATE INDEX IF NOT EXISTS workflow_artifacts_session ON workflow_artifacts(session_id,stage_id);
+CREATE TABLE IF NOT EXISTS workflow_handoffs (
+  id TEXT PRIMARY KEY, stage_id TEXT NOT NULL, session_id TEXT NOT NULL, revision INTEGER UNIQUE,
+  activation INTEGER NOT NULL, draft_watermark INTEGER NOT NULL, stale INTEGER NOT NULL DEFAULT 0,
+  record TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS workflow_handoffs_stage ON workflow_handoffs(stage_id,revision);
+CREATE TABLE IF NOT EXISTS workflow_migrations (name TEXT PRIMARY KEY);
 DROP TRIGGER IF EXISTS nodes_no_update;
 DROP TRIGGER IF EXISTS nodes_no_delete;
 DROP TRIGGER IF EXISTS edges_no_update;
@@ -77,12 +100,11 @@ type Service struct {
 }
 
 type project struct {
-	db                  *sql.DB
-	dir                 string
-	mu                  sync.Mutex
-	changed             chan struct{}
-	workflowOwner       string
-	releaseWorkflowLock func()
+	db                *sql.DB
+	dir               string
+	mu                sync.Mutex
+	changed           chan struct{}
+	workflowTurnLocks map[string]func()
 }
 
 var videoActions = map[string]string{
@@ -103,7 +125,7 @@ func (s *Service) Close() error {
 	var result error
 	for _, p := range s.projects {
 		result = errors.Join(result, p.db.Close())
-		p.unlockWorkflow("")
+		p.releaseWorkflowTurns()
 	}
 	return result
 }
@@ -186,6 +208,9 @@ func (s *Service) open(ctx context.Context, directory string, create bool) (*pro
 		err = repairVideoReferences(ctx, tx)
 	}
 	if err == nil {
+		err = migrateWorkflowHandoffs(ctx, tx)
+	}
+	if err == nil {
 		_, err = tx.ExecContext(ctx, `INSERT INTO canvas_meta VALUES(1,?) ON CONFLICT DO NOTHING`, uuid.NewString())
 	}
 	if err == nil {
@@ -241,7 +266,7 @@ func (s *Service) Execute(ctx context.Context, r Request) (any, error) {
 		}
 		p, err := s.open(ctx, r.WorkspacePath, false)
 		if err == nil && p != nil {
-			err = p.recoverWorkflow(ctx)
+			err = p.recoverWorkflow(ctx, "")
 		}
 		if err == nil && p != nil && s.provider != nil {
 			_, err = p.db.ExecContext(ctx, `UPDATE tasks SET status='polling',error='',updated_at=?
@@ -354,7 +379,7 @@ func (p *project) writeChecked(ctx context.Context, r Request, opID string, appl
 	if err != nil {
 		return nil, err
 	}
-	if !status.Connected && r.Action != "bind" && r.Action != "disconnect" {
+	if !status.Connected && r.Action != "bind" && r.Action != "disconnect" && !strings.HasPrefix(r.Action, "workflow_") {
 		return nil, notBound
 	}
 	var session, action string

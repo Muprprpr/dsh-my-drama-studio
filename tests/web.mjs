@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { copyFile, mkdir, mkdtemp, readFile, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { createServer as createHTTPServer } from 'node:http'
@@ -48,8 +48,11 @@ export async function apply(ctx) {
       const steps = workflowTools.get(options.model)
       if (steps?.length) {
         const { call, hold, pause, failure } = steps.shift()
-        workflowInputs.set(options.model, options.messages.flatMap(message =>
-          Array.isArray(message.content) ? message.content.filter(item => item.type === 'text').map(item => item.text) : []))
+        workflowInputs.set(options.model, {
+          messages: options.messages.flatMap(message => Array.isArray(message.content)
+            ? message.content.filter(item => item.type === 'text').map(item => ({ role: message.role, text: item.text })) : []),
+          tools: (options.tools ?? []).map(item => item.name),
+        })
         if (hold) await new Promise(resolve => setTimeout(resolve, hold))
         if (pause) {
           const gate = Promise.withResolvers()
@@ -140,15 +143,17 @@ export async function apply(ctx) {
       return agent.session.snapshotEvents().flatMap(event => {
         const { type, data } = event
         if (type === 'user/message') {
-          const context = data.source?.rpcId?.startsWith('drama-workflow:')
-            ? JSON.parse(data.content[0].text.split(String.fromCharCode(10)).find(line => line.startsWith('{'))) : undefined
-          const instructions = data.source?.kind === 'skill-invocation' ? data.content[0]?.text : undefined
-          return [{ type, source: data.source, context, instructions }]
+          const text = data.content.filter(item => item.type === 'text').map(item => item.text).join(' ')
+          return [{ type, source: data.source, text }]
+        }
+        if (type === 'system/message') {
+          const text = data.message.content.filter(item => item.type === 'text').map(item => item.text).join(String.fromCharCode(10))
+          return [{ type, turn: data.turn, text }]
         }
         if (type === 'assistant/message') return [{ type, source: data.message.source }]
         if (type === 'tool/call') return [{ type, name: data.name, arguments: data.arguments }]
-        if (type === 'tool/result' && data.message.isError) return [{
-          type, toolCallId: data.message.toolCallId, error: data.message.content.map(block => block.text ?? '').join(' '),
+        if (type === 'tool/result') return [{
+          type, toolCallId: data.message.toolCallId, isError: data.message.isError === true,
         }]
         if (type === 'turn/end') return [{ type, reason: data.reason.kind }]
         return []
@@ -566,414 +571,390 @@ async function installWorkflowFiles(home, id, harness, method) {
   }
 }
 
-const sha256 = text => createHash('sha256').update(text).digest('hex')
+const workflowMarker = /\[Drama Studio Workflow Stage\]/u
+const storyboardVersions = [
+  '镜头 01 · 中景\n夜班店员小林打烊前在窗边停下，看到一张旧车票。',
+  '镜头 01 · 近景\n小林捏住旧车票的一角，抬眼望向空荡的街道。镜头缓慢推近。',
+  '镜头 01 · 特写\n窗外霓虹扫过小林手中的旧车票。焦点由车票转到玻璃里的倒影，保留远处公交进站声。',
+]
 
 function workflowCalls(...calls) {
-  return [...calls.map(({ name, args }, index) => ({ hold: index === 0 ? 450 : 0, call: { id: randomUUID(), name, args } })), {}]
+  return [...calls.map(({ name, args }, index) => ({ hold: index === 0 ? 150 : 0, call: { id: randomUUID(), name, args } })), {}]
 }
 
-function workflowNote(type, content) {
-  return { name: 'drama_append', args: { operationId: randomUUID(), nodes: [{ id: randomUUID(), type, content }] } }
+function workflowArtifact(title, content, update = {}) {
+  return {
+    name: 'drama_save_artifact', args: { operationId: randomUUID(), title, content, ...update },
+  }
 }
 
-test('Workflow dock runs three installed stages through the native Agent', { timeout: 300_000 }, async () => {
-  const realWorkflow = process.env.DRAMA_REAL_WORKFLOW === '1'
+async function sendNative(page, text) {
+  await page.locator('[data-composer-input][contenteditable=true]').fill(text)
+  await page.getByRole('button', { name: 'Send message', exact: true }).click()
+}
+
+async function installTestStages(home) {
+  for (const [index, id] of fixedWorkflowIds.entries()) {
+    await installWorkflowFiles(home, id, 'STUDIO-HARNESS-' + id + '\n仅处理当前阶段。文档使用 drama_save_artifact 保存。',
+      'STUDIO-SKILL-' + id + '\n处理' + fixedWorkflowNames[index] + '，保留用户指定的创作决策。')
+  }
+}
+
+test('Workflow dock iterates, previews, and explicitly hands off in the native composer', { timeout: 100_000 }, async () => {
   await withWeb(async ({ page, records, home }) => {
-    const [a, b, c, other] = records
+    const [a] = records
     const pane = await openWorkflow(page, a)
-    let action = pane.getByTestId('drama-workflow-action')
     const ticket = await ticketFor(page, a.sessionId)
     const get = () => operate(page, ticket, 'workflow_get', {})
+    const queue = (...steps) => nativeActivity(home, a, 'workflow-queue', undefined, steps)
     const initial = await get()
     assert.equal(initial.id, 'drama-production')
-    assert.deepEqual(initial.stages.map(({ id, name }) => [id, name]), fixedWorkflowIds.map((id, index) => [id, fixedWorkflowNames[index]]))
-    assert.ok(initial.stages.every(stage => stage.status === 'not_started'))
-    assert.equal(initial.stages[0].files.skillPath, join(home, 'skills', 'drama-content-analysis', 'SKILL.md'))
-    assert.equal(initial.stages[0].files.harnessPath, join(home, 'drama-studio', 'workflows', 'drama-production', 'stages', 'content-analysis', 'harness.md'))
-    assert.equal(initial.stages[0].files.skillReady, false)
-    assert.equal(initial.stages[0].files.harnessReady, false)
-    assert.equal(await pane.locator('form, textarea, input[type=text]').count(), 0)
-    assert.equal(await page.locator('[data-rightbar-col] [data-dockkit-tab]').filter({ hasText: 'Drama Workflow' }).count(), 0)
-    await pane.getByRole('button', { name: '查看缺失路径', exact: true }).click()
-    const details = page.getByRole('dialog', { name: fixedWorkflowNames[0], exact: true })
-    await details.getByText(initial.stages[0].files.skillPath, { exact: true }).waitFor()
-    await details.getByText(initial.stages[0].files.harnessPath, { exact: true }).waitFor()
-    await details.getByRole('button', { name: '关闭阶段详情', exact: true }).click()
-    const editor = page.locator('[data-composer-input][contenteditable=true]')
-    await editor.waitFor()
+    assert.equal(initial.session.status, 'normal')
+    assert.deepEqual(initial.stages.map(stage => stage.id), fixedWorkflowIds)
+    assert.ok(initial.stages.every(stage => stage.status === 'not_started' && !stage.files.skillReady))
+    await page.setViewportSize({ width: 815, height: 850 })
+    assert.ok(await pane.evaluate(element => element.scrollWidth <= element.clientWidth + 1), 'narrow workflow overflowed')
+    await page.setViewportSize({ width: 1600, height: 1000 })
+
+    await queue({})
+    await sendNative(page, '普通聊天检查 NORMAL-CHAT')
+    await page.getByText('Workflow step completed.', { exact: true }).waitFor()
+    const normalInput = await nativeActivity(home, a, 'workflow-model-input')
+    assert.doesNotMatch(JSON.stringify(normalInput.messages), workflowMarker)
+    assert.equal((await get()).revision, initial.revision)
+    await installTestStages(home)
+    await poll(async () => (await get()).stages.slice(2, 4).every(stage => stage.files.skillReady && stage.files.harnessReady),
+      'Native Skill catalog did not discover global files', 20_000)
+
+    const turnsBefore = (await nativeActivity(home, a, 'workflow-transcript')).filter(event => event.type === 'turn/end').length
+    await pane.getByRole('button', { name: '分镜制作', exact: true }).click()
+    await poll(async () => (await get()).session.activeStageId === 'storyboard', 'Storyboard was not activated')
+    await pane.locator('[data-active-stage-id="storyboard"]').waitFor()
+    assert.equal((await nativeActivity(home, a, 'workflow-transcript')).filter(event => event.type === 'turn/end').length, turnsBefore)
+    assert.equal((await get()).revision, initial.revision)
     assert.ok(await pane.evaluate(element => {
       const input = document.querySelector('[data-composer-input][contenteditable=true]')
       return input && element.getBoundingClientRect().bottom <= input.getBoundingClientRect().top + 1
     }), 'workflow progress is not above the native composer')
+    await screenshot(page, '01-workflow-stage-active.png')
 
-    const harnesses = [
-      'Create one independent Canvas note. Use the exact test marker specified in the loaded Skill. Do not modify existing nodes.',
-      'Read the approved analysis and copy its marker into one new Canvas script node.',
-      'Read the approved script and use its marker in one new Canvas shot node.',
-    ]
-    const methods = [
-      'Immediately call drama_append with exactly {"operationId":"fixed-analysis-1","nodes":[{"type":"note","content":{"title":"Workflow analysis","description":"APRICOT-PLAN"}}]}. Do not add arguments. After success, return its ID and stop.',
-      'Call drama_query with {"id":"<approved analysis node ID>"}. Read its description. Then call drama_append with {"operationId":"fixed-script-1","nodes":[{"type":"script","content":{"text":"<the analysis description copied exactly>"}}]}. These are the only fields. After success, return the new ID and stop.',
-      'Call drama_query with {"id":"<approved script node ID>"}. Copy its text verbatim into the description of a new shot. Use drama_append arguments {"operationId":"fixed-shot-1","nodes":[{"type":"shot","content":{"description":"<script text>"}}]}. Then stop.',
-    ]
-    const stages = fixedWorkflowIds.slice(0, methods.length)
-    for (const [index, id] of stages.entries()) await installWorkflowFiles(home, id, harnesses[index], methods[index])
-    await poll(async () => (await get()).stages.slice(0, 3).every(stage => stage.files.skillReady && stage.files.harnessReady),
-      'Native Skill catalog did not discover new global files', 20_000)
-    await poll(() => action.filter({ hasText: '开始内容分析' }).isEnabled(), 'Workflow did not recognize new stage files in the open Session', 20_000)
-    const layoutKey = 'dsh.sidebar-right.v1.' + a.sessionId
-    await page.evaluate(({ key, sessionId }) => {
-      const layout = {
-        nodes: { pane1: { kind: 'pane', id: 'pane1', host: 'dock', tabs: ['tab2'], activeTabId: 'tab2' } },
-        tabs: { tab2: { id: 'tab2', kind: 'drama-workflow', contentId: 'sidebar://drama-workflow', title: 'Drama Workflow' } },
-        rootId: 'pane1', floats: [], activePaneId: 'pane1', expanded: true, mode: 'push',
-      }
-      localStorage.setItem(key, JSON.stringify({ bySession: { [sessionId]: { layout, minted: 2 } } }))
-    }, { key: layoutKey, sessionId: a.sessionId })
+    let artifactId
+    for (const [index, content] of storyboardVersions.entries()) {
+      const title = '《末班车》分镜脚本'
+      await queue(...workflowCalls(workflowArtifact(title, content, {
+        ...(artifactId ? { artifactId, expectedVersion: index } : {}),
+        summary: '夜班店员在打烊前发现旧车票。',
+        confirmedDecisions: ['保留车票和倒影的焦点转换'], constraints: ['保留公交进站声'],
+      })))
+      const message = '分镜修改 ' + (index + 1)
+      await sendNative(page, message)
+      const view = await poll(async () => {
+        const current = await get()
+        return current.session.status === 'active' && current.artifacts.some(item => item.version === index + 1) && current
+      }, 'Did not save and settle version ' + (index + 1))
+      artifactId = view.artifacts.find(item => item.version === index + 1).artifactId
+      assert.equal(view.session.activeStageId, 'storyboard')
+      assert.equal(view.stages[2].status, 'draft_available')
+      assert.equal(view.handoffs.length, 0)
+      const native = await nativeActivity(home, a, 'workflow-model-input')
+      const prompt = native.messages.filter(message => message.role === 'system').map(message => message.text).join('\n')
+      assert.match(prompt, workflowMarker)
+      assert.match(prompt, /STUDIO-HARNESS-storyboard/u)
+      assert.match(prompt, /STUDIO-SKILL-storyboard/u)
+      assert.ok(native.messages.some(item => item.role === 'user' && item.text === message))
+    }
+    await open(page, a)
+    assert.equal((await query(page, ticket)).nodes.length, 0)
+    await pane.getByRole('button', { name: '阶段产物', exact: true }).click()
+    const sidebar = page.getByTestId('drama-workflow-artifacts')
+    await sidebar.getByText(/焦点由车票转到玻璃/u).waitFor()
+    await screenshot(page, '02-workflow-artifact-current.png')
+    const history = sidebar.getByTestId('drama-artifact-history')
+    await history.locator('summary').click()
+    await history.locator('button[data-artifact-id="' + artifactId + '"][data-version="1"]').click()
+    await sidebar.getByText(/看到一张旧车票/u).waitFor()
+    await sidebar.getByRole('button', { name: '与最新版比较', exact: true }).click()
+    await sidebar.getByText(/焦点由车票转到玻璃/u).waitFor()
+    await screenshot(page, '03-workflow-artifact-history.png')
+
+    await pane.getByTestId('drama-workflow-action').click()
+    const preview = sidebar.getByTestId('drama-workflow-preview')
+    await preview.getByText('保留车票和倒影的焦点转换', { exact: true }).waitFor()
+    assert.equal((await get()).handoffs.length, 0)
+    await screenshot(page, '04-workflow-handoff-preview.png')
+    await queue(...workflowCalls(workflowArtifact('素材指引', '已收到《末班车》分镜交接。优先准备旧车票和店面玻璃。')))
+    await sidebar.getByTestId('drama-workflow-confirm').click()
+    const ready = await poll(async () => {
+      const view = await get()
+      return view.session.activeStageId === 'asset-binding' && view.session.status === 'active' &&
+        view.artifacts.some(item => item.stageId === 'asset-binding') && view
+    }, 'Confirmed handoff did not start the target stage')
+    assert.equal(ready.stages[2].status, 'handed_off')
+    assert.equal(ready.stages[3].status, 'draft_available')
+    assert.equal(ready.handoffs.length, 1)
+    const [handoff] = ready.handoffs
+    assert.equal(handoff.sourceSessionId, a.sessionId)
+    assert.equal(handoff.targetStageId, 'asset-binding')
+    assert.equal(handoff.artifacts[0].version, 3)
+    assert.deepEqual(handoff.confirmedDecisions, ['保留车票和倒影的焦点转换'])
+    const target = await nativeActivity(home, a, 'workflow-model-input')
+    const targetPrompt = target.messages.filter(message => message.role === 'system').map(message => message.text).join('\n')
+    assert.match(targetPrompt, /STUDIO-HARNESS-asset-binding/u)
+    assert.doesNotMatch(targetPrompt, /STUDIO-HARNESS-storyboard/u)
+    assert.ok(targetPrompt.includes(handoff.handoffId))
+    await screenshot(page, '05-workflow-handoff-confirmed.png')
+
     await page.reload({ waitUntil: 'domcontentloaded' })
-    await openWorkflow(page, a)
-    await poll(() => page.evaluate(key => !localStorage.getItem(key)?.includes('"drama-workflow"'), layoutKey),
-      'Old Workflow tab still occupied the native sidebar after reload')
-
-    const waitStatus = (index, status) => poll(async () => {
-      const current = (await get()).stages[index]
-      if (current.status === 'failed') {
-        const executor = records.find(record => record.sessionId === current.sessionId) ?? a
-        const events = realWorkflow ? await nativeActivity(home, executor, 'workflow-transcript') : []
-        const tools = events.filter(event => event.type === 'tool/call' || event.type === 'tool/result').slice(-12)
-        assert.fail(tools.length ? current.error + '\n' + JSON.stringify(tools) : current.error)
-      }
-      return current.status === status && current
-    }, 'Stage ' + (index + 1) + ' did not enter ' + status, 90_000)
-    const queue = (record, ...calls) => !realWorkflow && nativeActivity(home, record, 'workflow-queue', undefined, workflowCalls(...calls))
-    await queue(a, workflowNote('note', { title: 'Workflow analysis', description: 'APRICOT-PLAN' }))
-    await action.filter({ hasText: '开始内容分析' }).click()
-    if (!realWorkflow) await waitStatus(0, 'running')
-    const analysis = await waitStatus(0, 'review')
-    assert.equal(analysis.sessionId, a.sessionId)
-    assert.ok(analysis.startedAt && analysis.finishedAt)
-    assert.equal(analysis.workspaceId, a.workspaceId)
-    assert.equal(analysis.canvasId, (await ok(page, 'init', { sessionId: a.sessionId })).status.canvasId)
-    assert.equal(analysis.definitionVersion, 1)
-    for (const peer of [b, c]) {
-      await openWorkflow(page, peer)
-      const peerTicket = await ticketFor(page, peer.sessionId)
-      const observed = (await operate(page, peerTicket, 'workflow_get', {})).stages[0]
-      assert.deepEqual(observed, analysis, 'The same workspace exposed different progress or artifact versions')
-    }
-    const executorPane = await openWorkflow(page, b)
-    action = executorPane.getByTestId('drama-workflow-action')
-    await queue(b, { name: 'drama_query', args: { id: analysis.outputs[0].id } }, workflowNote('script', { text: 'APRICOT-PLAN' }))
-    await action.filter({ hasText: /确认.*开始拍摄脚本/u }).click()
-    const script = await waitStatus(1, 'review')
-    assert.deepEqual(script.inputs, analysis.outputs)
-    assert.equal(script.sessionId, b.sessionId)
-    assert.equal((await get()).stages[0].approvals.at(-1).sessionId, b.sessionId)
-    assert.match(JSON.stringify((await query(page, ticket, { id: script.outputs[0].id })).nodes[0].content), /APRICOT-PLAN/u)
-    await queue(b, { name: 'drama_query', args: { id: script.outputs[0].id } }, workflowNote('shot', { description: 'APRICOT-PLAN' }))
-    await action.filter({ hasText: /确认.*开始分镜/u }).click()
-    const storyboard = await waitStatus(2, 'review')
-    assert.deepEqual(storyboard.inputs, script.outputs)
-    assert.equal(storyboard.sessionId, b.sessionId)
-    const shot = storyboard.outputs[0].id
-    assert.equal((await query(page, ticket, { id: shot })).nodes[0].type, 'shot')
-    await action.filter({ hasText: /确认分镜/u }).click()
-    await waitStatus(2, 'approved')
-
-    await open(page, b)
-    await card(page, shot).waitFor()
-    await page.reload({ waitUntil: 'domcontentloaded' })
-    const shared = await openWorkflow(page, b)
-    await shared.locator('[data-testid="drama-workflow-current"][data-stage-id="asset-binding"]').waitFor()
-    const sharedTicket = await ticketFor(page, b.sessionId)
-    const sharedView = await operate(page, sharedTicket, 'workflow_get', {})
-    assert.deepEqual(sharedView.stages.slice(0, 3).map(stage => stage.status), ['approved', 'approved', 'approved'])
-    const isolated = await openWorkflow(page, other)
-    await isolated.locator('[data-testid="drama-workflow-current"][data-stage-id="content-analysis"]').waitFor()
-    const otherTicket = await ticketFor(page, other.sessionId)
-    const otherView = await operate(page, otherTicket, 'workflow_get', {})
-    assert.ok(otherView.stages.every(stage => stage.status === 'not_started'))
-    assert.deepEqual(otherView.stages.map(({ id, name, skill, files }) => ({ id, name, skill, files })),
-      sharedView.stages.map(({ id, name, skill, files }) => ({ id, name, skill, files })))
-    for (const record of [a, other]) {
-      assert.equal(existsSync(join(home, record.workspaceName, '.agents', 'skills')), false)
-      assert.equal(existsSync(join(home, record.workspaceName, 'workflows')), false)
-    }
-
-    await openWorkflow(page, a)
-    const original = (await query(page, ticket, { id: analysis.outputs[0].id })).nodes[0]
-    await operate(page, ticket, 'update_node', { operationId: randomUUID(), id: original.id, revision: original.revision,
-      content: { ...original.content, description: 'APRICOT-PLAN updated manually' } })
-    await operate(page, ticket, 'workflow_return', { operationId: randomUUID(), stageId: stages[0], runId: analysis.runId })
-    await operate(page, ticket, 'workflow_approve', { operationId: randomUUID(), stageId: stages[0], runId: analysis.runId,
-      outputs: [{ id: original.id, revision: original.revision + 1 }] })
-    await waitStatus(1, 'stale')
-    await waitStatus(2, 'stale')
-    assert.equal((await query(page, ticket, { id: shot })).nodes[0].deleted ?? false, false)
-
-    const [first, continued] = await Promise.all([a, b].map(record => nativeActivity(home, record, 'workflow-transcript')))
-    assert.ok(!continued.some(event => event.source?.rpcId === 'drama-workflow:' + analysis.runId))
-    const transcript = [...first, ...continued]
-    const invocations = transcript.filter(event => event.source?.kind === 'skill-invocation')
-    assert.deepEqual(invocations.map(event => event.source.name), stages.map(id => 'drama-' + id))
-    assert.deepEqual(transcript.flatMap(event => event.context ?
-      [[event.context.skill, event.context.harness, event.context.approvedInputs]] : []), [
-      ['drama-' + stages[0], harnesses[0], []], ['drama-' + stages[1], harnesses[1], analysis.outputs], ['drama-' + stages[2], harnesses[2], script.outputs],
-    ])
-    for (const [index, stage] of [analysis, script, storyboard].entries()) {
-      assert.equal(stage.skillSha256, sha256(invocations[index].instructions))
-      assert.equal(stage.harnessSha256, sha256(harnesses[index]))
-    }
-    const realModels = [...new Set(transcript.filter(event => event.source?.provider === 'deepseek-official').map(event => event.source.model))]
-    if (realWorkflow) assert.ok(realModels.length, JSON.stringify(transcript))
-    assert.ok(transcript.filter(event => event.type === 'tool/call' && event.name === 'drama_append').length >= 3)
-    assert.ok(transcript.some(event => event.type === 'tool/call' && event.name === 'drama_query'))
-    assert.equal((await operate(page, ticket, 'tasks', {})).tasks.length, 0)
-    const source = realWorkflow ? 'DeepSeek API (' + realModels.join(', ') + ')' : 'scripted model'
-    console.info('Workflow evidence: 3 globally installed Skills loaded through two independent Sessions via ' + source + ', confirmed revisions, Canvas outputs and zero generation tasks')
-  }, { realWorkflow, workflowFixture: true })
-})
-
-test('Workflow dock checks files, native chat, failed runs and generation permission', { timeout: 85_000 }, async () => {
-  await withWeb(async ({ page, records, home }) => {
-    const [record] = records
-    const id = fixedWorkflowIds[0]
-    await installWorkflowFiles(home, id, '   ')
-    const pane = await openWorkflow(page, record)
-    const action = pane.getByTestId('drama-workflow-action')
-    const ticket = await ticketFor(page, record.sessionId)
-    const get = () => operate(page, ticket, 'workflow_get', {})
-    const readState = (status, previousId) => poll(async () => {
-      const stage = (await get()).stages[0]
-      return stage.status === status && stage.runId !== previousId && stage
-    }, 'Stage did not enter ' + status)
-    const queue = (...steps) => nativeActivity(home, record, 'workflow-queue', undefined, steps)
-    const files = (await get()).stages[0].files
-    assert.equal(files.skillReady, false)
-    assert.equal(files.harnessReady, false)
-    assert.ok(files.issues.length >= 2)
-    await page.setViewportSize({ width: 815, height: 850 })
-    assert.ok(await pane.evaluate(element => element.scrollWidth <= element.clientWidth + 1), 'narrow Workflow overflowed')
-
+    const reloaded = await openWorkflow(page, a)
+    assert.equal((await get()).session.activeStageId, 'asset-binding')
+    assert.equal((await get()).handoffs[0].handoffId, handoff.handoffId)
+    assert.equal((await get()).artifacts.filter(item => item.artifactId === artifactId).length, 3)
+    await reloaded.getByRole('button', { name: '退出阶段', exact: true }).click()
+    await poll(async () => (await get()).session.status === 'normal', 'Session did not exit the workflow')
     await queue({})
-    await page.locator('[data-composer-input][contenteditable=true]').fill('Native chat still sends beside the Workflow dock')
-    await page.getByRole('button', { name: 'Send message', exact: true }).click()
-    await page.getByText('Workflow step completed.', { exact: true }).waitFor()
-    assert.equal((await get()).stages[0].runId, undefined)
-
-    await installWorkflowFiles(home, id, 'Append one Canvas analysis note.', 'Create a one-line note with drama_append.')
-    await poll(async () => {
-      const { files } = (await get()).stages[0]
-      return files.skillReady && files.harnessReady
-    }, 'Global files did not become ready')
-    await queue({ failure: 'Scripted native model stream failure' })
-    await action.filter({ hasText: '开始内容分析' }).click()
-    const failed = await readState('failed')
-    assert.match(failed.error, /DSH Agent 执行失败/u)
-
-    await queue({ hold: 2500 })
-    const calls = []
-    page.on('request', request => {
-      if (request.url().endsWith('/api/drama/operation') && request.postDataJSON()?.action === 'workflow_start') calls.push(request)
-    })
-    await action.filter({ hasText: '重试' }).evaluate(button => { button.click(); button.click() })
-    const running = await readState('running', failed.runId)
-    assert.equal(calls.length, 1)
-    await nativeActivity(home, record, 'cancel')
-    const cancelled = await readState('failed', failed.runId)
-    assert.equal(cancelled.runId, running.runId)
-    assert.match(cancelled.error, /取消/u)
-
-    await setPermission(page, true)
-    const output = workflowNote('note', { text: 'Recovery fixture output' })
-    const submitId = randomUUID()
-    await queue(...workflowCalls(output).slice(0, 1), { call: { id: submitId, name: 'drama_submit', args: {
-      operationId: randomUUID(), nodeId: output.args.nodes[0].id,
-    } } }, {})
-    await action.filter({ hasText: '重试' }).click()
-    const ready = await readState('review', cancelled.runId)
-    const transcript = await nativeActivity(home, record, 'workflow-transcript')
-    assert.match(transcript.find(event => event.toolCallId === submitId)?.error ?? '', /工作流阶段不授权模型生成/u)
+    await sendNative(page, '退出后普通聊天 AFTER-EXIT')
+    await poll(async () => JSON.stringify(await nativeActivity(home, a, 'workflow-model-input')).includes('AFTER-EXIT'),
+      'Ordinary native turn was not sent after exit')
+    const after = await nativeActivity(home, a, 'workflow-model-input')
+    assert.doesNotMatch(after.messages.filter(item => item.role === 'system').map(item => item.text).join('\n'), workflowMarker)
+    assert.equal((await get()).handoffs.length, 1)
     assert.equal((await operate(page, ticket, 'tasks', {})).tasks.length, 0)
-    await action.filter({ hasText: /确认内容分析/u }).click()
-    const approved = await readState('approved')
-    assert.deepEqual(approved.outputs, ready.outputs)
-    const next = (await get()).stages[1]
-    assert.equal(next.status, 'not_started')
-    assert.equal(next.files.skillReady, false)
-    assert.equal(next.files.harnessReady, false)
   }, { workflowFixture: true })
 })
 
-test('Workflow dock shares one package but fences runs and pins revisions per workspace', { timeout: 120_000 }, async () => {
+test('Workflow dock isolates Sessions and rejects conflicting Workspace handoffs', { timeout: 85_000 }, async () => {
   await withWeb(async ({ page, records, home }) => {
     const [a, b, c, other] = records
-    const oldHarness = 'Respect fixture GLOBAL-HARNESS-V1.', newHarness = 'Respect fixture GLOBAL-HARNESS-V2.'
-    const oldSkill = 'Use the pinned instructions GLOBAL-SKILL-V1.', newSkill = 'Use the pinned instructions GLOBAL-SKILL-V2.'
-    for (const id of fixedWorkflowIds.slice(0, 3)) await installWorkflowFiles(home, id, oldHarness, oldSkill)
-    const observer = await openWorkflow(page, c)
-    const tickets = new Map(await Promise.all(records.map(async record => [record.sessionId, await ticketFor(page, record.sessionId)])))
-    const call = (record, action, data = {}) => operate(page, tickets.get(record.sessionId), action, data)
-    for (const record of [a, b, other]) await call(record, 'bind', { operationId: randomUUID() })
-    const get = record => call(record, 'workflow_get')
-    const firstA = await get(a), firstOther = await get(other)
-    assert.deepEqual(firstA.stages, firstOther.stages)
-    assert.ok(firstA.stages.slice(0, 3).every(stage => stage.files.skillReady && stage.files.harnessReady))
-    const waitStage = (record, index, status) => poll(async () => {
-      const stage = (await get(record)).stages[index]
-      if (stage.status === 'failed') assert.fail(stage.error)
-      return stage.status === status && stage
-    }, record.name + ' did not reach ' + status + ' for stage ' + (index + 1), 25_000)
-    const starter = async (record, index) => {
-      const view = await get(record)
-      return request(page, 'operation', {
-        ticket: tickets.get(record.sessionId), action: 'workflow_start', data: {
-          operationId: randomUUID(), stageId: view.stages[index].id, revision: view.revision,
-          previousApproval: view.stages[index - 1]?.approvalId, expectedRunId: view.stages[index].runId,
-        },
-      })
-    }
-    const queue = (record, steps) => nativeActivity(home, record, 'workflow-queue', undefined, steps)
-    const produce = async (record, index, description, approve = true) => {
-      await queue(record, workflowCalls(workflowNote('note', { description })))
-      const admission = await starter(record, index)
-      assert.equal(admission.status, 200, admission.body.error)
-      const review = await waitStage(record, index, 'review')
-      if (approve) await call(record, 'workflow_approve', {
-        operationId: randomUUID(), stageId: review.id, runId: review.runId, outputs: review.outputs,
-      })
-      return review
-    }
-    await produce(a, 0, 'Workspace A analysis')
-    await produce(a, 1, 'Workspace A script')
-    assert.ok((await get(other)).stages.every(stage => stage.status === 'not_started'))
-    for (const contender of [a, b]) {
-      const prepared = workflowCalls(workflowNote('note', { description: 'Workspace A pinned storyboard' }))
-      await queue(contender, [{ ...prepared[0], pause: true }, ...prepared.slice(1)])
-    }
-    const starts = await Promise.all([a, b].map(record => starter(record, 2)))
-    assert.deepEqual(starts.map(item => item.status).sort(), [200, 409])
-    const winner = [a, b][starts.findIndex(item => item.status === 200)]
-    const live = await waitStage(c, 2, 'running')
-    const conflict = starts.find(item => item.status === 409).body.error
-    assert.ok(conflict.includes(live.runId) && conflict.includes(winner.sessionId) && conflict.includes('storyboard'), conflict)
-    await observer.locator('[data-testid="drama-workflow-executor"][data-session-id="' + winner.sessionId + '"]').waitFor()
-    await poll(() => nativeActivity(home, winner, 'workflow-held'), 'Workspace A model was not paused')
-    assert.equal(live.harnessSha256, sha256(oldHarness))
-    const oldTranscript = await nativeActivity(home, winner, 'workflow-transcript')
-    const oldInvocation = oldTranscript.find(event => event.source?.name === 'drama-storyboard' && event.instructions)
-    assert.match(oldInvocation?.instructions ?? '', /GLOBAL-SKILL-V1/u)
-    assert.equal(live.skillSha256, sha256(oldInvocation.instructions))
-
-    await installWorkflowFiles(home, 'storyboard', newHarness, newSkill)
-    const localShadow = join(home, other.workspaceName, '.dsh', 'skills', 'drama-storyboard')
+    await installTestStages(home)
+    const localShadow = join(home, other.workspaceName, '.dsh', 'skills', 'drama-content-analysis')
     await mkdir(localShadow, { recursive: true })
-    await writeFile(join(localShadow, 'SKILL.md'), ['---', 'name: drama-storyboard',
-      'description: Existing fixture workspace shadow', '---', '', 'WORKSPACE-SHADOW-MUST-NOT-LOAD'].join('\n'))
-    await produce(other, 0, 'Workspace B analysis')
-    assert.equal((await get(c)).stages[2].status, 'running', 'Another workspace advanced Workspace A')
-    await produce(other, 1, 'Workspace B script')
-    const fresh = await produce(other, 2, 'Workspace B updated storyboard', false)
-    assert.equal(fresh.workspaceId, other.workspaceId)
-    assert.equal(fresh.sessionId, other.sessionId)
-    assert.equal(fresh.harnessSha256, sha256(newHarness))
-    assert.notEqual(fresh.skillSha256, live.skillSha256)
-    const newTranscript = await nativeActivity(home, other, 'workflow-transcript')
-    const newInvocation = newTranscript.find(event => event.source?.name === 'drama-storyboard' && event.instructions)
-    assert.match(newInvocation?.instructions ?? '', /GLOBAL-SKILL-V2/u)
-    assert.doesNotMatch(newInvocation.instructions, /WORKSPACE-SHADOW-MUST-NOT-LOAD/u)
-    assert.equal(fresh.skillSha256, sha256(newInvocation.instructions))
+    await writeFile(join(localShadow, 'SKILL.md'), '---\nname: drama-content-analysis\ndescription: Shadow fixture\n---\nWORKSPACE-SHADOW-MUST-NOT-LOAD')
+    await openWorkflow(page, a)
+    const tickets = new Map(await Promise.all(records.map(async record => [record, await ticketFor(page, record.sessionId)])))
+    const read = record => operate(page, tickets.get(record), 'workflow_get', {})
+    const write = (record, action, data) => operate(page, tickets.get(record), action, { operationId: randomUUID(), ...data })
+    await Promise.all([a, b, other].map(record => write(record, 'workflow_activate', {
+      stageId: record === other ? 'content-analysis' : 'shooting-script',
+    })))
+    assert.equal((await read(c)).session.status, 'normal')
+    assert.equal((await read(other)).session.activeStageId, 'content-analysis')
+    for (const [record, title] of [[a, 'Session A script'], [b, 'Session B script'], [other, 'Other workspace analysis']]) {
+      const [save, finish] = workflowCalls(workflowArtifact(title, 'Only ' + record.name + ' owns this draft.'))
+      await nativeActivity(home, record, 'workflow-queue', undefined, [{ ...save, pause: record !== other }, finish])
+      await openWorkflow(page, record)
+      await sendNative(page, 'Create ' + title)
+    }
+    await poll(async () => (await read(a)).session.status === 'running' && (await read(b)).session.status === 'running',
+      'Two concurrent native Agent turns did not enter the same stage')
+    assert.equal((await read(c)).session.status, 'normal')
+    for (const record of [a, b]) {
+      await poll(() => nativeActivity(home, record, 'workflow-held'), 'The native turn did not reach the scripted hold')
+      await nativeActivity(home, record, 'workflow-release')
+    }
+    const drafts = await Promise.all([a, b, other].map(record => poll(async () => {
+      const view = await read(record)
+      return view.session.status === 'active' && view.artifacts[0]
+    }, 'The isolated draft did not settle')))
+    assert.deepEqual(drafts.map(item => item.title), ['Session A script', 'Session B script', 'Other workspace analysis'])
+    assert.deepEqual((await read(c)).artifacts, [])
+    assert.equal((await read(other)).stages[1].status, 'not_started')
+    const modelInput = await nativeActivity(home, other, 'workflow-model-input')
+    assert.match(JSON.stringify(modelInput.messages), /STUDIO-SKILL-content-analysis/u)
+    assert.doesNotMatch(JSON.stringify(modelInput.messages), /WORKSPACE-SHADOW-MUST-NOT-LOAD/u)
 
-    await nativeActivity(home, winner, 'workflow-steer', '/drama-storyboard FIXTURE-NATIVE-STEER')
-    await nativeActivity(home, winner, 'workflow-release')
-    const settled = await waitStage(c, 2, 'review')
-    assert.equal(settled.runId, live.runId)
-    assert.equal(settled.skillSha256, live.skillSha256)
-    assert.equal(settled.harnessSha256, live.harnessSha256)
-    assert.notEqual(settled.canvasId, fresh.canvasId)
-    assert.notEqual(settled.outputs[0].id, fresh.outputs[0].id)
-    const frozen = (await nativeActivity(home, winner, 'workflow-model-input')).join('\n')
-    assert.match(frozen, /FIXTURE-NATIVE-STEER/u)
-    assert.match(frozen, /GLOBAL-SKILL-V1/u)
-    assert.match(frozen, /GLOBAL-HARNESS-V1/u)
-    assert.doesNotMatch(frozen, /GLOBAL-(?:SKILL|HARNESS)-V2/u)
-    assert.equal((await call(a, 'query', { id: fresh.outputs[0].id })).nodes.length, 0)
-    assert.equal((await call(other, 'query', { id: settled.outputs[0].id })).nodes.length, 0)
+    const previews = await Promise.all([a, b].map(record => write(record, 'workflow_handoff_preview', { stageId: 'shooting-script' })))
+    for (const record of [a, b]) await nativeActivity(home, record, 'workflow-queue', undefined, [{}])
+    const confirmations = await Promise.all([a, b].map((record, index) => request(page, 'operation', {
+      ticket: tickets.get(record), action: 'workflow_handoff_confirm',
+      data: { operationId: randomUUID(), handoffId: previews[index].handoffId },
+    })))
+    assert.deepEqual(confirmations.map(item => item.status).sort(), [200, 409])
+    const winner = [a, b][confirmations.findIndex(item => item.status === 200)]
+    const loser = winner === a ? b : a
+    const official = await read(c)
+    assert.equal(official.session.status, 'normal')
+    assert.equal(official.stages[1].status, 'handed_off')
+    assert.equal(official.handoffs.length, 1)
+    assert.equal(official.handoffs[0].sourceSessionId, winner.sessionId)
+    assert.equal((await read(loser)).session.activeStageId, 'shooting-script')
+    assert.equal((await read(other)).handoffs.length, 0)
+    for (const action of ['workflow_approve', 'workflow_reserve', 'workflow_turn_start', 'workflow_save_artifact']) {
+      const result = await request(page, 'operation', { ticket: tickets.get(loser), action, data: {} })
+      assert.equal(result.status, 400, action)
+    }
   }, { workflowFixture: true })
+})
+
+test('Workflow dock exercises DeepSeek on successive native Agent turns and handoff', {
+  timeout: 240_000, skip: process.env.DRAMA_REAL_WORKFLOW !== '1',
+}, async () => {
+  await withWeb(async ({ page, records, home }) => {
+    const [a] = records
+    const title = 'Late bus storyboard'
+    const stage = 'storyboard'
+    await installWorkflowFiles(home, stage,
+      'REAL-HARNESS-STORYBOARD. Save Markdown only when explicitly requested. Continue revising the same artifact ID when supplied.',
+      'REAL-SKILL-STORYBOARD. Use drama_save_artifact to deliver Markdown draft versions; never advance workflow.')
+    await installWorkflowFiles(home, 'asset-binding', 'REAL-HARNESS-ASSETS. On the initial task, make one asset brief.',
+      'REAL-SKILL-ASSETS. Read the confirmed storyboard using drama_workflow_artifact and the artifactId and version from approvedInputs. Then call drama_save_artifact with a unique operationId, title "Late bus assets", and content copying the exact storyboard marker returned by the tool. Stop after saving.')
+    const pane = await openWorkflow(page, a)
+    const ticket = await ticketFor(page, a.sessionId)
+    const get = () => operate(page, ticket, 'workflow_get', {})
+    await pane.getByRole('button', { name: '分镜制作', exact: true }).click()
+    await poll(async () => (await get()).session.activeStageId === stage, 'Could not activate real storyboard Stage')
+    let artifactId
+    for (const [index, marker] of ['LAST-BUS-WIDE', 'LAST-BUS-CLOSE', 'LAST-BUS-REFLECT'].entries()) {
+      const args = { operationId: randomUUID(), title, content: marker, ...(artifactId ? { artifactId, expectedVersion: index } : {}) }
+      await sendNative(page, 'Use the drama_save_artifact tool exactly once now with these arguments: ' + JSON.stringify(args) +
+        '. Keep the exact content marker in the saved storyboard. After saving say "Saved".')
+      const artifact = await poll(async () => {
+        const view = await get()
+        if (view.session.status === 'failed') assert.fail(view.session.error)
+        return view.session.status === 'active' && view.artifacts.find(item => item.version === index + 1 && item.content?.includes(marker))
+      }, 'DeepSeek did not finish draft version ' + (index + 1), 55_000)
+      artifactId = artifact.artifactId
+    }
+    assert.equal((await get()).handoffs.length, 0)
+    await pane.getByTestId('drama-workflow-action').click()
+    const sidebar = page.getByTestId('drama-workflow-artifacts')
+    await sidebar.getByTestId('drama-workflow-confirm').click()
+    const result = await poll(async () => {
+      const view = await get()
+      if (view.session.status === 'failed') assert.fail(view.session.error)
+      return view.session.activeStageId === 'asset-binding' && view.session.status === 'active' &&
+        view.artifacts.find(item => item.stageId === 'asset-binding' && item.content?.includes('LAST-BUS-REFLECT')) && view
+    }, 'DeepSeek did not receive the confirmed storyboard in the next stage', 60_000)
+    await screenshot(page, '07-workflow-deepseek-confirmed.png')
+    const beforeExit = await nativeActivity(home, a, 'workflow-transcript')
+    await pane.getByRole('button', { name: '退出阶段', exact: true }).click()
+    await poll(async () => (await get()).session.status === 'normal', 'Real Session did not return to normal chat')
+    await sendNative(page, 'Reply with one short greeting. WORKFLOW-REAL-NORMAL-CHAT')
+    const transcript = await poll(async () => {
+      const events = await nativeActivity(home, a, 'workflow-transcript')
+      return events.filter(event => event.type === 'turn/end').length >
+        beforeExit.filter(event => event.type === 'turn/end').length && events
+    }, 'DeepSeek did not return a normal chat reply after exiting', 55_000)
+    assert.equal(transcript.filter(event => event.type === 'turn/end').at(-1).reason, 'completed')
+    const restoredPrompt = transcript.filter(event => event.type === 'system/message').at(-1)
+    assert.doesNotMatch(restoredPrompt.text, workflowMarker)
+    const prompts = transcript.filter(event => event.type === 'system/message').map(event => event.text)
+    assert.ok(prompts.some(prompt => prompt.includes('REAL-HARNESS-STORYBOARD') && prompt.includes('REAL-SKILL-STORYBOARD')))
+    assert.ok(prompts.some(prompt => prompt.includes('REAL-HARNESS-ASSETS') && prompt.includes(result.handoffs[0].handoffId)))
+    const models = [...new Set(transcript.filter(event => event.source?.provider === 'deepseek-official').map(event => event.source.model))]
+    assert.ok(models.length, 'Native trajectory has no deepseek-official model')
+    const calls = transcript.filter(event => event.type === 'tool/call').map(item => item.name)
+    assert.ok(calls.filter(name => name === 'drama_save_artifact').length >= 4)
+    assert.ok(calls.includes('drama_workflow_artifact'))
+    await operate(page, ticket, 'bind', { operationId: randomUUID() })
+    assert.equal((await query(page, ticket)).nodes.length, 0)
+    const tasks = await operate(page, ticket, 'tasks', {})
+    assert.equal(tasks.tasks.length, 0)
+    const report = {
+      provider: 'deepseek-official', models, sessionId: a.sessionId, workspaceId: a.workspaceId,
+      draftVersions: result.artifacts.filter(item => item.artifactId === artifactId).map(({ version, content }) => ({ version, content })),
+      handoff: result.handoffs[0], targetDrafts: result.artifacts.filter(item => item.stageId === 'asset-binding'),
+      nativeTrace: transcript.flatMap(event => {
+        if (event.type === 'system/message') {
+          const stage = event.text.includes('REAL-HARNESS-ASSETS') ? 'asset-binding' :
+            event.text.includes('REAL-HARNESS-STORYBOARD') ? 'storyboard' : undefined
+          return stage ? [{ type: event.type, stage, turn: event.turn }] : []
+        }
+        if (event.type === 'tool/call') return [{ type: event.type, name: event.name }]
+        if (event.type === 'assistant/message' || event.type === 'turn/end' || event.type === 'tool/result') return [event]
+        return []
+      }),
+      normalChatAfterExit: true, canvasNodes: 0, videoTasks: tasks.tasks.length,
+    }
+    if (process.env.DRAMA_WORKFLOW_REAL_EVIDENCE) await writeFile(process.env.DRAMA_WORKFLOW_REAL_EVIDENCE, JSON.stringify(report, null, 2) + '\n')
+    console.info('Real Agent evidence: ' + models.join(', ') + '; storyboard V1–V3; one confirmed handoff; target draft saved; zero Canvas nodes and video tasks')
+  }, { realWorkflow: true, workflowFixture: true })
 })
 
 test('Workflow dock separates Canvas video authorization from final film approval', { timeout: 160_000, skip: !hasVideo }, async () => {
   await withWeb(async ({ page, records, home }) => {
     const [record] = records
     await configureVideoFixture(page)
-    for (const id of fixedWorkflowIds) {
-      await installWorkflowFiles(home, id, 'Use only the supplied synthetic inputs.', 'Follow the fixture stage.')
-    }
+    await installTestStages(home)
     const pane = await openWorkflow(page, record)
-    const action = pane.getByTestId('drama-workflow-action')
+    await open(page, record)
     const ticket = await ticketFor(page, record.sessionId)
     const get = () => operate(page, ticket, 'workflow_get', {})
-    const waitStatus = (index, status) => poll(async () => {
-      const stage = (await get()).stages[index]
-      if (stage.status === 'failed') assert.fail(stage.error)
-      return stage.status === status && stage
-    }, 'Stage ' + fixedWorkflowIds[index] + ' did not enter ' + status)
-    const queue = (...calls) => nativeActivity(home, record, 'workflow-queue', undefined, workflowCalls(...calls))
-    const draft = workflowNote('video', { title: 'Workflow fixture video', mode: 't2v',
-      prompt: '固定中景。人物推开餐厅门，在门口停顿。', params: { duration: 8 } })
-    for (let index = 0; index <= 4; index++) {
-      await queue(index === 4 ? draft : workflowNote('note', { text: fixedWorkflowIds[index] }))
-      const text = index ? '开始' + fixedWorkflowNames[index] : '开始内容分析'
-      await action.filter({ hasText: text }).click()
-      await waitStatus(index, 'review')
-    }
-    await action.filter({ hasText: /^确认视频节点部署$/u }).click()
-    await waitStatus(4, 'approved')
-    const draftId = draft.args.nodes[0].id
+    const queue = (...steps) => nativeActivity(home, record, 'workflow-queue', undefined, steps)
+    const action = pane.getByTestId('drama-workflow-action')
+    const confirm = page.getByTestId('drama-workflow-confirm')
+    const draftId = randomUUID()
+    await pane.getByRole('button', { name: '视频节点部署', exact: true }).click()
+    await poll(async () => (await get()).session.activeStageId === 'video-deployment', 'Deployment activation')
+    await queue(...workflowCalls(
+      { name: 'drama_append', args: { operationId: randomUUID(), nodes: [{ id: draftId, type: 'video',
+        content: { title: 'Workflow fixture video', mode: 't2v', prompt: '固定中景。人物推开餐厅门，在门口停顿。', params: { duration: 8 } } }] } },
+      { name: 'drama_save_artifact', args: { operationId: randomUUID(), title: '待生成镜头', nodeId: draftId } },
+    ))
+    await sendNative(page, '为这个镜头准备视频节点草稿。')
+    await poll(async () => {
+      const view = await get()
+      return view.session.status === 'active' && view.artifacts.some(item => item.stageId === 'video-deployment')
+    }, 'No deployment artifact was saved')
+    await action.click()
+    await queue({})
+    await confirm.click()
+    await poll(async () => (await get()).session.activeStageId === 'video-generation' &&
+      (await get()).session.status === 'active', 'Generation stage did not receive the deployment handoff')
     assert.equal((await get()).stages[5].generation.state, 'waiting')
     assert.equal((await operate(page, ticket, 'tasks', {})).tasks.length, 0)
-    await action.filter({ hasText: '打开画布生成视频' }).click()
+
+    await open(page, record)
     const source = card(page, draftId)
     await source.locator('.drama-node-titlebar').click()
     await source.getByRole('button', { name: '生成…', exact: true }).click()
     assert.equal((await operate(page, ticket, 'tasks', {})).tasks.length, 0)
     await page.getByRole('dialog', { name: '确认生成', exact: true })
       .getByRole('button', { name: '确认提交', exact: true }).click()
-    await poll(async () => (await get()).stages[5].generation.state === 'processing', 'Video generation did not track the existing task')
+    await poll(async () => (await get()).stages[5].generation.state === 'processing', 'Generation did not track the Canvas task')
     await writeFile(join(home, 'allow-fixture-result'), '')
     const task = await poll(async () => {
       const { tasks } = await operate(page, ticket, 'tasks', {})
       return (await get()).stages[5].generation.state === 'ready' && tasks.find(item => item.status === 'completed')
-    }, 'Downloaded video did not reach Workflow result readiness', 25_000)
-    await queue({ name: 'drama_query', args: { id: task.resultNodeId } })
-    await action.filter({ hasText: '核对生成结果' }).click()
-    const generation = await waitStatus(5, 'review')
-    assert.equal(generation.outputs[0].id, task.resultNodeId)
+    }, 'Download did not reach generation result readiness', 25_000)
     assert.match(task.outputPath, /^assets\/native-results\/[^/]+\.mp4$/u)
     const downloaded = join(home, record.workspaceName, task.outputPath)
     await rename(downloaded, downloaded + '.held')
     try {
-      assert.equal((await get()).stages[5].needsRerun, true)
-      await page.evaluate(() => window.dispatchEvent(new Event('focus')))
-      await action.filter({ hasText: '打开画布检查任务' }).waitFor()
+      const blocked = await request(page, 'operation', { ticket, action: 'workflow_handoff_preview',
+        data: { operationId: randomUUID(), stageId: 'video-generation' } })
+      assert.ok(blocked.status >= 400)
     } finally {
       await rename(downloaded + '.held', downloaded)
     }
-    await page.evaluate(() => window.dispatchEvent(new Event('focus')))
-    await queue(workflowNote('note', { text: 'The final fixture film is ready for review.' }))
-    await action.filter({ hasText: '开始成片验收' }).click()
-    const reviewStage = await waitStatus(6, 'review')
-    assert.deepEqual(reviewStage.inputs, generation.outputs)
-    await pane.getByRole('button', { name: '查看成片', exact: true }).click()
-    const details = page.getByRole('dialog', { name: '成片验收', exact: true })
-    const player = details.locator('video')
+
+    await queue(...workflowCalls(
+      workflowArtifact('成片验收记录', '画面与声音检查通过，可交付验收。'),
+      { name: 'drama_save_artifact', args: { operationId: randomUUID(), title: '已验收镜头', nodeId: task.resultNodeId } },
+    ))
+    await action.click()
+    const sidebar = page.getByTestId('drama-workflow-artifacts')
+    const generatedPreview = sidebar.getByTestId('drama-workflow-preview')
+    await generatedPreview.locator('.drama-handoff-file summary').click()
+    const player = generatedPreview.locator('video')
     await player.waitFor()
     assert.ok(await decodeVideoFrame(player))
-    await details.getByRole('button', { name: '关闭阶段详情', exact: true }).click()
-    await action.filter({ hasText: '验收影片' }).click()
-    await waitStatus(6, 'approved')
-    const completed = await get()
-    assert.ok(completed.stages.every(stage => stage.status === 'approved'))
+    await screenshot(page, '06-workflow-video-preview.png')
+    await confirm.click()
+    await poll(async () => {
+      const view = await get()
+      return view.session.activeStageId === 'final-review' && view.session.status === 'active' &&
+        view.artifacts.filter(item => item.stageId === 'final-review').length === 2
+    }, 'Final review did not receive the authorized video handoff')
+    await action.click()
+    await sidebar.getByTestId('drama-workflow-confirm').click()
+    const closed = await poll(async () => {
+      const view = await get()
+      return view.stages[6].status === 'handed_off' && view
+    }, 'The final handoff was not recorded')
+    assert.equal(closed.handoffs.length, 3)
+    const final = closed.handoffs.find(item => item.sourceStageId === 'final-review')
+    assert.ok(!final.targetStageId)
+    assert.ok(final.artifacts.some(item => item.nodeId === task.resultNodeId))
     assert.equal((await operate(page, ticket, 'tasks', {})).tasks.length, 1)
   }, { providerFixture: true, workflowFixture: true })
 })
@@ -3424,8 +3405,13 @@ test('Native prompt asset mentions survive reload and send real assets without c
         const atoms = [...copied.querySelectorAll('[data-asset-mention]')]
         return atoms.length === expectedIds.length && atoms.every((atom, i) => atom.dataset.assetId === expectedIds[i])
       }, [canvasAssetId, project.id]), 'Ctrl+C did not serialize both asset atoms to the clipboard')
-      await page.keyboard.press('Control+End')
-      await page.keyboard.press('Control+v')
+      await prompt.press('Control+End')
+      await poll(() => prompt.evaluate(element => {
+        const selection = document.getSelection()
+        return document.activeElement === element && selection?.isCollapsed &&
+          selection.focusNode && element.contains(selection.focusNode)
+      }), 'Ctrl+End did not collapse the selection inside the prompt editor')
+      await prompt.press('Control+v')
       await poll(async () => (await savedNode()).content.promptDoc.content.flatMap(block => block.content ?? [])
         .filter(item => item.type === 'assetMention').length === 4, 'rich paste flattened the copied asset atoms')
       await prompt.press('Control+z')

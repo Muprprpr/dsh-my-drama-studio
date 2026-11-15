@@ -1,145 +1,156 @@
-import React, { useEffect, useRef, useState } from 'react'
-import { Button, Modal, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
-import { nodeLabels, nodeTitle } from './canvas-node.jsx'
-import { mediaURL, operation, subscribe } from './studio-api.js'
+import React, { useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { Button, MarkdownText, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
+import { artifactMediaURL, operation, subscribe } from './studio-api.js'
 import style from './workflow-panel.css'
 
-const generationStage = 'video-generation'
 const finalStage = 'final-review'
-const statuses = {
+const generationStage = 'video-generation'
+const stageStatuses = {
   not_started: ['未开始', 'idle'],
-  running: ['运行中', 'ongoing'],
-  review: ['待验收', 'warning'],
-  approved: ['已确认', 'done'],
-  failed: ['失败', 'error'],
+  draft_available: ['有草稿', 'warning'],
+  handed_off: ['已交接', 'done'],
   stale: ['产物已过期', 'warning'],
 }
-
-const isActive = stage => stage.pending || stage.status === 'running'
-const filesReady = stage => stage?.files?.harnessReady && stage.files.skillReady
-const canAdvance = stage => stage && stage.id !== generationStage && stage.status === 'not_started'
-  && !stage.pending && filesReady(stage)
-
-function statusFor(stage, current) {
-  if (stage.pending) return ['正在启动', 'ongoing']
-  if (stage.needsReview) return ['产物已更新，待复审', 'warning']
-  if (!['not_started', 'failed', 'stale'].includes(stage.status)) return statuses[stage.status]
-  if (current) {
-    if (stage.generation?.state === 'processing') return ['视频生成中', 'ongoing']
-    if (stage.generation?.state === 'failed') return ['视频任务失败', 'error']
-    if (stage.generation?.state === 'waiting') return ['待独立授权', 'warning']
-    if (stage.status === 'not_started' && stage.files && !filesReady(stage)) return ['全局配置缺失', 'warning']
-  }
-  return statuses[stage.status]
+const sessionStatuses = {
+  normal: '普通聊天',
+  active: '本会话已加载 Harness',
+  running: '本会话 Agent 执行中',
+  failed: '本会话执行失败',
+}
+const markdownLabels = {
+  code: {
+    copyLabel: '复制', copiedLabel: '已复制',
+    toolbarLabels: { codeLabel: '代码块', wrapLabel: '换行', unwrapLabel: '取消换行' },
+  },
+  footnotes: '脚注',
 }
 
-async function readCanvasNodes(ticket, ids, signal) {
-  return Object.fromEntries(await Promise.all(ids.map(async id => {
-    const { nodes } = await operation(ticket, 'query', { id, limit: 1 }, signal)
-    return [id, nodes.find(node => node.id === id) ?? null]
-  })))
+const workflowChange = new EventTarget()
+const interactions = new Map()
+const initialInteraction = Object.freeze({ choices: Object.freeze({}) })
+
+function setInteraction(ticket, patch) {
+  interactions.set(ticket, { ...(interactions.get(ticket) ?? initialInteraction), ...patch })
+  workflowChange.dispatchEvent(new CustomEvent('interaction', { detail: ticket }))
 }
 
-function useCanvasNodes(ticket, refs, changes, connected) {
-  const [loaded, setLoaded] = useState(null)
-  const ids = JSON.stringify([...new Set(refs.map(ref => ref.id))])
-
-  useEffect(() => {
-    const requested = JSON.parse(ids)
-    if (!connected || !requested.length) return
-    const controller = new AbortController()
-    readCanvasNodes(ticket, requested, controller.signal).then(nodes => {
-      if (!controller.signal.aborted) setLoaded({ ids, changes, nodes })
-    }).catch(error => {
-      if (!controller.signal.aborted) setLoaded({ ids, changes, error: error.message })
-    })
-    return () => controller.abort()
-  }, [ticket, ids, changes, connected])
-
-  return connected && loaded?.ids === ids && loaded.changes === changes ? loaded : null
+function useInteraction(ticket) {
+  return useSyncExternalStore(listener => {
+    const changed = event => { if (event.detail === ticket) listener() }
+    workflowChange.addEventListener('interaction', changed)
+    return () => workflowChange.removeEventListener('interaction', changed)
+  }, () => interactions.get(ticket) ?? initialInteraction)
 }
 
-export function WorkflowProgress({ session, workspaceTitle, useSessions, refreshSession, openCanvas }) {
-  const { ticket, status } = session
-  const { sessionId, workspaceId, connected, eventSeq } = status
+function refreshWorkflow(ticket) {
+  workflowChange.dispatchEvent(new CustomEvent('refresh', { detail: ticket }))
+}
+
+function useWorkflowView(session, refreshSession) {
+  const { ticket, status: { connected, eventSeq } } = session
   const [view, setView] = useState(null)
-  const [detailId, showDetails] = useState('')
-  const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const [loadError, setLoadError] = useState('')
-  const [reload, setReload] = useState(0)
-  const [changes, setChanges] = useState(0)
-  const action = useRef(false)
-  const epoch = useRef(0)
-  const steps = useRef(null)
-
   useEffect(() => {
     const controller = new AbortController()
-    const generation = epoch.current
-    operation(ticket, 'workflow_get', {}, controller.signal).then(result => {
-      if (!controller.signal.aborted && generation === epoch.current) {
+    let requestId = 0
+    async function refresh() {
+      const id = ++requestId
+      try {
+        const result = await operation(ticket, 'workflow_get', {}, controller.signal)
+        if (controller.signal.aborted || id !== requestId) return
         setView(result)
-        setLoadError('')
+        setError('')
+      } catch (failure) {
+        if (!controller.signal.aborted && id === requestId) setError(failure.message)
       }
-    }).catch(failure => {
-      if (!controller.signal.aborted && generation === epoch.current) setLoadError(failure.message)
-    })
-    return () => controller.abort()
-  }, [ticket, reload])
-
-  useEffect(() => {
-    if (!connected) return
-    const controller = new AbortController()
-    subscribe(ticket, eventSeq, controller.signal, batch => {
-      if (!batch.events) return
-      const types = new Set(batch.events.map(event => event.type))
-      if (!types.size || types.has('append') || types.has('update')) {
-        setChanges(value => value + 1)
-        setReload(value => value + 1)
-      } else if (types.has('workflow') || types.has('task')) {
-        setReload(value => value + 1)
-      }
-      if (types.has('binding')) refreshSession()
-    }, failure => {
-      setLoadError(failure.message)
-      refreshSession()
-    })
-    return () => controller.abort()
-  }, [ticket, connected, eventSeq, refreshSession])
-
-  const stages = view?.stages ?? []
-  const current = stages.find(isActive) ?? stages.find(stage => stage.status !== 'approved' || stage.needsReview)
-  const currentIndex = current ? stages.indexOf(current) : -1
-  const next = current ? stages[currentIndex + 1] : null
-  const detail = stages.find(stage => stage.id === detailId)
-  const active = Boolean(current && isActive(current))
-  const activeSessionId = active ? current.sessionId : undefined
-  const activeSessionTitle = useSessions(state => activeSessionId ? state.byId[activeSessionId]?.displayTitle : undefined)
-  const detailSessionTitle = useSessions(state => detail?.sessionId ? state.byId[detail.sessionId]?.displayTitle : undefined)
-  const needsFileCheck = [current, next, detail].some(stage => stage?.files && !filesReady(stage))
-  const awaitingProgress = !connected || needsFileCheck || Boolean(current?.pending) || current?.generation?.state === 'processing'
-  const reviewRefs = current?.status === 'review' ? current.outputs ?? [] : []
-  const review = useCanvasNodes(ticket, reviewRefs, changes, connected)
-  const invalidReview = current?.needsRerun || review?.nodes && reviewRefs.some(ref => {
-    const node = review.nodes[ref.id]
-    return !node || node.deleted || current?.id === generationStage && node.revision !== ref.revision
-  })
-  const generationNeedsCanvas = current?.id === generationStage && current.generation?.state !== 'ready'
-  const working = busy || active
-
-  useEffect(() => {
-    function refresh() {
-      if (document.visibilityState === 'visible') setReload(value => value + 1)
     }
-    window.addEventListener('focus', refresh)
-    document.addEventListener('visibilitychange', refresh)
-    const timer = awaitingProgress ? setInterval(refresh, 5000) : null
+    const changed = event => { if (event.detail === ticket) void refresh() }
+    const visible = () => { if (document.visibilityState === 'visible') void refresh() }
+    workflowChange.addEventListener('refresh', changed)
+    window.addEventListener('focus', visible)
+    document.addEventListener('visibilitychange', visible)
+    const poll = !connected ? setInterval(visible, 4000) : null
+    if (connected) {
+      subscribe(ticket, eventSeq, controller.signal, batch => {
+        if (!batch.events || batch.events.some(event => ['workflow', 'task', 'append', 'update', 'binding'].includes(event.type))) {
+          void refresh()
+        }
+        if (batch.events?.some(event => event.type === 'binding')) refreshSession()
+      }, failure => {
+        setError(failure.message)
+        refreshSession()
+      })
+    }
+    void refresh()
     return () => {
-      window.removeEventListener('focus', refresh)
-      document.removeEventListener('visibilitychange', refresh)
-      if (timer !== null) clearInterval(timer)
+      controller.abort()
+      if (poll !== null) clearInterval(poll)
+      workflowChange.removeEventListener('refresh', changed)
+      window.removeEventListener('focus', visible)
+      document.removeEventListener('visibilitychange', visible)
     }
-  }, [awaitingProgress])
+  }, [ticket, connected, eventSeq, refreshSession])
+  return { view, error }
+}
+
+function mutate(ticket, action, data) {
+  return operation(ticket, action, { ...data, operationId: crypto.randomUUID() })
+}
+
+async function runAction(ticket, action, work) {
+  if (interactions.get(ticket)?.busy) return
+  setInteraction(ticket, { busy: action, error: '' })
+  try {
+    await work()
+  } catch (failure) {
+    setInteraction(ticket, { error: failure.message })
+  } finally {
+    setInteraction(ticket, { busy: '' })
+    refreshWorkflow(ticket)
+  }
+}
+
+const artifactKey = artifact => JSON.stringify([artifact.artifactId, artifact.version])
+const belongsTo = (artifact, stageId, sessionId) => artifact.stageId === stageId && artifact.sessionId === sessionId
+
+function groupVersions(artifacts) {
+  const grouped = new Map()
+  for (const artifact of artifacts) {
+    const group = grouped.get(artifact.artifactId) ?? []
+    group.push(artifact)
+    grouped.set(artifact.artifactId, group)
+  }
+  return [...grouped.values()].map(group => group.sort((a, b) => b.version - a.version))
+}
+
+function chosenVersion(choices, group) {
+  return Object.hasOwn(choices, group[0].artifactId) ? choices[group[0].artifactId] : group[0].version
+}
+
+function selectedRefs(groups, choices) {
+  return groups.flatMap(group => {
+    const version = chosenVersion(choices, group)
+    return version ? [{ artifactId: group[0].artifactId, version }] : []
+  })
+}
+
+export function WorkflowProgress({ session, refreshSession, openArtifacts, openCanvas, nativeRunning }) {
+  const { ticket, status: { sessionId, workspaceId } } = session
+  const { view, error: loadError } = useWorkflowView(session, refreshSession)
+  const interaction = useInteraction(ticket)
+  const steps = useRef(null)
+  const state = view?.session
+  const stages = view?.stages ?? []
+  const stage = stages.find(candidate => candidate.id === state?.activeStageId)
+  const ownGroups = groupVersions((view?.artifacts ?? []).filter(artifact => belongsTo(artifact, stage?.id, sessionId)))
+  const choices = interaction.choices[stage?.id] ?? {}
+  const refs = selectedRefs(ownGroups, choices)
+  const sessionStatus = stage && nativeRunning ? 'running' : state?.status
+  const previewAllowed = sessionStatus !== 'running' && (stage?.id === generationStage
+    ? stage.generation?.state === 'ready' : refs.length > 0)
+  const review = interaction.review?.sourceStageId === stage?.id ? interaction.review : null
+
+  useEffect(() => refreshWorkflow(ticket), [ticket, nativeRunning])
 
   useEffect(() => {
     const list = steps.current
@@ -149,265 +160,326 @@ export function WorkflowProgress({ session, workspaceTitle, useSessions, refresh
     const item = chip.getBoundingClientRect()
     if (item.left < bar.left) list.scrollLeft += item.left - bar.left
     if (item.right > bar.right) list.scrollLeft += item.right - bar.right
-  }, [current?.id])
+  }, [stage?.id])
 
-  const mutate = (name, data) => operation(ticket, name, { ...data, operationId: crypto.randomUUID() })
-
-  async function connect() {
-    if (connected) return
-    await mutate('bind', {})
+  const activate = stageId => runAction(ticket, 'activate', async () => {
+    await mutate(ticket, 'workflow_activate', { stageId })
+    setInteraction(ticket, { stageId: stageId || stage?.id, review: null, selected: undefined, section: 'artifacts' })
     refreshSession()
-  }
+  })
 
-  async function run(work) {
-    if (action.current) return
-    action.current = true
-    epoch.current += 1
-    setBusy(true)
-    setError('')
-    try {
-      await work()
-    } catch (failure) {
-      setError(failure.message)
-    } finally {
-      epoch.current += 1
-      action.current = false
-      setBusy(false)
-      setReload(value => value + 1)
-    }
-  }
-
-  function select(id) {
-    showDetails(id)
-    setReload(value => value + 1)
-  }
-
-  function accept(result) {
-    epoch.current += 1
-    setView(previous => ({
-      ...result,
-      stages: result.stages.map(stage => ({
-        ...stage,
-        files: stage.files ?? previous?.stages.find(item => item.id === stage.id)?.files,
-      })),
-    }))
-  }
-
-  async function start(snapshot, stage, predecessor) {
-    await mutate('workflow_start', {
-      stageId: stage.id, revision: snapshot.revision, expectedRunId: stage.runId,
-      previousApproval: predecessor?.approvalId,
+  const preview = () => runAction(ticket, 'preview', async () => {
+    const result = await mutate(ticket, 'workflow_handoff_preview', {
+      stageId: stage.id,
+      ...(Object.keys(choices).length ? { artifacts: refs } : {}),
     })
+    setInteraction(ticket, { review: result, stageId: stage.id })
+    openArtifacts()
+  })
+
+  function browse() {
+    if (stage?.id && !review) setInteraction(ticket, { stageId: stage.id })
+    openArtifacts()
   }
 
-  const startCurrent = () => run(async () => {
-    await connect()
-    await start(view, current, stages[currentIndex - 1])
-  })
-
-  const approveCurrent = () => run(async () => {
-    await connect()
-    const nodes = review?.nodes ?? await readCanvasNodes(ticket, reviewRefs.map(ref => ref.id))
-    const outputs = reviewRefs.map(({ id, revision }) => {
-      const node = nodes[id]
-      if (!node || node.deleted) throw new Error('阶段产物已不可用，请在画布中检查。')
-      if (current.id === generationStage && node.revision !== revision) throw new Error('视频成片已变化，请重新核对生成结果。')
-      return { id, revision: node.revision }
-    })
-    const result = await mutate('workflow_approve', { stageId: current.id, runId: current.runId, outputs })
-    accept(result)
-    if (!canAdvance(next)) return
-
-    try {
-      const latest = await operation(ticket, 'workflow_get')
-      accept(latest)
-      const index = latest.stages.findIndex(stage => stage.id === current.id)
-      const upcoming = latest.stages[index + 1]
-      if (upcoming?.id !== next.id || !canAdvance(upcoming)) return
-      await start(latest, upcoming, latest.stages[index])
-    } catch (failure) {
-      throw new Error('当前阶段已确认。下一阶段启动失败。' + failure.message)
-    }
-  })
-
-  const reopen = stage => run(async () => {
-    await connect()
-    accept(await mutate('workflow_return', { stageId: stage.id, runId: stage.runId }))
-    showDetails('')
-  })
-
-  const showCanvas = () => run(async () => {
-    await connect()
-    showDetails('')
-    openCanvas()
-  })
-
-  let primary
-  if (current) {
-    const generationCanvasLabel = current.generation?.state === 'waiting' ? '打开画布生成视频' : '打开画布检查任务'
-    if (active || current.generation?.state === 'processing' && !['review', 'approved'].includes(current.status)) {
-      primary = { label: current.pending ? '正在启动' + current.name + '…' : '正在执行' + current.name + '…', disabled: true }
-    } else if (current.needsReview) {
-      primary = { label: '重新验收', invoke: () => reopen(current) }
-    } else if (invalidReview) {
-      primary = generationNeedsCanvas
-        ? { label: generationCanvasLabel, invoke: showCanvas }
-        : { label: '重试当前阶段', invoke: startCurrent, disabled: !filesReady(current) }
-    } else if (current.status === 'review') {
-      const reviewable = reviewRefs.length > 0
-        && (!connected || reviewRefs.every(({ id }) => review?.nodes?.[id] && !review.nodes[id].deleted))
-      primary = {
-        label: current.id === finalStage ? '验收影片' : canAdvance(next)
-          ? '确认' + current.name + '，开始' + next.name : '确认' + current.name,
-        invoke: approveCurrent,
-        disabled: !reviewable,
-      }
-    } else if (generationNeedsCanvas) {
-      primary = { label: generationCanvasLabel, invoke: showCanvas }
-    } else {
-      primary = {
-        label: current.status === 'failed' ? '重试当前阶段'
-          : current.status === 'stale' ? '重新执行' + current.name
-          : current.id === generationStage ? '核对生成结果' : '开始' + current.name,
-        invoke: startCurrent,
-        disabled: !filesReady(current),
-      }
-    }
+  function showPreview() {
+    setInteraction(ticket, { stageId: stage.id, dismissedReview: undefined })
+    openArtifacts()
   }
-  const reviewError = invalidReview && (generationNeedsCanvas ? '成片已不可用，请打开画布检查。'
-    : '当前产物已删除或版本已变化，请重新执行此阶段。')
-  const alert = error || loadError || current?.error || review?.error || reviewError
-  const feedback = alert || current?.generation?.message
-  const projectLabel = workspaceTitle || workspaceId
 
-  return <section className="drama-workflow-progress" aria-label="短剧生产进度"
-    data-testid="drama-workflow" data-session-id={sessionId} data-workspace-id={workspaceId}>
-    <style>{style}</style>
-    {!view && !loadError && <p role="status">正在读取生产进度…</p>}
-    {view && <>
-      <ol ref={steps} className="drama-workflow-steps" aria-label="工作流阶段">
-        {stages.map(stage => {
-          const [label, state] = statusFor(stage, stage.id === current?.id)
-          return <li key={stage.id}>
-            <button type="button" data-stage-id={stage.id} aria-current={stage.id === current?.id ? 'step' : undefined}
-              aria-label={stage.name + '，' + label} title={stage.name + ' · ' + label}
-              onClick={() => select(stage.id)}>
-              <StateDot state={state} size={8} />
-              <span>{stage.name}</span>
+  const retry = () => runAction(ticket, 'retry', async () => {
+    await operation(ticket, 'workflow_handoff_retry', { handoffId: state.pendingHandoffId })
+    refreshSession()
+  })
+
+  const feedback = interaction.error || state?.error || loadError
+  return <section className="drama-workflow-progress" data-testid="drama-workflow"
+    data-session-id={sessionId} data-workspace-id={workspaceId} aria-label="制作工作流">
+    {stages.length > 0 ? <>
+      <ol className="drama-workflow-steps" ref={steps}>
+        {stages.map(candidate => {
+          const [label, dot] = stageStatuses[candidate.status] ?? stageStatuses.not_started
+          return <li key={candidate.id}>
+            <button type="button" aria-current={stage?.id === candidate.id ? 'step' : undefined}
+              data-status={candidate.status} title={candidate.name + ' · ' + label}
+              disabled={Boolean(interaction.busy)} onClick={() => {
+                if (stage?.id !== candidate.id) void activate(candidate.id)
+                else browse()
+              }}>
+              <StateDot state={dot} size={6} />{candidate.name}
             </button>
           </li>
         })}
       </ol>
       <div className="drama-workflow-command">
-        <div className="drama-workflow-current" role="status" data-testid="drama-workflow-current"
-          data-stage-id={current?.id} data-status={current?.status ?? 'approved'}>
-          <span className="drama-workflow-identity" title={projectLabel}>项目 {projectLabel}</span>
-          <strong>{current ? current.name : view.name}</strong>
-          <span className="drama-workflow-state">{current ? statusFor(current, true)[0] : '全部阶段已验收'}</span>
-          {activeSessionId && <span className="drama-workflow-identity" title={activeSessionId}
-            data-testid="drama-workflow-executor" data-session-id={activeSessionId}>
-            {activeSessionId === sessionId ? '本会话执行' : '执行会话 ' + (activeSessionTitle || activeSessionId)}
-          </span>}
+        <div className="drama-workflow-current" data-status={sessionStatus} data-active-stage-id={stage?.id}>
+          <strong>{stage?.name ?? sessionStatuses.normal}</strong>
+          {stage && <span>{sessionStatuses[sessionStatus]}</span>}
         </div>
-        {current?.files && !filesReady(current) && <Button type="button" size="sm" onClick={() => select(current.id)}>查看缺失路径</Button>}
-        {current?.id === finalStage && current.status === 'review'
-          && <Button type="button" size="sm" onClick={() => select(current.id)}>查看成片</Button>}
-        {primary && <Button type="button" size="sm" variant="primary" data-testid="drama-workflow-action"
-          disabled={busy || primary.disabled} onClick={primary.invoke}>{primary.label}</Button>}
+        <Button type="button" size="sm" onClick={browse}>阶段产物</Button>
+        {stage && <Button type="button" size="sm" disabled={Boolean(interaction.busy)}
+          onClick={() => void activate('')}>退出阶段</Button>}
+        {state?.pendingHandoffId ? <Button type="button" size="sm" variant="primary"
+          disabled={Boolean(interaction.busy) || sessionStatus === 'running'} onClick={retry}>启动交接后的任务</Button>
+          : review ? <Button type="button" size="sm" variant="primary" onClick={showPreview}>查看交接预览</Button>
+          : previewAllowed && <Button type="button" size="sm" variant="primary" data-testid="drama-workflow-action"
+            disabled={Boolean(interaction.busy)} onClick={preview}>
+            {stage.id === finalStage ? '生成成片验收包' : '生成交接预览'}
+          </Button>}
       </div>
-    </>}
+      {stage?.generation?.message && <div className="drama-workflow-feedback">
+        <p role="status">{stage.generation.message}</p>
+        <Button type="button" size="sm" onClick={openCanvas}>打开画布</Button>
+      </div>}
+    </> : !feedback && <p role="status">正在读取工作流…</p>}
     {feedback && <div className="drama-workflow-feedback">
-      <p role={alert ? 'alert' : 'status'}>{feedback}</p>
-      {(loadError || review?.error) && <Button type="button" size="sm" onClick={() => {
-        setReload(value => value + 1)
-        setChanges(value => value + 1)
-      }}>重新读取</Button>}
+      <p role="alert">{feedback}</p>
+      {loadError && <Button type="button" size="sm" onClick={() => refreshWorkflow(ticket)}>重新读取</Button>}
     </div>}
-    {detail && <StageDetails stage={detail} current={detail.id === current?.id} ticket={ticket} changes={changes} connected={connected}
-      definitionVersion={view.revision} executionTitle={detailSessionTitle}
-      busy={working} awaitingBind={busy} connect={() => run(connect)}
-      close={() => showDetails('')} openCanvas={showCanvas} reopen={() => reopen(detail)} />}
   </section>
 }
 
-function StageDetails({ stage, current, ticket, changes, connected, definitionVersion, executionTitle,
-  busy, awaitingBind, connect, close, openCanvas, reopen }) {
-  const inputs = stage.inputs ?? []
-  const outputs = stage.outputs ?? []
-  const refs = useCanvasNodes(ticket, [...inputs, ...outputs], changes, connected)
-  const [label, state] = statusFor(stage, current)
-  const showInputs = stage.id === finalStage || stage.id === generationStage
+export function WorkflowArtifacts({ session, workspaceTitle, useSessions, refreshSession, openCanvas, nativeRunning }) {
+  const { ticket, status: { sessionId } } = session
+  const { view, error: loadError } = useWorkflowView(session, refreshSession)
+  const interaction = useInteraction(ticket)
+  const [compare, setCompare] = useState(false)
+  const stages = view?.stages ?? []
+  const draftOrHandoffStage = view?.artifacts?.[0]?.stageId ?? view?.handoffs?.[0]?.sourceStageId
+  const stageId = interaction.stageId ?? view?.session?.activeStageId ?? draftOrHandoffStage ?? stages[0]?.id
+  const stage = stages.find(candidate => candidate.id === stageId)
+  const groups = groupVersions((view?.artifacts ?? []).filter(artifact => artifact.stageId === stageId))
+  const latest = groups.map(group => group[0])
+  const handoffs = (view?.handoffs ?? []).filter(handoff => handoff.sourceStageId === stageId)
+  const review = interaction.review?.sourceStageId === stageId ? interaction.review : null
+  const versionGroup = groups.find(group => group[0].artifactId === interaction.selected?.artifactId) ?? groups[0]
+  const current = versionGroup?.[0]
+  const selected = versionGroup?.find(artifact => artifact.version === interaction.selected?.version) ?? current
+  const selectedHandoff = handoffs.find(handoff => handoff.handoffId === interaction.handoffId) ?? handoffs[0]
+  const choices = interaction.choices[stageId] ?? {}
+  const isActiveStage = view?.session?.activeStageId === stageId
+  const sessionTitles = useSessions(state => state.byId)
+  const sessionLabel = id => id === sessionId ? '当前会话' : sessionTitles[id]?.displayTitle || id
+  const stageLabel = id => stages.find(candidate => candidate.id === id)?.name ?? id
+  const showReview = Boolean(review) && interaction.dismissedReview !== review?.handoffId
+  const panel = showReview ? 'review' : interaction.section ?? 'artifacts'
 
-  return <Modal open title={stage.name} closeLabel="关闭阶段详情" onClose={close} backdropBlur={false}
-    footer={<>
-      {stage.status === 'approved' && stage.runId && <Button type="button" size="sm" disabled={busy} onClick={reopen}>重新验收</Button>}
-      <Button type="button" size="sm" onClick={openCanvas}>打开画布</Button>
-    </>}>
-    <section className="drama-workflow-details" aria-label={stage.name + '详情'}>
-      <p className="drama-workflow-detail-status"><StateDot state={state} size={8} />{label}</p>
-      {stage.error && <p role="alert">{stage.error}</p>}
-      {stage.generation?.message && <p>{stage.generation.message}</p>}
-      {stage.files && <details open={!filesReady(stage)}>
-        <summary>全局能力文件</summary>
-        <dl className="drama-workflow-metadata">
-          <dt>当前定义版本</dt><dd>{definitionVersion}</dd>
-          <dt>Skill {stage.files.skillReady ? '已就绪' : '未就绪'}</dt><dd><code>{stage.files.skillPath}</code></dd>
-          <dt>Harness {stage.files.harnessReady ? '已就绪' : '未就绪'}</dt><dd><code>{stage.files.harnessPath}</code></dd>
-        </dl>
-        {stage.files.issues?.map(issue => <p key={issue}>{issue}</p>)}
-      </details>}
-      {stage.runId && <details>
-        <summary>最近一次执行</summary>
-        <dl className="drama-workflow-metadata">
-          <dt>运行</dt><dd><code>{stage.runId}</code></dd>
-          <dt>执行会话</dt><dd>{executionTitle && executionTitle !== stage.sessionId ? executionTitle + ' · ' : ''}
-            <code>{stage.sessionId}</code></dd>
-          {stage.workspaceId && <><dt>Workspace ID</dt><dd><code>{stage.workspaceId}</code></dd></>}
-          {stage.canvasId && <><dt>Canvas ID</dt><dd><code>{stage.canvasId}</code></dd></>}
-          <dt>运行定义版本</dt><dd>{stage.definitionVersion ?? '未记录'}</dd>
-          {stage.skillId && <><dt>运行 Skill</dt><dd><code>{stage.skillId}</code></dd></>}
-          {stage.harnessSha256 && stage.harness && <><dt>运行 Harness</dt><dd><code>{stage.harness}</code></dd></>}
-          <dt>Skill SHA-256</dt><dd>{stage.skillSha256 ? <code>{stage.skillSha256}</code> : '未记录'}</dd>
-          <dt>Harness SHA-256</dt><dd>{stage.harnessSha256 ? <code>{stage.harnessSha256}</code> : '未记录'}</dd>
-          {stage.startedAt && <><dt>开始</dt><dd>{new Date(stage.startedAt).toLocaleString()}</dd></>}
-          {stage.finishedAt && <><dt>结束</dt><dd>{new Date(stage.finishedAt).toLocaleString()}</dd></>}
-        </dl>
-        {stage.approvals?.length > 0 && <ul>
-          {stage.approvals.map(approval => <li key={approval.id}>
-            {new Date(approval.at).toLocaleString()} · {approval.sessionId || '自动确认'} · {approval.outputs.map(ref => ref.revision).join('、')}
+  function chooseStage(id) {
+    setInteraction(ticket, { stageId: id, selected: undefined, handoffId: undefined, section: 'artifacts' })
+    setCompare(false)
+  }
+
+  function chooseArtifact(artifact, pinVersion = false) {
+    setInteraction(ticket, { selected: { artifactId: artifact.artifactId, version: pinVersion ? artifact.version : undefined } })
+    setCompare(false)
+  }
+
+  function chooseVersion(artifact, version) {
+    setInteraction(ticket, {
+      choices: { ...interaction.choices, [stageId]: { ...choices, [artifact.artifactId]: version } },
+      review: null,
+    })
+  }
+
+  async function confirm() {
+    await runAction(ticket, 'confirm', async () => {
+      const result = await mutate(ticket, 'workflow_handoff_confirm', { handoffId: review.handoffId })
+      setInteraction(ticket, { review: null, section: 'handoffs', handoffId: result.handoff?.handoffId ?? review.handoffId })
+      refreshSession()
+    })
+  }
+
+  function showSection(next) {
+    setInteraction(ticket, { section: next, dismissedReview: review?.handoffId })
+  }
+
+  return <section className="drama-artifacts" data-testid="drama-workflow-artifacts" data-session-id={sessionId}
+    aria-label="阶段产物">
+    <header className="drama-artifacts-heading">
+      <div>
+        <h2>阶段产物</h2>
+        {workspaceTitle && <span className="drama-artifacts-workspace" title={workspaceTitle}>{workspaceTitle}</span>}
+      </div>
+      {stage && <label className="drama-artifacts-select">
+        <span className="drama-visually-hidden">浏览阶段</span>
+        <select value={stage.id} onChange={event => chooseStage(event.target.value)}>
+          {stages.map(candidate => <option key={candidate.id} value={candidate.id}>{candidate.name}</option>)}
+        </select>
+      </label>}
+    </header>
+    {stage && <nav className="drama-artifact-tabs" aria-label="产物视图">
+      <button type="button" aria-pressed={panel === 'artifacts'} onClick={() => showSection('artifacts')}>当前与历史版本</button>
+      <button type="button" aria-pressed={panel === 'handoffs'} onClick={() => showSection('handoffs')}>交接记录</button>
+      {review && <button type="button" aria-pressed={panel === 'review'}
+        onClick={() => setInteraction(ticket, { dismissedReview: undefined })}>交接预览</button>}
+    </nav>}
+    <div className="drama-artifacts-body">
+      {(interaction.error || loadError) && <p className="drama-artifacts-error" role="alert">{interaction.error || loadError}</p>}
+      {!stage && !loadError && <p className="drama-artifacts-empty" role="status">正在读取阶段产物…</p>}
+      {panel === 'review' && <section className="drama-handoff" data-testid="drama-workflow-preview">
+        <Package packageData={review} stageLabel={stageLabel} sessionLabel={sessionLabel} ticket={ticket} openCanvas={openCanvas} />
+        <div className="drama-artifacts-actions">
+          <Button type="button" size="sm" onClick={() => {
+            setInteraction(ticket, { review: null, error: '', section: 'artifacts' })
+          }} disabled={Boolean(interaction.busy)}>返回修改</Button>
+          <Button type="button" size="sm" variant="primary" data-testid="drama-workflow-confirm" onClick={confirm}
+            disabled={Boolean(interaction.busy) || !isActiveStage || nativeRunning || view?.session?.status === 'running'}>
+            {review.targetStageId ? '确认交接并启动下一阶段' : '确认最终验收'}
+          </Button>
+        </div>
+      </section>}
+      {stage && panel === 'handoffs' && (selectedHandoff ? <>
+        <ul className="drama-asset-list" aria-label="已确认的交接包">
+          {handoffs.map(handoff => <li key={handoff.handoffId}>
+            <button type="button" aria-pressed={handoff.handoffId === selectedHandoff.handoffId}
+              onClick={() => setInteraction(ticket, { handoffId: handoff.handoffId })}>
+              <strong>{handoff.targetStageId ? '交接到 ' + stageLabel(handoff.targetStageId) : '成片验收包'}</strong>
+              <small>{formatDate(handoff.confirmedAt)} · {sessionLabel(handoff.sourceSessionId)}
+                {handoff.stale && ' · 已过期'}</small>
+            </button>
           </li>)}
-        </ul>}
-      </details>}
-      {!connected && inputs.length + outputs.length > 0 && <div>
-        <Button type="button" size="sm" disabled={awaitingBind} onClick={connect}>连接查看产物</Button>
-      </div>}
-      {inputs.length > 0 && <details open={showInputs}>
-        <summary>输入产物（{inputs.length}）</summary>
-        {inputs.map(ref => <Output key={ref.id} reference={ref} node={refs?.nodes?.[ref.id]} ticket={ticket} />)}
-      </details>}
-      {outputs.length > 0 && <details open>
-        <summary>阶段产物（{outputs.length}）</summary>
-        {refs?.error && <p role="alert">{refs.error}</p>}
-        {outputs.map(ref => <Output key={ref.id} reference={ref} node={refs?.nodes?.[ref.id]} ticket={ticket} />)}
-      </details>}
-    </section>
-  </Modal>
+        </ul>
+        <section className="drama-handoff">
+          <Package packageData={selectedHandoff} stageLabel={stageLabel} sessionLabel={sessionLabel} ticket={ticket} openCanvas={openCanvas} />
+        </section>
+      </> : <p className="drama-artifacts-empty">此阶段尚无正式交接记录。</p>)}
+      {stage && panel === 'artifacts' && <>
+        {selected ? <>
+          <ul className="drama-asset-list" aria-label="当前版本" data-testid="drama-artifact-current">
+            {latest.map(artifact => <li key={artifact.artifactId}>
+              <ArtifactRow artifact={artifact} active={selected.artifactId === artifact.artifactId}
+                sessionLabel={sessionLabel} select={() => chooseArtifact(artifact)} />
+            </li>)}
+          </ul>
+          {groups.some(group => group.length > 1) && <details className="drama-artifact-versions" data-testid="drama-artifact-history">
+            <summary>历史版本</summary>
+            <ul className="drama-asset-list">
+              {groups.filter(group => group.length > 1).flatMap(group => group.map(artifact =>
+                <li key={artifactKey(artifact)}>
+                  <ArtifactRow artifact={artifact} active={artifactKey(selected) === artifactKey(artifact)}
+                    sessionLabel={sessionLabel} select={() => chooseArtifact(artifact, true)} />
+                </li>))}
+            </ul>
+          </details>}
+          <div className="drama-artifact-preview" data-testid="drama-artifact-version"
+            data-artifact-id={selected.artifactId} data-version={selected.version}>
+            <div className="drama-artifact-preview-heading">
+              <div>
+                <h3>{selected.title} <span>V{selected.version}</span></h3>
+                <small title={selected.sessionId}>{sessionLabel(selected.sessionId)} · {selected.handedOff ? '已正式交接' : '草稿'}</small>
+              </div>
+              {current.version !== selected.version && <Button type="button" size="sm" aria-pressed={compare}
+                onClick={() => setCompare(value => !value)}>{compare ? '关闭比较' : '与最新版比较'}</Button>}
+            </div>
+            <ArtifactContent artifact={selected} ticket={ticket} openCanvas={openCanvas} />
+            {compare && current.version !== selected.version && <div className="drama-artifact-comparison">
+              <h4>{current.title} <span>V{current.version}</span></h4>
+              <ArtifactContent artifact={current} ticket={ticket} openCanvas={openCanvas} />
+            </div>}
+            {isActiveStage && selected.sessionId === sessionId && <div className="drama-artifacts-actions">
+              {chosenVersion(choices, [current]) === selected.version
+                ? <Button type="button" size="sm" onClick={() => chooseVersion(selected, 0)}>从交接选择移除</Button>
+                : <Button type="button" size="sm" onClick={() => chooseVersion(selected, selected.version)}>选此版本交接</Button>}
+            </div>}
+          </div>
+        </> : <p className="drama-artifacts-empty">此阶段还没有可预览的产物。</p>}
+        {stage.files && (!stage.files.skillReady || !stage.files.harnessReady) && <details className="drama-artifact-versions">
+          <summary>全局能力文件</summary>
+          <dl className="drama-handoff-metadata">
+            <dt>Skill</dt><dd>{stage.files.skillPath}</dd>
+            <dt>Harness</dt><dd>{stage.files.harnessPath}</dd>
+          </dl>
+          {stage.files.issues?.map(issue => <p key={issue}>{issue}</p>)}
+        </details>}
+      </>}
+    </div>
+  </section>
 }
 
-function Output({ reference, node, ticket }) {
-  const available = node && !node.deleted
-  const { id, revision } = reference
-  const title = available ? nodeTitle(node) || nodeLabels[node.type] : id
-  const source = available && mediaURL(ticket, node)
-  const content = available && [node.content.text, node.content.description, node.content.prompt]
-    .find(value => typeof value === 'string' && value.trim())
-  return <div className="drama-workflow-output">
-    <strong>{title}</strong> <span>记录版本 {revision}</span>
-    {available && node.revision !== revision && <p>画布当前为版本 {node.revision}。</p>}
-    {(node === null || node?.deleted) && <p>该节点当前不可用。</p>}
-    {source && node.type === 'image' && <img src={source} alt={title} />}
-    {source && node.type === 'video' && <video src={source} controls playsInline preload="metadata" aria-label={title} />}
-    {source && node.type === 'audio' && <audio src={source} controls preload="metadata" aria-label={title} />}
-    {content && <pre>{content}</pre>}
+function formatDate(value) {
+  return value ? new Date(value).toLocaleString() : ''
+}
+
+function ArtifactRow({ artifact, active, select, sessionLabel }) {
+  return <button type="button" aria-pressed={active} onClick={select}
+    data-artifact-id={artifact.artifactId} data-version={artifact.version}>
+    <strong>{artifact.title} <span>V{artifact.version}</span></strong>
+    <small title={artifact.sessionId}>{sessionLabel(artifact.sessionId)} · {artifact.handedOff ? '已交接' : '草稿'}</small>
+  </button>
+}
+
+function ArtifactContent({ artifact, ticket, openCanvas }) {
+  const node = artifact.node
+  const media = artifactMediaURL(ticket, artifact)
+  const content = artifact.content || node?.content?.text || node?.content?.description || node?.content?.prompt
+  return <>
+    {content && <div className="drama-artifact-markdown"><MarkdownText text={content} labels={markdownLabels} /></div>}
+    {media && artifact.kind === 'image' && <img className="drama-artifact-media" src={media} alt={artifact.title} />}
+    {media && artifact.kind === 'video' && <video className="drama-artifact-media" src={media} controls
+      playsInline preload="metadata" aria-label={artifact.title} />}
+    {media && artifact.kind === 'audio' && <audio className="drama-artifact-media" src={media} controls
+      preload="metadata" aria-label={artifact.title} />}
+    {node && <div className="drama-artifacts-actions"><Button type="button" size="sm" onClick={openCanvas}>在画布中查看</Button></div>}
+  </>
+}
+
+function Package({ packageData, stageLabel, sessionLabel, ticket, openCanvas }) {
+  const { sourceSessionId, sourceStageId, targetStageId, handoffId, sourceRevision, confirmedAt,
+    artifacts, summary, confirmedDecisions, constraints } = packageData
+  return <>
+    <header className="drama-handoff-heading">
+      <h3>{confirmedAt ? targetStageId ? '正式交接包' : '成片验收包' : targetStageId ? '交接预览' : '成片验收预览'}</h3>
+      <p>{stageLabel(sourceStageId)}{targetStageId && <> → {stageLabel(targetStageId)}</>}</p>
+    </header>
+    <dl className="drama-handoff-metadata">
+      <dt>来源会话</dt><dd title={sourceSessionId}>{sessionLabel(sourceSessionId)}</dd>
+      {sourceRevision !== undefined && <><dt>来源版本</dt><dd>{sourceRevision}</dd></>}
+      {confirmedAt && <><dt>确认时间</dt><dd>{formatDate(confirmedAt)}</dd></>}
+      {packageData.stale && <><dt>状态</dt><dd>上游已更新，此交接已过期</dd></>}
+    </dl>
+    {summary && <div className="drama-handoff-block">
+      <h4>摘要</h4><MarkdownText text={summary} labels={markdownLabels} />
+    </div>}
+    <div className="drama-handoff-block">
+      <h4>固定产物版本</h4>
+      <ul className="drama-handoff-artifact-list">
+        {(artifacts ?? []).map(artifact => {
+          const title = <>{artifact.title || artifact.artifactId} <span>V{artifact.version}</span></>
+          return <li key={artifactKey(artifact)}>
+            {artifact.content || artifact.node ? <details className="drama-handoff-file">
+              <summary>{title}</summary>
+              <ArtifactContent artifact={artifact} ticket={ticket} openCanvas={openCanvas} />
+            </details> : <strong>{title}</strong>}
+            {artifact.sessionId && <small title={artifact.sessionId}>{sessionLabel(artifact.sessionId)}</small>}
+          </li>
+        })}
+      </ul>
+    </div>
+    <PackageList title="确认的创作决策" items={confirmedDecisions} />
+    <PackageList title="约束" items={constraints} />
+    <details className="drama-artifact-versions">
+      <summary>交接信息</summary>
+      <dl className="drama-handoff-metadata">
+        <dt>交接 ID</dt><dd>{handoffId}</dd>
+        {packageData.skillSha256 && <><dt>Skill SHA-256</dt><dd>{packageData.skillSha256}</dd></>}
+        {packageData.harnessSha256 && <><dt>Harness SHA-256</dt><dd>{packageData.harnessSha256}</dd></>}
+      </dl>
+    </details>
+  </>
+}
+
+function PackageList({ title, items }) {
+  if (!items?.length) return null
+  return <div className="drama-handoff-block">
+    <h4>{title}</h4>
+    <ul>{items.map((item, index) => <li key={index}>{item}</li>)}</ul>
   </div>
+}
+
+export function installWorkflowStyle() {
+  const tag = document.createElement('style')
+  tag.dataset.dramaWorkflowStyle = ''
+  tag.textContent = style
+  document.head.append(tag)
+  return () => tag.remove()
 }

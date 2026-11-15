@@ -37,9 +37,11 @@ func deploymentDrafts(ctx context.Context, tx *sql.Tx, outputs []workflowRef) ([
 
 var generationResultChanged = &requestError{http.StatusConflict, "视频生成结果或版本已变更，请在 Canvas 检查后重新核对视频生成阶段"}
 
-func generationProgress(ctx context.Context, tx *sql.Tx, workspace string, approval workflowApproval) (workflowGenerationView, []workflowRef, error) {
+var finalVideosRequired = &requestError{http.StatusConflict, "成片验收需要视频生成阶段已确认且仍可读取的成片版本"}
+
+func generationProgress(ctx context.Context, tx *sql.Tx, workspace string, approvedOutputs []workflowRef) (workflowGenerationView, []workflowRef, error) {
 	view := workflowGenerationView{State: "waiting", Message: "请在 Canvas 对已确认的视频草稿单独授权生成"}
-	drafts, err := deploymentDrafts(ctx, tx, approval.Outputs)
+	drafts, err := deploymentDrafts(ctx, tx, approvedOutputs)
 	var known *requestError
 	if errors.As(err, &known) {
 		view.Message = known.text
@@ -127,23 +129,50 @@ func taskVideoResult(ctx context.Context, tx *sql.Tx, root *os.Root, taskID stri
 	return ref, nil
 }
 
-func checkGenerationResults(ctx context.Context, tx *sql.Tx, workspace string, run workflowRun) error {
-	if len(run.GenerationResults) == 0 || len(run.GenerationResults) != len(run.GenerationTasks) {
-		return generationResultChanged
+func checkFinalWorkflowVideos(ctx context.Context, tx *sql.Tx, workspace string, approved workflowHandoff, artifacts []workflowArtifact) error {
+	if approved.HandoffID == "" || approved.Stale {
+		return finalVideosRequired
+	}
+	refs := make(map[workflowRef]bool)
+	for _, artifact := range approved.Artifacts {
+		if isWorkflowVideo(artifact) {
+			refs[workflowRef{ID: artifact.NodeID, Revision: artifact.Node.Revision}] = true
+		}
 	}
 	root, err := os.OpenRoot(workspace)
 	if err != nil {
 		return err
 	}
 	defer root.Close()
-	for i, taskID := range run.GenerationTasks {
-		ref, err := taskVideoResult(ctx, tx, root, taskID)
+	var valid bool
+	for _, artifact := range artifacts {
+		if !isWorkflowVideo(artifact) {
+			continue
+		}
+		ref := workflowRef{ID: artifact.NodeID, Revision: artifact.Node.Revision}
+		if !refs[ref] {
+			return finalVideosRequired
+		}
+		var taskID string
+		err := tx.QueryRowContext(ctx, `SELECT id FROM tasks WHERE result_node_id=? AND type='video'
+			AND status='succeeded' AND json_extract(input,'$.manualConfirmation')=1 LIMIT 1`, ref.ID).Scan(&taskID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return finalVideosRequired
+		}
 		if err != nil {
 			return err
 		}
-		if ref != run.GenerationResults[i] {
-			return generationResultChanged
+		current, err := taskVideoResult(ctx, tx, root, taskID)
+		if err == generationResultChanged || err == nil && current != ref {
+			return finalVideosRequired
 		}
+		if err != nil {
+			return err
+		}
+		valid = true
+	}
+	if !valid {
+		return finalVideosRequired
 	}
 	return nil
 }

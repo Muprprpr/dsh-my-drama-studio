@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState, useSyncExternalStore 
 import { CanvasViewport } from './canvas.jsx'
 import { videoMode } from './canvas-node.jsx'
 import { ProviderSettings, protocols } from './provider-settings.jsx'
-import { WorkflowProgress } from './workflow-panel.jsx'
+import { installWorkflowStyle, WorkflowArtifacts, WorkflowProgress } from './workflow-panel.jsx'
 import {
   Button, IconChevronDownOutlineRegular, IconPanelLeftOutlineRegular, Menu, MenuItemButton, StateDot, Switch, Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives'
@@ -11,6 +11,8 @@ import { generateT2V, generateI2V, generateR2V, generateV2V, initialize, mediaUR
 
 const canvasKind = 'drama-canvas'
 const canvasTabId = 'dsh-my-drama-studio.canvas'
+const artifactsKind = 'drama-workflow-artifacts'
+const artifactsTabId = 'dsh-my-drama-studio.artifacts'
 const statusChanges = new EventTarget()
 const videoGeneration = { t2v: generateT2V, i2v: generateI2V, r2v: generateR2V, v2v: generateV2V }
 
@@ -18,6 +20,7 @@ export const inject = ['slots', 'sidebarRight', 'sidebarRightTabs', 'locale']
 
 export function apply(ctx) {
   const sidebar = ctx.sidebarRight
+  ctx.effect(installWorkflowStyle)
   ctx.effect(() => {
     const style = document.createElement('style')
     style.dataset.dramaStudioShell = ''
@@ -30,13 +33,18 @@ export function apply(ctx) {
     zh: { name: '短剧工作台' },
   }))
   ctx.effect(() => ctx.sidebarRightTabs.register({ id: canvasTabId, kind: canvasKind, title: () => 'Drama Canvas' }))
+  ctx.effect(() => ctx.sidebarRightTabs.register({ id: artifactsTabId, kind: artifactsKind, title: () => '阶段产物' }))
   ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab', () =>
     ctx.slots.register({ name: 'sidebar.right.pane.tab', key: canvasTabId, locale: 'dramaStudio' }, DramaCanvasTab)))
+  ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab', () =>
+    ctx.slots.register({ name: 'sidebar.right.pane.tab', key: artifactsTabId },
+      ({ sessionId, useTabInfo, useWorkspaces, useSessions, useSessionStatus }) =>
+        <DramaArtifactsTab key={sessionId} sessionId={sessionId} useTabInfo={useTabInfo}
+          useWorkspaces={useWorkspaces} useSessions={useSessions} useSessionStatus={useSessionStatus} sidebar={sidebar} />)))
   ctx.effect(() => ctx.slots.inject('conversation.input.dock', () =>
     ctx.slots.register({ name: 'conversation.input.dock', id: 'drama-workflow-progress' },
-      ({ sessionId, useWorkspaces, useSessions }) =>
-        <SessionWorkflowDock key={sessionId} sessionId={sessionId} sidebar={sidebar}
-          useWorkspaces={useWorkspaces} useSessions={useSessions} />)))
+      ({ sessionId, useSessionStatus }) => <SessionWorkflowDock key={sessionId} sessionId={sessionId}
+        useSessionStatus={useSessionStatus} sidebar={sidebar} />)))
   ctx.effect(() => ctx.slots.inject('conversation.input.left', () =>
     ctx.slots.register({ name: 'conversation.input.left', id: 'drama-session-control' },
       ({ sessionId, useWorkspaces }) => <SessionCanvasControl key={sessionId} sessionId={sessionId}
@@ -49,14 +57,14 @@ function notify(sessionId) {
   statusChanges.dispatchEvent(new CustomEvent('changed', { detail: sessionId }))
 }
 
-function openCanvasTab(sidebar, sessionId) {
+function openStudioTab(sidebar, sessionId, kind) {
   if (sidebar.mounted.getSnapshot() !== sessionId) return
-  const existing = sidebar.tabsIn(sessionId).find(tab => tab.kind === canvasKind)
+  const existing = sidebar.tabsIn(sessionId).find(tab => tab.kind === kind)
   if (existing) {
     if (!sidebar.isExpanded()) sidebar.toggleExpanded()
     sidebar.focus(existing.id)
   } else {
-    sidebar.openTab(canvasKind)
+    sidebar.openTab(kind)
   }
 }
 
@@ -126,7 +134,7 @@ function SessionCanvasControl({ sessionId, sidebar, useWorkspaces }) {
         await operation(captured.ticket, 'bind', { operationId: crypto.randomUUID() })
         notify(sessionId)
       }
-      openCanvasTab(sidebar, sessionId)
+      openStudioTab(sidebar, sessionId, canvasKind)
     } catch (failure) {
       setError(failure.message)
     } finally {
@@ -179,12 +187,29 @@ function DramaCanvasTab({ sessionId, useTabInfo, useWorkspaces, t }) {
     useWorkspaces={useWorkspaces} title={t('name')} />
 }
 
-function SessionWorkflowDock({ sessionId, sidebar, useWorkspaces, useSessions }) {
+function DramaArtifactsTab({ sessionId, useTabInfo, useWorkspaces, useSessions, useSessionStatus, sidebar }) {
+  const { tab } = useTabInfo()
+  const { session, error } = useStudioSession(sessionId, tab.visible)
+  const nativeRunning = useSessionStatus(snapshot => snapshot.get(sessionId)?.running === true)
+  const workspaceTitle = useWorkspaces(snapshot => snapshot.items.find(
+    item => item.workspaceId === session?.status.workspaceId,
+  )?.title)
+  const refreshSession = useCallback(() => notify(sessionId), [sessionId])
+  if (!tab.visible) return null
+  if (!session) return <p className="drama-artifacts-empty" role={error ? 'alert' : 'status'}>
+    {error || '正在读取阶段产物…'}
+  </p>
+  return <WorkflowArtifacts key={session.ticket} session={session} workspaceTitle={workspaceTitle} nativeRunning={nativeRunning}
+    useSessions={useSessions} refreshSession={refreshSession}
+    openCanvas={() => openStudioTab(sidebar, sessionId, canvasKind)} />
+}
+
+function SessionWorkflowDock({ sessionId, useSessionStatus, sidebar }) {
   const active = useSyncExternalStore(listener => sidebar.mounted.subscribe(listener),
     () => sidebar.mounted.getSnapshot() === sessionId)
   const { session } = useStudioSession(sessionId, active)
+  const nativeRunning = useSessionStatus(snapshot => snapshot.get(sessionId)?.running === true)
   const workspaceId = session?.status.workspaceId
-  const workspaceTitle = useWorkspaces(snapshot => snapshot.items.find(item => item.workspaceId === workspaceId)?.title)
   const refreshSession = useCallback(() => notify(sessionId), [sessionId])
   const ticket = session?.ticket
   useEffect(() => {
@@ -194,8 +219,9 @@ function SessionWorkflowDock({ sessionId, sidebar, useWorkspaces, useSessions })
     }
   }, [active, sessionId, sidebar, ticket])
   if (!active || !workspaceId) return null
-  return <WorkflowProgress key={ticket} session={session} refreshSession={refreshSession}
-    workspaceTitle={workspaceTitle} useSessions={useSessions} openCanvas={() => openCanvasTab(sidebar, sessionId)} />
+  return <WorkflowProgress key={ticket} session={session} refreshSession={refreshSession} nativeRunning={nativeRunning}
+    openCanvas={() => openStudioTab(sidebar, sessionId, canvasKind)}
+    openArtifacts={() => openStudioTab(sidebar, sessionId, artifactsKind)} />
 }
 
 function SessionPanel({ sessionId, visible, title, useWorkspaces }) {

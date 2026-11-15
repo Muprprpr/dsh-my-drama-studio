@@ -3,551 +3,436 @@ package studio
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/google/uuid"
 )
 
-func TestWorkflowReviewPreservesVersionsAndCanvas(t *testing.T) {
-	dir, other := t.TempDir(), t.TempDir()
-	s := New(nil)
-	defer func() { _ = s.Close() }()
-	for _, session := range []string{"agent", "reviewer"} {
-		bindSession(t, s, dir, session)
+var testWorkflowVersions = workflowFileVersions{SkillSHA256: strings.Repeat("a", 64), HarnessSHA256: strings.Repeat("b", 64)}
+
+func workflowOp() operation { return operation{ID: uuid.NewString()} }
+
+type workflowTest struct {
+	t   *testing.T
+	s   *Service
+	dir string
+}
+
+func newWorkflowTest(t *testing.T, providers providerRegistry) *workflowTest {
+	f := &workflowTest{t: t, s: New(providers), dir: t.TempDir()}
+	t.Cleanup(func() { _ = f.s.Close() })
+	return f
+}
+
+func (f *workflowTest) call(session, actor, action string, data any) any {
+	f.t.Helper()
+	value, err := editCall(f.s, f.dir, session, actor, action, data)
+	if err != nil {
+		f.t.Fatalf("%s/%s: %v", session, action, err)
 	}
-	call := func(session, action string, data any) any {
-		t.Helper()
-		return callWorkflow(t, s, dir, session, action, data)
+	return value
+}
+
+func (f *workflowTest) check(session, actor, action string, data any, code int) {
+	f.t.Helper()
+	_, err := editCall(f.s, f.dir, session, actor, action, data)
+	var known *requestError
+	if !errors.As(err, &known) || known.code != code {
+		f.t.Fatalf("%s/%s: got %v, expected HTTP %d", session, action, err, code)
 	}
-	const aStage, bStage, cStage = "content-analysis", "shooting-script", "storyboard"
-	checkWorkflowError(t, s, dir, "reviewer", "human", "workflow_save", map[string]any{}, http.StatusBadRequest)
-	saved := call("reviewer", "workflow_get", nil).(workflowView)
-	if saved.Revision != 1 || saved.ID != "drama-production" || saved.Name != "AI 短剧制作" || len(saved.Stages) != 7 {
-		t.Fatalf("fixed definition: %+v", saved)
+}
+
+func (f *workflowTest) view(session string) workflowView {
+	f.t.Helper()
+	return f.call(session, "human", "workflow_get", nil).(workflowView)
+}
+
+func (f *workflowTest) activate(session, stage string) workflowView {
+	f.t.Helper()
+	versions := testWorkflowVersions
+	if stage == "" {
+		versions = workflowFileVersions{}
 	}
-	for i, stage := range saved.Stages {
-		if stage.workflowStage != dramaWorkflowStages[i] || stage.Status != workflowNotStarted {
-			t.Fatalf("stage %d = %+v", i, stage)
+	return f.call(session, "human", "workflow_activate", workflowActivateArgs{
+		operation: workflowOp(), StageID: stage, workflowFileVersions: versions,
+	}).(workflowView)
+}
+
+func (f *workflowTest) start(session, stage, handoff string) workflowTurnResult {
+	f.t.Helper()
+	return f.call(session, "workflow", "workflow_turn_start", workflowTurnStartArgs{
+		operation: workflowOp(), RunID: uuid.NewString(), StageID: stage, HandoffID: handoff, workflowFileVersions: testWorkflowVersions,
+	}).(workflowTurnResult)
+}
+
+func (f *workflowTest) finish(session, run, reason string) {
+	f.t.Helper()
+	f.call(session, "workflow", "workflow_turn_finish", workflowTurnFinishArgs{operation: workflowOp(), RunID: run, Error: reason})
+}
+
+func (f *workflowTest) draft(session, run, text string, prior workflowArtifact) workflowArtifact {
+	f.t.Helper()
+	return f.call(session, "workflow", "workflow_save_artifact", workflowSaveArtifactArgs{
+		operation: workflowOp(), RunID: run, ArtifactID: prior.ArtifactID, ExpectedVersion: prior.Version,
+		Title: "分镜脚本", Content: text, workflowArtifactNotes: workflowArtifactNotes{
+			Summary: "首镜从室外切入", ConfirmedDecisions: []string{"先全景再切近"}, Constraints: []string{"横屏"}},
+	}).(workflowArtifact)
+}
+
+func (f *workflowTest) preview(session string, refs ...workflowArtifactRef) workflowHandoff {
+	f.t.Helper()
+	return f.call(session, "human", "workflow_handoff_preview", workflowPreviewArgs{
+		operation: workflowOp(), Artifacts: refs,
+	}).(workflowHandoff)
+}
+
+func (f *workflowTest) confirm(session string, h workflowHandoff) workflowHandoff {
+	f.t.Helper()
+	return f.call(session, "human", "workflow_handoff_confirm", workflowConfirmArgs{
+		operation: workflowOp(), HandoffID: h.HandoffID,
+	}).(workflowHandoff)
+}
+
+func (f *workflowTest) reopen(providers providerRegistry) {
+	f.t.Helper()
+	if err := f.s.Close(); err != nil {
+		f.t.Fatal(err)
+	}
+	f.s = New(providers)
+}
+
+func TestWorkflowSessionDraftsAndExplicitHandoff(t *testing.T) {
+	f := newWorkflowTest(t, nil)
+	const stage = "storyboard"
+	const target = "asset-binding"
+	idx := workflowStageIndex(stage)
+	if v := f.view("normal"); v.Session.Status != "normal" || len(v.Stages) != 7 || v.Stages[idx].Status != workflowNotStarted {
+		t.Fatalf("initial workflow: %+v", v)
+	}
+	if _, err := os.Stat(filepath.Join(f.dir, ".drama-studio")); !os.IsNotExist(err) {
+		t.Fatalf("reading normal chat created project state: %v", err)
+	}
+	if v := f.activate("a", stage); v.Session.Status != "active" || v.Session.ActiveStageID != stage || len(v.Handoffs) != 0 {
+		t.Fatalf("activation started work or handoff: %+v", v)
+	}
+	f.activate("b", stage)
+	turnA := f.start("a", stage, "")
+	turnB := f.start("b", stage, "")
+	if turnA.Session.Status != workflowRunning || turnB.Session.Status != workflowRunning || len(turnA.Inputs) != 0 {
+		t.Fatalf("independent runs: %+v / %+v", turnA, turnB)
+	}
+	if v := f.view("normal"); v.Session.Status != "normal" || v.Session.ActiveStageID != "" {
+		t.Fatalf("peer activation affected ordinary chat: %+v", v.Session)
+	}
+	a1 := f.draft("a", turnA.Session.RunID, "分镜初稿", workflowArtifact{})
+	b1 := f.draft("b", turnB.Session.RunID, "B 的不共享草稿", workflowArtifact{})
+	f.check("a", "workflow", "workflow_save_artifact", workflowSaveArtifactArgs{
+		operation: workflowOp(), RunID: turnB.Session.RunID, Title: "越权", Content: "无效"}, http.StatusForbidden)
+	f.check("b", "workflow", "workflow_artifact_get", a1.workflowArtifactRef, http.StatusNotFound)
+	f.finish("a", turnA.Session.RunID, "")
+	f.finish("b", turnB.Session.RunID, "")
+	{
+		prior := a1
+		turn := f.start("a", stage, "")
+		if len(turn.Artifacts) != 1 || turn.Artifacts[0].Version != prior.Version {
+			t.Fatalf("round two lost the prior draft: %+v", turn.Artifacts)
+		}
+		a2 := f.call("a", "workflow", "workflow_save_artifact", workflowSaveArtifactArgs{
+			operation: workflowOp(), RunID: turn.Session.RunID, ArtifactID: prior.ArtifactID,
+			ExpectedVersion: prior.Version, Title: prior.Title, Content: "分镜第二版",
+		}).(workflowArtifact)
+		if len(a2.ConfirmedDecisions) != 1 || len(a2.Constraints) != 1 {
+			t.Fatalf("unrelated revision lost decisions or constraints: %+v", a2)
+		}
+		f.finish("a", turn.Session.RunID, "")
+		stalePreview := f.preview("a")
+		turn = f.start("a", stage, "")
+		a3 := f.draft("a", turn.Session.RunID, "分镜第三版", a2)
+		f.finish("a", turn.Session.RunID, "")
+		f.check("a", "human", "workflow_handoff_confirm", workflowConfirmArgs{
+			operation: workflowOp(), HandoffID: stalePreview.HandoffID}, http.StatusConflict)
+		v := f.view("a")
+		if len(v.Artifacts) != 3 || v.Artifacts[0].Content != a3.Content || v.Artifacts[2].Content != a1.Content ||
+			v.Stages[idx].Status != workflowDraft || len(v.Handoffs) != 0 || v.Session.ActiveStageID != stage {
+			t.Fatalf("iteration changed formal progress or lost versions: %+v", v)
 		}
 	}
-	if isolated := callWorkflow(t, s, other, "reviewer", "workflow_get", nil).(workflowView); isolated.ID != saved.ID || len(isolated.Stages) != 7 {
-		t.Fatalf("fresh workspace could not read fixed stage list: %+v", isolated)
+	if v := f.view("b"); len(v.Artifacts) != 1 || v.Artifacts[0].ArtifactID != b1.ArtifactID || v.Stages[idx].Status != workflowDraft {
+		t.Fatalf("drafts were not owned independently: %+v", v)
 	}
-	if _, err := os.Stat(filepath.Join(other, ".drama-studio")); !os.IsNotExist(err) {
-		t.Fatalf("read-only workflow_get created a DB: %v", err)
+	bindSession(t, f.s, f.dir, "a")
+	if nodes := mustCall(t, f.s, f.dir, "a", "query", nil).(queryResult).Nodes; len(nodes) != 0 {
+		t.Fatalf("document work created Canvas nodes: %+v", nodes)
 	}
-	checkWorkflowError(t, s, other, "reviewer", "workflow", "workflow_reserve",
-		workflowReserveArgs{operation: operation{ID: "unbound"}, StageID: aStage, Revision: saved.Revision}, http.StatusForbidden)
-	checkWorkflowError(t, s, dir, "agent", "workflow", "workflow_reserve",
-		workflowReserveArgs{operation: operation{ID: "too-soon"}, StageID: bStage, Revision: saved.Revision}, http.StatusConflict)
-
-	start := func(id, priorApproval, expectedRun string) workflowReservation {
-		return call("agent", "workflow_reserve", workflowReserveArgs{operation: operation{ID: uuid.NewString()}, StageID: id,
-			Revision: saved.Revision, PreviousApproval: priorApproval, ExpectedRunID: expectedRun}).(workflowReservation)
+	aPreview := f.preview("a", a1.workflowArtifactRef)
+	bPreview := f.preview("b")
+	f.check("a", "workflow", "workflow_activate", workflowActivateArgs{operation: workflowOp(), StageID: "final-review"}, http.StatusForbidden)
+	f.check("a", "workflow", "workflow_handoff_preview", workflowPreviewArgs{operation: workflowOp()}, http.StatusForbidden)
+	f.check("a", "workflow", "workflow_handoff_confirm", workflowConfirmArgs{
+		operation: workflowOp(), HandoffID: aPreview.HandoffID}, http.StatusForbidden)
+	confirm := workflowConfirmArgs{operation: workflowOp(), HandoffID: aPreview.HandoffID}
+	a := f.call("a", "human", "workflow_handoff_confirm", confirm).(workflowHandoff)
+	var replay workflowHandoff
+	replayed := f.call("a", "human", "workflow_handoff_confirm", confirm).(json.RawMessage)
+	if err := json.Unmarshal(replayed, &replay); err != nil || a.HandoffID != replay.HandoffID {
+		t.Fatalf("confirmation replay: %+v, %v", replay, err)
 	}
-	finishNote := func(session string, reserved workflowReservation, content string) string {
-		call(session, "workflow_running", workflowRunningPayload(reserved.RunID))
-		nodeID := mustCall(t, s, dir, session, "append", appendArgs{operation: operation{ID: uuid.NewString()},
-			Nodes: []NodeInput{{Type: "note", Content: json.RawMessage(content)}}}).(appendResult).IDs[0]
-		call(session, "workflow_finish", workflowFinishArgs{RunID: reserved.RunID, NodeIDs: []string{nodeID}})
-		return nodeID
+	f.check("b", "human", "workflow_handoff_confirm", workflowConfirmArgs{
+		operation: workflowOp(), HandoffID: bPreview.HandoffID}, http.StatusConflict)
+	f.check("a", "human", "workflow_handoff_confirm", workflowConfirmArgs{
+		operation: workflowOp(), HandoffID: aPreview.HandoffID}, http.StatusConflict)
+	if a.ConfirmedAt == "" || a.TargetStageID != target || a.SourceRevision != 1 || a.Artifacts[0].Content != a1.Content ||
+		len(a.ConfirmedDecisions) != 1 || len(a.Constraints) != 1 {
+		t.Fatalf("incorrect pinned package: %+v", a)
 	}
-	review := func(stage, run, node string, revision int64) workflowView {
-		return call("reviewer", "workflow_approve", workflowApproveArgs{workflowDecisionArgs: workflowDecisionArgs{
-			operation: operation{ID: uuid.NewString()}, StageID: stage, RunID: run}, Outputs: []workflowRef{{node, revision}}}).(workflowView)
+	if v := f.view("b"); len(v.Handoffs) != 1 || v.Stages[idx].Status != workflowHandedOff || v.Session.ActiveStageID != stage ||
+		len(v.Artifacts) != 2 || !v.Artifacts[1].HandedOff {
+		t.Fatalf("formal data not shared or peer Session changed: %+v", v)
 	}
-
-	a := start(aStage, "", "")
-	if stage := call("reviewer", "workflow_get", nil).(workflowView).Stages[0]; !stage.Pending || stage.Status != workflowNotStarted {
-		t.Fatalf("reservation reported as executing: %+v", stage)
+	f.reopen(nil)
+	if v := f.view("a"); len(v.Handoffs) != 1 || len(v.Artifacts) != 3 || v.Session.ActiveStageID != target ||
+		v.Session.PendingHandoffID != a.HandoffID || v.Session.Status != "active" {
+		t.Fatalf("restart changed formal package, draft history or initial delivery: %+v", v)
 	}
-	aID := finishNote("agent", a, `{"text":"# 分析 V1"}`)
-	if stage := call("reviewer", "workflow_get", nil).(workflowView).Stages[0]; stage.Status != workflowReview || stage.ApprovalID != "" {
-		t.Fatalf("Agent finish approved an unreviewed artifact: %+v", stage)
-	}
-	approved := review(aStage, a.RunID, aID, 1).Stages[0]
-	if approved.Status != workflowApproved || approved.ApprovalID == "" {
-		t.Fatalf("review failed: %+v", approved)
-	}
-	b := call("reviewer", "workflow_reserve", workflowReserveArgs{operation: operation{ID: uuid.NewString()}, StageID: bStage,
-		Revision: saved.Revision, PreviousApproval: approved.ApprovalID}).(workflowReservation)
-	if !slices.Equal(b.Inputs, []workflowRef{{aID, 1}}) {
-		t.Fatalf("next stage input = %+v", b.Inputs)
-	}
-	bID := finishNote("reviewer", b, `{"text":"脚本 V1"}`)
-	bApproved := review(bStage, b.RunID, bID, 1).Stages[1]
-	if bApproved.Status != workflowApproved || bApproved.ApprovalID == "" || bApproved.SessionID != "reviewer" {
-		t.Fatalf("script stage did not record reviewed output: %+v", bApproved)
-	}
-	c := start(cStage, bApproved.ApprovalID, "")
-	cID := finishNote("agent", c, `{"text":"分镜 V1"}`)
-	review(cStage, c.RunID, cID, 1)
-	if visible := call("unbound-viewer", "workflow_get", nil).(workflowView).Stages[0]; visible.RunID != a.RunID || visible.SessionID != "agent" || len(visible.Approvals) != 1 || visible.Approvals[0].SessionID != "reviewer" {
-		t.Fatalf("unbound Session did not get the workspace progress and audit record: %+v", visible)
-	}
-	if isolated := callWorkflow(t, s, other, "reviewer", "workflow_get", nil).(workflowView).Stages[0]; isolated.RunID != "" || isolated.Status != workflowNotStarted {
-		t.Fatalf("workflow run leaked into another Workspace: %+v", isolated)
-	}
-
-	s.SetHumanWriteCheck(func(context.Context, string, string, []string) (bool, error) { return true, nil })
-	mustEdit(t, s, dir, "reviewer", "update_node", updateNodeArgs{
-		nodeRevisionArgs: nodeRevisionArgs{operation: operation{ID: "edit-a"}, ID: aID, Revision: 1},
-		Content:          json.RawMessage(`{"text":"# 分析 V2"}`),
+	f.call("a", "workflow", "workflow_kickoff_failed", workflowKickoffFailedArgs{
+		operation: workflowOp(), HandoffID: a.HandoffID, Error: "Native queue offline",
 	})
-	changed := call("reviewer", "workflow_get", nil).(workflowView)
-	if !changed.Stages[0].NeedsReview || changed.Stages[1].Status != workflowStale || changed.Stages[2].Status != workflowStale {
-		t.Fatalf("version change did not invalidate visible dependent progress immediately: %+v", changed)
+	if ses := f.view("a").Session; ses.Status != workflowFailed || ses.PendingHandoffID != a.HandoffID {
+		t.Fatalf("initial delivery failure discarded pending result: %+v", ses)
 	}
-	checkWorkflowError(t, s, dir, "agent", "workflow", "workflow_reserve", workflowReserveArgs{operation: operation{ID: "transitive-old-input"},
-		StageID: cStage, Revision: saved.Revision, PreviousApproval: bApproved.ApprovalID, ExpectedRunID: c.RunID}, http.StatusConflict)
-	call("reviewer", "workflow_return", workflowDecisionArgs{operation: operation{ID: "reopen-a"}, StageID: aStage, RunID: a.RunID})
-	checkWorkflowError(t, s, dir, "reviewer", "human", "workflow_approve", workflowApproveArgs{
-		workflowDecisionArgs: workflowDecisionArgs{operation: operation{ID: "wrong-version"}, StageID: aStage, RunID: a.RunID},
-		Outputs:              []workflowRef{{aID, 1}},
+	initial := f.start("a", target, a.HandoffID)
+	if len(initial.Inputs) != 1 || initial.Inputs[0].Artifacts[0].Content != a1.Content ||
+		initial.Session.PendingHandoffID != "" || initial.Session.SkillSHA256 != testWorkflowVersions.SkillSHA256 {
+		t.Fatalf("initial turn missed exact approved input: %+v", initial)
+	}
+	f.draft("a", initial.Session.RunID, "素材说明", workflowArtifact{})
+	f.finish("a", initial.Session.RunID, "")
+	f.check("a", "workflow", "workflow_turn_start", workflowTurnStartArgs{
+		operation: workflowOp(), StageID: target, HandoffID: a.HandoffID, RunID: uuid.NewString(), workflowFileVersions: testWorkflowVersions,
 	}, http.StatusConflict)
-	updated := review(aStage, a.RunID, aID, 2)
-	if updated.Stages[0].ApprovalID == approved.ApprovalID || updated.Stages[1].Status != workflowStale || updated.Stages[2].Status != workflowStale {
-		t.Fatalf("review of updated upstream failed to invalidate all descendants: %+v", updated)
-	}
-	checkWorkflowError(t, s, dir, "agent", "workflow", "workflow_reserve", workflowReserveArgs{operation: operation{ID: "old-approval"},
-		StageID: bStage, Revision: saved.Revision, PreviousApproval: approved.ApprovalID, ExpectedRunID: b.RunID}, http.StatusConflict)
-	b2 := start(bStage, updated.Stages[0].ApprovalID, b.RunID)
-	if !slices.Equal(b2.Inputs, []workflowRef{{aID, 2}}) {
-		t.Fatalf("rerun did not use the newly approved input: %+v", b2)
-	}
-	b2ID := finishNote("agent", b2, `{"text":"脚本 V2"}`)
-	if exactNode(t, s, dir, "reviewer", bID).Deleted || exactNode(t, s, dir, "reviewer", cID).Deleted || bID == b2ID {
-		t.Fatal("rerun removed or overwrote pre-existing Canvas output")
-	}
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
-	s = New(nil)
-	reloaded := call("reviewer", "workflow_get", nil).(workflowView)
-	if reloaded.ID != saved.ID || reloaded.Stages[1].RunID != b2.RunID || reloaded.Stages[2].Status != workflowStale {
-		t.Fatalf("restart lost workflow state: %+v", reloaded)
-	}
-	b2Approved := review(bStage, b2.RunID, b2ID, 1).Stages[1]
-	c2 := start(cStage, b2Approved.ApprovalID, c.RunID)
-	c2ID := finishNote("agent", c2, `{"text":"分镜 V2"}`)
-	review(cStage, c2.RunID, c2ID, 1)
-	a3 := start(aStage, "", a.RunID)
-	call("agent", "workflow_finish", workflowFinishArgs{RunID: a3.RunID, Error: "restarted upstream failed"})
-	stale := call("reviewer", "workflow_get", nil).(workflowView)
-	if stale.Stages[0].Status != workflowFailed || stale.Stages[1].Status != workflowStale || stale.Stages[2].Status != workflowStale ||
-		stale.Stages[1].RunID != b2.RunID || stale.Stages[2].RunID != c2.RunID {
-		t.Fatalf("restarted upstream did not stale all dependent approved attempts: %+v", stale)
+	binding := f.confirm("a", f.preview("a"))
+	b := f.confirm("b", f.preview("b"))
+	if b.SourceRevision <= binding.SourceRevision || f.view("normal").Stages[workflowStageIndex(target)].Status != workflowStale {
+		t.Fatalf("new upstream version did not invalidate downstream: %+v", f.view("normal"))
 	}
 }
 
-func TestWorkflowExecutionOwnershipReplayAndRecovery(t *testing.T) {
-	dir := t.TempDir()
-	s := New(nil)
-	defer func() { _ = s.Close() }()
-	bindSession(t, s, dir, "a")
-	bindSession(t, s, dir, "b")
-	checkWorkflowError(t, s, dir, "a", "human", "workflow_reserve",
-		workflowReserveArgs{operation: operation{ID: "untrusted"}, StageID: "content-analysis", Revision: 1}, http.StatusForbidden)
-	oldNode := mustCall(t, s, dir, "a", "append", appendArgs{operation: operation{ID: "historical"},
-		Nodes: []NodeInput{{Type: "note", Content: json.RawMessage(`{"text":"existing"}`)}}}).(appendResult).IDs[0]
-	args := workflowReserveArgs{operation: operation{ID: "start"}, StageID: "content-analysis", Revision: 1}
-	var wg sync.WaitGroup
-	results := make(chan workflowReservation, 2)
-	for range 2 {
-		wg.Go(func() {
-			value, err := editCall(s, dir, "a", "workflow", "workflow_reserve", args)
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			results <- value.(workflowReservation)
-		})
+func TestWorkflowWorkspaceIsolationAndAbandonedTurnRecovery(t *testing.T) {
+	f := newWorkflowTest(t, nil)
+	other := newWorkflowTest(t, nil)
+	f.activate("one", "storyboard")
+	other.activate("one", "content-analysis")
+	turn := f.start("one", "storyboard", "")
+	f.draft("one", turn.Session.RunID, "工作区 A", workflowArtifact{})
+	peer := New(nil)
+	defer peer.Close()
+	value, err := editCall(peer, f.dir, "one", "workflow", "workflow_session", nil)
+	if err != nil || value.(workflowSessionResult).Session.Status != workflowRunning {
+		t.Fatalf("second kernel marked the live native turn abandoned: %v %v", value, err)
 	}
-	wg.Wait()
-	close(results)
-	var runID string
-	var launches int
-	for value := range results {
-		if runID != "" && runID != value.RunID {
-			t.Fatalf("duplicate operation produced inconsistent reservations: %q and %q", runID, value.RunID)
-		}
-		runID = value.RunID
-		if !value.Duplicate {
-			launches++
-		}
+	if v := other.view("one"); v.Session.ActiveStageID != "content-analysis" || len(v.Artifacts) != 0 {
+		t.Fatalf("cross-workspace state leak: %+v", v)
 	}
-	if runID == "" || launches != 1 {
-		t.Fatalf("got %d actual reservations for a repeated operation", launches)
+	f.reopen(nil)
+	if v := f.view("one"); v.Session.Status != workflowFailed || v.Session.ActiveStageID != "storyboard" ||
+		len(v.Artifacts) != 1 || len(v.Handoffs) != 0 {
+		t.Fatalf("interrupted native run changed active stage, drafts or formal progress: %+v", v)
 	}
-	checkWorkflowError(t, s, dir, "b", "workflow", "workflow_finish", workflowFinishArgs{RunID: runID, Error: "wrong owner"}, http.StatusForbidden)
-	callWorkflow(t, s, dir, "a", "workflow_running", workflowRunningPayload(runID))
-	other := New(nil)
-	defer other.Close()
-	if live := callWorkflow(t, other, dir, "b", "workflow_get", nil).(workflowView).Stages[0]; live.Status != workflowRunning {
-		t.Fatalf("second Host changed a live run: %+v", live)
+	resumed := f.start("one", "storyboard", "")
+	f.activate("one", "content-analysis")
+	f.finish("one", resumed.Session.RunID, "Old turn failed")
+	if v := f.view("one"); v.Session.Status != "active" || v.Session.ActiveStageID != "content-analysis" || len(v.Artifacts) != 1 {
+		t.Fatalf("old attempt overwrote the new activation: %+v", v)
 	}
-	callWorkflow(t, s, dir, "a", "workflow_finish", workflowFinishArgs{RunID: runID, NodeIDs: []string{oldNode}})
-	if old := callWorkflow(t, s, dir, "a", "workflow_get", nil).(workflowView).Stages[0]; old.Status != workflowFailed || old.Error == "" {
-		t.Fatalf("historical Canvas node was accepted as a current result: %+v", old)
-	}
-	checkWorkflowError(t, s, dir, "a", "workflow", "workflow_reserve", workflowReserveArgs{operation: operation{ID: "stale-start"},
-		StageID: "content-analysis", Revision: 1}, http.StatusConflict)
-	args.ID, args.ExpectedRunID = "new-start", runID
-	rerun := callWorkflow(t, s, dir, "a", "workflow_reserve", args).(workflowReservation)
-	callWorkflow(t, s, dir, "a", "workflow_running", workflowRunningPayload(rerun.RunID))
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if recovered := callWorkflow(t, other, dir, "b", "workflow_get", nil).(workflowView).Stages[0]; recovered.RunID != rerun.RunID ||
-		recovered.Status != workflowFailed || !strings.Contains(recovered.Error, "Host") {
-		t.Fatalf("lost native executor was not surfaced as an interrupted run: %+v", recovered)
-	}
-	if replay := callWorkflow(t, other, dir, "a", "workflow_reserve", args).(workflowReservation); !replay.Duplicate || replay.RunID != rerun.RunID {
-		t.Fatalf("restart replay could re-dispatch an interrupted agent: %+v", replay)
-	}
-	args.ID, args.ExpectedRunID = "manual-retry", rerun.RunID
-	manual := callWorkflow(t, other, dir, "a", "workflow_reserve", args).(workflowReservation)
-	callWorkflow(t, other, dir, "a", "workflow_finish", workflowFinishArgs{RunID: manual.RunID, Error: "Skill 不存在"})
-	if failed := callWorkflow(t, other, dir, "b", "workflow_get", nil).(workflowView).Stages[0]; failed.Status != workflowFailed || failed.Error != "Skill 不存在" {
-		t.Fatalf("pre-launch failure looked like successful or running work: %+v", failed)
+	if v := f.activate("one", ""); v.Session.Status != "normal" || len(v.Artifacts) != 1 {
+		t.Fatalf("exit activated work or removed existing drafts: %+v", v)
 	}
 }
 
-func TestWorkflowKeepsPreviousCustomDefinitionAndRuns(t *testing.T) {
-	ctx := context.Background()
-	dir := t.TempDir()
-	s := New(nil)
-	defer s.Close()
-	bindSession(t, s, dir, "agent")
-	p, err := s.open(ctx, dir, false)
-	if err != nil {
-		t.Fatal(err)
+func TestWorkflowConcurrentConfirmation(t *testing.T) {
+	f := newWorkflowTest(t, nil)
+	previews := make(map[string]workflowHandoff)
+	for _, session := range []string{"a", "b"} {
+		f.activate(session, "storyboard")
+		run := f.start(session, "storyboard", "")
+		f.draft(session, run.Session.RunID, session, workflowArtifact{})
+		f.finish(session, run.Session.RunID, "")
+		previews[session] = f.preview(session)
 	}
-	if _, err := p.db.ExecContext(ctx, `CREATE TABLE workflow_definition (singleton INTEGER PRIMARY KEY, id TEXT, revision INTEGER, name TEXT, stages TEXT);
-		INSERT INTO workflow_definition VALUES(1,'custom-id',3,'Original configuration','[]');
-		INSERT INTO workflow_runs VALUES('old-run','content-analysis','agent','approved','{"stage":{"id":"content-analysis","skill":"old-skill","harness":"old rules"}}');`); err != nil {
-		t.Fatal(err)
-	}
-	view := callWorkflow(t, s, dir, "agent", "workflow_get", nil).(workflowView)
-	if view.ID != dramaWorkflowID || view.Stages[0].RunID != "" || view.Stages[0].Status != workflowNotStarted {
-		t.Fatalf("custom stage was treated as approved fixed-stage progress: %+v", view)
-	}
-	callWorkflow(t, s, dir, "agent", "workflow_reserve", workflowReserveArgs{operation: operation{ID: "fixed-start"},
-		Revision: dramaWorkflowRev, StageID: "content-analysis"})
-	var name, raw string
-	if err := p.db.QueryRow(`SELECT name,record FROM workflow_definition CROSS JOIN workflow_runs WHERE workflow_runs.id='old-run'`).Scan(&name, &raw); err != nil {
-		t.Fatal(err)
-	}
-	if name != "Original configuration" || !strings.Contains(raw, "old rules") {
-		t.Fatalf("legacy workflow data changed: %q/%q", name, raw)
-	}
-}
-
-func TestWorkflowKeepsVersionlessFixedProgress(t *testing.T) {
-	ctx := context.Background()
-	dir := t.TempDir()
-	s := New(nil)
-	defer s.Close()
-	status := bindSession(t, s, dir, "agent")
-	bindSession(t, s, dir, "reviewer")
-	node := mustCall(t, s, dir, "agent", "append", appendArgs{operation: operation{ID: "old-output"}, Nodes: []NodeInput{
-		{Type: "note", Content: json.RawMessage(`{"text":"Existing approved analysis"}`)},
-	}}).(appendResult).IDs[0]
-	legacy := workflowRun{WorkflowID: dramaWorkflowID, Stage: workflowStage{ID: "content-analysis", Name: "内容分析", Skill: "content-analysis"},
-		Outputs: []workflowRef{{node, 1}}, Approvals: []workflowApproval{{ID: "legacy-approval", SessionID: "reviewer", Outputs: []workflowRef{{node, 1}}}}}
-	encoded, err := json.Marshal(legacy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	p, err := s.open(ctx, dir, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := p.db.ExecContext(ctx, `INSERT INTO workflow_runs VALUES('legacy-fixed','content-analysis','agent','approved',?)`, string(encoded)); err != nil {
-		t.Fatal(err)
-	}
-	view := callWorkflow(t, s, dir, "reviewer", "workflow_get", nil).(workflowView)
-	first := view.Stages[0]
-	if first.Status != workflowApproved || first.RunID != "legacy-fixed" || first.SkillID != "content-analysis" || first.Skill != "drama-content-analysis" ||
-		first.Harness != "stages/content-analysis/harness.md" || first.DefinitionVersion != 0 || first.SkillSHA256 != "" || first.HarnessSHA256 != "" {
-		t.Fatalf("legacy progress, global mapping or unknown provenance misreported: %+v", first)
-	}
-	second := callWorkflow(t, s, dir, "reviewer", "workflow_reserve", workflowReserveArgs{operation: operation{ID: "next"},
-		StageID: "shooting-script", Revision: view.Revision, PreviousApproval: first.ApprovalID}).(workflowReservation)
-	if !slices.Equal(second.Inputs, first.Outputs) || second.DefinitionVersion != dramaWorkflowRev || second.CanvasID != status.CanvasID {
-		t.Fatalf("next run did not inherit the legacy approved artifact with new provenance: %+v", second)
-	}
-	var stored string
-	if err := p.db.QueryRowContext(ctx, `SELECT record FROM workflow_runs WHERE id='legacy-fixed'`).Scan(&stored); err != nil {
-		t.Fatal(err)
-	}
-	if stored != string(encoded) {
-		t.Fatalf("legacy fixed record mutated: %s", stored)
-	}
-}
-
-func TestWorkflowRunSnapshotsAndWorkspaceConflicts(t *testing.T) {
-	dir, otherDir := t.TempDir(), t.TempDir()
-	s := New(nil)
-	defer func() { _ = s.Close() }()
-	status := bindSession(t, s, dir, "writer-a")
-	bindSession(t, s, dir, "writer-b")
-	otherStatus := bindSession(t, s, otherDir, "other-writer")
-	reserve := func(id string) workflowReserveArgs {
-		return workflowReserveArgs{operation: operation{ID: id}, StageID: "content-analysis", Revision: dramaWorkflowRev}
-	}
-	type attempt struct {
-		session string
-		run     workflowReservation
-		err     error
-	}
+	otherKernel := New(nil)
+	defer otherKernel.Close()
 	ready := make(chan struct{})
-	results := make(chan attempt, 2)
-	for _, session := range []string{"writer-a", "writer-b"} {
-		go func() {
+	result := make(chan error, 2)
+	for session, h := range previews {
+		go func(session, id string) {
 			<-ready
-			value, err := editCall(s, dir, session, "workflow", "workflow_reserve", reserve(session))
-			run, _ := value.(workflowReservation)
-			results <- attempt{session: session, run: run, err: err}
-		}()
+			kernel := f.s
+			if session == "b" {
+				kernel = otherKernel
+			}
+			_, err := editCall(kernel, f.dir, session, "human", "workflow_handoff_confirm", workflowConfirmArgs{
+				operation: workflowOp(), HandoffID: id,
+			})
+			result <- err
+		}(session, h.HandoffID)
 	}
 	close(ready)
-	winner, loser := <-results, <-results
-	if winner.err != nil {
-		winner, loser = loser, winner
+	first, second := <-result, <-result
+	if first != nil {
+		first, second = second, first
 	}
-	conflict, ok := loser.err.(*requestError)
-	if winner.err != nil || !ok || conflict.code != http.StatusConflict || !strings.Contains(conflict.Error(), winner.session) ||
-		!strings.Contains(conflict.Error(), winner.run.RunID) || !strings.Contains(conflict.Error(), winner.run.Stage.ID) {
-		t.Fatalf("simultaneous starts did not expose the elected Workspace run: %+v / %+v", winner, loser)
-	}
-	if winner.run.CanvasID != status.CanvasID || winner.run.WorkspaceID != status.WorkspaceID || winner.run.DefinitionVersion != dramaWorkflowRev {
-		t.Fatalf("reservation omitted authoritative scope: %+v", winner.run)
-	}
-	versions := workflowRunningPayload(winner.run.RunID)
-	checkWorkflowError(t, s, dir, winner.session, "workflow", "workflow_running", map[string]string{"runId": winner.run.RunID}, http.StatusBadRequest)
-	callWorkflow(t, s, dir, winner.session, "workflow_running", versions)
-	callWorkflow(t, s, dir, winner.session, "workflow_running", versions)
-	modified := versions
-	modified.SkillSHA256 = strings.Repeat("c", 64)
-	checkWorkflowError(t, s, dir, winner.session, "workflow", "workflow_running", modified, http.StatusConflict)
-	other := callWorkflow(t, s, otherDir, "other-writer", "workflow_reserve", reserve("other")).(workflowReservation)
-	if other.CanvasID != otherStatus.CanvasID || other.CanvasID == winner.run.CanvasID || other.RunID == winner.run.RunID {
-		t.Fatalf("separate Workspace could not run the same global stage independently: %+v", other)
-	}
-	modified.RunID = other.RunID
-	callWorkflow(t, s, otherDir, "other-writer", "workflow_running", modified)
-	current := callWorkflow(t, s, dir, loser.session, "workflow_get", nil).(workflowView).Stages[0]
-	if current.Status != workflowRunning || current.SessionID != winner.session || current.SkillID != winner.run.Stage.Skill ||
-		current.workflowFileVersions != versions.workflowFileVersions || current.workflowRunScope != winner.run.workflowRunScope {
-		t.Fatalf("peer Session did not see the exact running snapshot: %+v", current)
-	}
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
-	s = New(nil)
-	for _, keep := range []struct {
-		directory string
-		runID     string
-		versions  workflowFileVersions
-	}{
-		{dir, winner.run.RunID, versions.workflowFileVersions},
-		{otherDir, other.RunID, modified.workflowFileVersions},
-	} {
-		got := callWorkflow(t, s, keep.directory, "resumed-viewer", "workflow_get", nil).(workflowView).Stages[0]
-		if got.Status != workflowFailed || got.RunID != keep.runID || got.workflowFileVersions != keep.versions {
-			t.Fatalf("restart lost immutable execution provenance: %+v", got)
-		}
+	var known *requestError
+	if first != nil || !errors.As(second, &known) || known.code != http.StatusConflict || len(f.view("peer").Handoffs) != 1 {
+		t.Fatalf("expected one success and one version conflict across kernels: %v %v", first, second)
 	}
 }
 
-func TestWorkflowVideoUsesOnlyAuthorizedResultsOfApprovedDraftVersions(t *testing.T) {
+func TestWorkflowLegacyApprovalMigration(t *testing.T) {
 	ctx := context.Background()
-	dir := t.TempDir()
-	s := New(providerFixture{})
-	defer s.Close()
-	bindSession(t, s, dir, "agent")
-	bindSession(t, s, dir, "reviewer")
-	p, err := s.open(ctx, dir, false)
+	f := newWorkflowTest(t, nil)
+	bindSession(t, f.s, f.dir, "legacy-agent")
+	node := mustCall(t, f.s, f.dir, "legacy-agent", "append", appendArgs{operation: workflowOp(), Nodes: []NodeInput{
+		{Type: "note", Content: json.RawMessage(`{"title":"旧文档","text":"既有分镜"}`)},
+	}}).(appendResult).IDs[0]
+	p, err := f.s.open(ctx, f.dir, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	call := func(session, action string, data any) any {
-		return callWorkflow(t, s, dir, session, action, data)
+	if _, err := p.db.ExecContext(ctx, `DELETE FROM workflow_migrations`); err != nil {
+		t.Fatal(err)
 	}
-	var priorApproval string
-	reserve := func(stage string) workflowReservation {
-		return call("agent", "workflow_reserve", workflowReserveArgs{operation: operation{ID: uuid.NewString()}, StageID: stage,
-			Revision: dramaWorkflowRev, PreviousApproval: priorApproval}).(workflowReservation)
+	encoded, err := json.Marshal(legacyWorkflowRun{WorkflowID: dramaWorkflowID, WorkspaceID: "native-workspace",
+		Approvals: []workflowApproval{
+			{ID: "older", At: "2026-11-12T00:00:00Z", Outputs: []workflowRef{{node, 1}}},
+			{ID: "newer", At: "2026-11-13T00:00:00Z", Outputs: []workflowRef{{node, 2}}},
+		}})
+	if err != nil {
+		t.Fatal(err)
 	}
-	approve := func(run workflowReservation, outputs []workflowRef) workflowView {
-		view := call("reviewer", "workflow_approve", workflowApproveArgs{workflowDecisionArgs: workflowDecisionArgs{
-			operation: operation{ID: uuid.NewString()}, StageID: run.Stage.ID, RunID: run.RunID}, Outputs: outputs}).(workflowView)
-		priorApproval = view.Stages[workflowStageIndex(run.Stage.ID)].ApprovalID
-		return view
+	if _, err := p.db.ExecContext(ctx, `INSERT INTO workflow_runs VALUES('legacy','content-analysis','legacy-agent','approved',?)`, string(encoded)); err != nil {
+		t.Fatal(err)
 	}
-	appendNodes := func(nodes ...NodeInput) []string {
-		return mustCall(t, s, dir, "agent", "append", appendArgs{operation: operation{ID: uuid.NewString()}, Nodes: nodes}).(appendResult).IDs
+	f.reopen(nil)
+	view := f.activate("viewer", "shooting-script")
+	if len(view.Handoffs) != 2 || len(view.Inputs) != 1 || view.Inputs[0].HandoffID != "newer" ||
+		view.Handoffs[0].Artifacts[0].Node.Revision != 2 || string(view.Handoffs[0].Artifacts[0].Node.Content) != "null" ||
+		!strings.Contains(string(view.Handoffs[1].Artifacts[0].Node.Content), "既有分镜") {
+		t.Fatalf("legacy approvals or exact historical reference changed: %+v", view)
 	}
-	finish := func(run workflowReservation, nodes ...string) {
-		call("agent", "workflow_running", workflowRunningPayload(run.RunID))
-		call("agent", "workflow_finish", workflowFinishArgs{RunID: run.RunID, NodeIDs: nodes})
+	f.reopen(nil)
+	if v := f.view("viewer"); v.Session.ActiveStageID != "shooting-script" || len(v.Handoffs) != 2 {
+		t.Fatalf("migration replayed legacy approvals: %+v", v)
 	}
-	for _, stage := range dramaWorkflowStages[:workflowStageIndex(workflowDeployment)] {
-		run := reserve(stage.ID)
-		id := appendNodes(NodeInput{Type: "note", Content: json.RawMessage(`{"text":"phase output"}`)})[0]
-		finish(run, id)
-		approve(run, []workflowRef{{id, 1}})
+}
+
+func TestWorkflowVideoUsesAuthorizedExactResults(t *testing.T) {
+	ctx := context.Background()
+	f := newWorkflowTest(t, providerFixture{})
+	bindSession(t, f.s, f.dir, "active")
+	bindSession(t, f.s, f.dir, "human")
+	p, err := f.s.open(ctx, f.dir, false)
+	if err != nil {
+		t.Fatal(err)
 	}
-	drafts := reserve(workflowDeployment)
-	ids := appendNodes(
-		NodeInput{Type: "video", Content: json.RawMessage(`{"mode":"t2v","prompt":"A quiet first shot."}`)},
-		NodeInput{Type: "video", Content: json.RawMessage(`{"mode":"t2v","prompt":"A quiet second shot."}`)},
-	)
-	finish(drafts, ids...)
-	manual := func(id string) Task {
-		mustCall(t, s, dir, "reviewer", "generateT2V", map[string]any{"operationId": uuid.NewString(), "nodeId": id, "confirmed": true})
-		return tasksIn(t, s, dir, "reviewer")[0]
+	node := mustCall(t, f.s, f.dir, "active", "append", appendArgs{operation: workflowOp(), Nodes: []NodeInput{
+		{Type: "video", Content: json.RawMessage(`{"mode":"t2v","prompt":"Evening light in the courtyard."}`)},
+	}}).(appendResult).IDs[0]
+	f.activate("active", workflowDeployment)
+	run := f.start("active", workflowDeployment, "")
+	mustCall(t, f.s, f.dir, "active", "permission", map[string]any{"operationId": uuid.NewString(), "enabled": true})
+	f.check("active", "agent", "submit", map[string]any{"operationId": uuid.NewString(), "nodeId": node}, http.StatusForbidden)
+	f.call("active", "workflow", "workflow_save_artifact", workflowSaveArtifactArgs{
+		operation: workflowOp(), RunID: run.Session.RunID, Title: "正片草稿", NodeID: node,
+	})
+	f.finish("active", run.Session.RunID, "")
+	deployment := f.confirm("active", f.preview("active"))
+	if deployment.TargetStageID != workflowGeneration || len(tasksIn(t, f.s, f.dir, "active")) != 0 {
+		t.Fatalf("deployment confirmation submitted a paid task: %+v", deployment)
 	}
-	complete := func(task Task) Task {
-		resultPath := "assets/videos/" + task.ID + ".mp4"
-		output := filepath.Join(dir, filepath.FromSlash(resultPath))
-		if err := os.MkdirAll(filepath.Dir(output), 0o700); err != nil {
+	kickoff := f.start("active", workflowGeneration, deployment.HandoffID)
+	if len(kickoff.GenerationResults) != 0 {
+		t.Fatalf("generation kickoff read a nonexistent output: %+v", kickoff.GenerationResults)
+	}
+	f.finish("active", kickoff.Session.RunID, "")
+	f.check("active", "human", "workflow_handoff_preview", workflowPreviewArgs{operation: workflowOp()}, http.StatusConflict)
+
+	submit := func(manual bool) Task {
+		if manual {
+			mustCall(t, f.s, f.dir, "human", "generateT2V", map[string]any{"operationId": uuid.NewString(), "nodeId": node, "confirmed": true})
+		} else {
+			mustCall(t, f.s, f.dir, "active", "submit", map[string]any{"operationId": uuid.NewString(), "nodeId": node})
+		}
+		task := tasksIn(t, f.s, f.dir, "active")[0]
+		path := "assets/videos/" + task.ID + ".mp4"
+		absolute := filepath.Join(f.dir, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(absolute), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(output, []byte("local completion fixture"), 0o600); err != nil {
+		if err := os.WriteFile(absolute, []byte("local completion fixture"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		if err := p.transition(ctx, task, "polling", "fixture-provider-"+task.ID, ""); err != nil {
 			t.Fatal(err)
 		}
-		active := tasksIn(t, s, dir, "reviewer")[0]
-		if active.ID != task.ID || active.Status != "polling" {
-			t.Fatalf("expected current queued task to claim: %+v", active)
-		}
-		if err := p.complete(ctx, active, resultPath, nil); err != nil {
+		running := tasksIn(t, f.s, f.dir, "active")[0]
+		if err := p.complete(ctx, running, path, nil); err != nil {
 			t.Fatal(err)
 		}
-		return tasksIn(t, s, dir, "reviewer")[0]
+		return tasksIn(t, f.s, f.dir, "active")[0]
 	}
-	first := complete(manual(ids[0]))
-	oldRevision := complete(manual(ids[1]))
-	s.SetHumanWriteCheck(func(context.Context, string, string, []string) (bool, error) { return true, nil })
-	mustEdit(t, s, dir, "reviewer", "update_node", updateNodeArgs{
-		nodeRevisionArgs: nodeRevisionArgs{operation: operation{ID: "edit-second-draft"}, ID: ids[1], Revision: 1},
-		Content:          json.RawMessage(`{"mode":"t2v","prompt":"A revised second shot."}`),
-	})
-	view := approve(drafts, []workflowRef{{ids[0], 1}, {ids[1], 2}})
-	videoIndex := workflowStageIndex(workflowGeneration)
-	if state := view.Stages[videoIndex].Generation; state.State != "waiting" || !slices.Equal(state.TaskIDs, []string{first.ID}) {
-		t.Fatalf("an unchanged authorized result was not reused, or the old draft revision was adopted: %+v", state)
+	automatic := submit(false)
+	if got := f.view("active").Stages[workflowStageIndex(workflowGeneration)].Generation; got.State != "waiting" {
+		t.Fatalf("ordinary auto-authorized output was accepted: %+v", got)
 	}
-	checkWorkflowError(t, s, dir, "agent", "workflow", "workflow_reserve", workflowReserveArgs{
-		operation: operation{ID: "no-approval"}, Revision: dramaWorkflowRev, StageID: workflowGeneration,
-		PreviousApproval: priorApproval,
-	}, http.StatusConflict)
-	if tasks := tasksIn(t, s, dir, "agent"); len(tasks) != 2 {
-		t.Fatalf("workflow start implicitly submitted a paid task: %+v", tasks)
+	manual := submit(true)
+	playablePath := filepath.Join(f.dir, filepath.FromSlash(manual.OutputPath))
+	review := f.preview("active")
+	if len(review.Artifacts) != 1 || review.Artifacts[0].NodeID != manual.ResultNodeID || review.Artifacts[0].NodeID == automatic.ResultNodeID {
+		t.Fatalf("preview did not snapshot the independently authorized video: %+v", review)
 	}
-	mustCall(t, s, dir, "agent", "permission", map[string]any{"operationId": "allow-ordinary-auto", "enabled": true})
-	mustCall(t, s, dir, "agent", "submit", map[string]any{"operationId": "unrelated-auto", "nodeId": ids[1]})
-	automatic := complete(tasksIn(t, s, dir, "reviewer")[0])
-	current := func() workflowStageView {
-		return call("reviewer", "workflow_get", nil).(workflowView).Stages[videoIndex]
+	ref := review.Artifacts[0].workflowArtifactRef
+	if item := f.call("active", "human", "workflow_artifact_get", ref).(workflowArtifact); item.HandedOff || item.NodeID != manual.ResultNodeID {
+		t.Fatalf("owner could not view generated preview before confirmation: %+v", item)
 	}
-	if state := current().Generation; state.State != "waiting" {
-		t.Fatalf("an automatically authorized task made the fixed workflow ready: %+v", state)
-	}
-	second := manual(ids[1])
-	if state := current().Generation; state.State != "processing" || !slices.Equal(state.TaskIDs, []string{first.ID, second.ID}) {
-		t.Fatalf("manual task not tracked exclusively: %+v", state)
-	}
-	second = complete(second)
-	if state := current().Generation; state.State != "ready" || !slices.Equal(state.TaskIDs, []string{first.ID, second.ID}) {
-		t.Fatalf("approved manual results not ready: %+v", state)
-	}
-	video := reserve(workflowGeneration)
-	expected := []workflowRef{{first.ResultNodeID, 1}, {second.ResultNodeID, 1}}
-	if !slices.Equal(video.GenerationResults, expected) || slices.Contains(video.GenerationResults, workflowRef{oldRevision.ResultNodeID, 1}) ||
-		slices.Contains(video.GenerationResults, workflowRef{automatic.ResultNodeID, 1}) {
-		t.Fatalf("generation reservation used incorrect results: %+v", video)
-	}
-	finish(video)
-	if current := current(); current.Status != workflowReview || !slices.Equal(current.Outputs, expected) {
-		t.Fatalf("native generation phase did not carry actual Canvas results to human review: %+v", current)
-	}
-	file := filepath.Join(dir, filepath.FromSlash(second.OutputPath))
-	if err := os.Remove(file); err != nil {
+	f.check("human", "human", "workflow_artifact_get", ref, http.StatusNotFound)
+	if err := os.Remove(playablePath); err != nil {
 		t.Fatal(err)
 	}
-	if stage := current(); stage.Generation.State != "failed" || !stage.NeedsRerun {
-		t.Fatalf("missing local result still marked ready for approval: %+v", stage)
-	}
-	checkWorkflowError(t, s, dir, "reviewer", "human", "workflow_approve", workflowApproveArgs{workflowDecisionArgs: workflowDecisionArgs{
-		operation: operation{ID: "missing-result-review"}, StageID: video.Stage.ID, RunID: video.RunID}, Outputs: expected}, http.StatusConflict)
-	if err := os.WriteFile(file, []byte("local completion fixture"), 0o600); err != nil {
+	f.check("active", "human", "workflow_handoff_confirm", workflowConfirmArgs{
+		operation: workflowOp(), HandoffID: review.HandoffID}, http.StatusConflict)
+	if err := os.WriteFile(playablePath, []byte("local completion fixture"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	updatedContent, err := json.Marshal(map[string]string{"path": second.OutputPath, "providerTaskId": second.ProviderTaskID, "title": "更新标题"})
-	if err != nil {
+	generated := f.confirm("active", review)
+	if item := f.call("human", "human", "workflow_artifact_get", ref).(workflowArtifact); !item.HandedOff || item.NodeID != manual.ResultNodeID {
+		t.Fatalf("formal generated video not shared: %+v", item)
+	}
+	final := f.start("active", "final-review", generated.HandoffID)
+	if len(final.Inputs) != 2 || final.Inputs[1].Artifacts[0].NodeID != manual.ResultNodeID {
+		t.Fatalf("final review lost verified output: %+v", final.Inputs)
+	}
+	f.draft("active", final.Session.RunID, "接受成片", workflowArtifact{})
+	f.finish("active", final.Session.RunID, "")
+	finalPreview := f.preview("active")
+	if len(finalPreview.Artifacts) != 2 || finalPreview.Artifacts[1].NodeID != manual.ResultNodeID {
+		t.Fatalf("final preview failed to include the exact approved video: %+v", finalPreview.Artifacts)
+	}
+	if err := os.Remove(playablePath); err != nil {
 		t.Fatal(err)
 	}
-	edit := mustEdit(t, s, dir, "reviewer", "update_node", updateNodeArgs{
-		nodeRevisionArgs: nodeRevisionArgs{operation: operation{ID: "edit-result-revision"}, ID: second.ResultNodeID, Revision: 1}, Content: updatedContent,
-	})
-	latest := []workflowRef{expected[0], {second.ResultNodeID, edit.Revision}}
-	checkWorkflowError(t, s, dir, "reviewer", "human", "workflow_approve", workflowApproveArgs{workflowDecisionArgs: workflowDecisionArgs{
-		operation: operation{ID: "approve-different-revision"}, StageID: video.Stage.ID, RunID: video.RunID}, Outputs: latest}, http.StatusConflict)
-	runID := video.RunID
-	video = call("agent", "workflow_reserve", workflowReserveArgs{operation: operation{ID: "check-result-revision"}, StageID: workflowGeneration,
-		Revision: dramaWorkflowRev, PreviousApproval: priorApproval, ExpectedRunID: runID}).(workflowReservation)
-	if !slices.Equal(video.GenerationResults, latest) {
-		t.Fatalf("native rerun did not reuse the existing task with the new validated result revision: %+v", video)
+	f.check("active", "human", "workflow_handoff_confirm", workflowConfirmArgs{
+		operation: workflowOp(), HandoffID: finalPreview.HandoffID}, http.StatusConflict)
+	if err := os.WriteFile(playablePath, []byte("local completion fixture"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	finish(video)
-	expected = latest
-	approve(video, expected)
-	final := reserve("final-review")
-	if !slices.Equal(final.Inputs, expected) {
-		t.Fatalf("final review did not receive the approved film references: %+v", final)
-	}
-	id := appendNodes(NodeInput{Type: "note", Content: json.RawMessage(`{"text":"final review notes"}`)})[0]
-	finish(final, id)
-	if got := approve(final, []workflowRef{{id, 1}}).Stages[6]; got.Status != workflowApproved || got.ApprovalID == "" {
-		t.Fatalf("final phase did not persist its approval: %+v", got)
-	}
-}
-
-func callWorkflow(t *testing.T, s *Service, dir, session, action string, data any) any {
-	t.Helper()
-	actor := "human"
-	if action == "workflow_running" || action == "workflow_finish" || action == "workflow_reserve" {
-		actor = "workflow"
-	}
-	value, err := editCall(s, dir, session, actor, action, data)
-	if err != nil {
-		t.Fatalf("%s/%s: %v", session, action, err)
-	}
-	return value
-}
-
-func workflowRunningPayload(runID string) workflowRunningArgs {
-	return workflowRunningArgs{RunID: runID, workflowFileVersions: workflowFileVersions{
-		SkillSHA256: strings.Repeat("a", 64), HarnessSHA256: strings.Repeat("b", 64),
-	}}
-}
-
-func checkWorkflowError(t *testing.T, s *Service, dir, session, actor, action string, data any, code int) {
-	t.Helper()
-	if _, err := editCall(s, dir, session, actor, action, data); err == nil {
-		t.Fatalf("%s unexpectedly succeeded", action)
-	} else if known, ok := err.(*requestError); !ok || known.code != code {
-		t.Fatalf("%s rejected with %v, want HTTP %d", action, err, code)
+	accepted := f.confirm("active", finalPreview)
+	if session := f.view("active").Session; accepted.TargetStageID != "" || session.PendingHandoffID != "" ||
+		session.ActiveStageID != "final-review" || session.Status != "active" {
+		t.Fatalf("end of chain scheduled a nonexistent stage: %+v / %+v", accepted, session)
 	}
 }

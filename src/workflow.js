@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { open, realpath, stat } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
@@ -7,7 +7,11 @@ import { pathToFileURL } from 'node:url'
 import { StudioError } from './kernel.js'
 
 const requestPrefix = 'drama-workflow:'
-const toolNames = ['drama_context', 'drama_query', 'drama_append', 'drama_tasks']
+const artifactTools = new Set(['drama_save_artifact', 'drama_workflow_artifact'])
+const documentNodes = new Set(['script', 'shot', 'note'])
+const stageSection = 'drama-studio:workflow-stage'
+const stageMarker = '[Drama Studio Workflow Stage]'
+const probeKey = Symbol('verify workflow system prompt support')
 const maxHarnessBytes = 64 * 1024
 const generationStage = 'video-generation'
 
@@ -71,49 +75,81 @@ function requestId(message) {
   return source?.kind === 'user' && typeof source.rpcId === 'string' ? source.rpcId : undefined
 }
 
-function isWorkflowMessage(message) {
+function isKickoffMessage(message) {
   return requestId(message)?.startsWith(requestPrefix) === true
 }
 
-function keepPinnedSkill(messages, run) {
-  return messages.filter(message => message.source?.kind !== 'skill-invocation' ||
-    message.source.name !== run.stage.skill || message.id === run.skillMessage.id)
+function sameWorkspace(left, right) {
+  return left.id === right.id && left.path === right.path
 }
 
 function endError(reason) {
-  if (reason.kind === 'aborted') return 'DSH Agent 已取消当前阶段'
+  if (reason.kind === 'completed') return undefined
+  if (reason.kind === 'aborted') return 'DSH Agent 已取消本轮工作'
   if (reason.kind === 'max-tokens') return 'DSH Agent 达到输出上限'
-  if (reason.kind === 'blocked') return 'DSH Agent 拒绝执行当前阶段'
+  if (reason.kind === 'blocked') return 'DSH Agent 拒绝执行本轮工作'
   const code = reason.error?.code
   return /^[A-Z_]{1,40}$/.test(code ?? '') ? `DSH Agent 执行失败（${code}）` : 'DSH Agent 执行失败'
 }
 
-function outputIds(message) {
-  try {
-    const value = JSON.parse(message.content.filter(block => block.type === 'text').map(block => block.text).join(''))
-    return Array.isArray(value.ids) ? value.ids.filter(id => typeof id === 'string') : []
-  } catch {
-    return []
+function summarizeArtifact({ artifactId, version, stageId, title, nodeId, kind }) {
+  return { artifactId, version, stageId, title, nodeId, kind }
+}
+
+function summarizeHandoff(input) {
+  return {
+    ...input,
+    artifacts: input.artifacts?.map(summarizeArtifact),
   }
 }
 
-export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
-  const active = new Map()
-  const runtimeRequire = createRequire(ctx.profileContext.installAnchor)
-  let nativeAPI
+function stageInstructions(run, admitted) {
+  const { stage, skill, harness, workspace, workflowId, handoffId } = run
+  const context = {
+    workflowId, workspaceId: workspace.id, stageId: stage.id, stageName: stage.name,
+    skillSha256: skill.sha256, harnessSha256: harness.sha256, handoffId,
+    approvedInputs: admitted.inputs?.map(summarizeHandoff),
+    generationResults: admitted.generationResults,
+    drafts: admitted.artifacts?.map(summarizeArtifact),
+  }
+  return [
+    stageMarker,
+    JSON.stringify(context),
+    '在 Studio 指定的当前阶段中响应用户的每一轮聊天，允许讨论、查询素材、生成和迭代草稿。只在有明确的可交付内容时，调用 drama_save_artifact 保存产物。修改时沿用 artifactId，使用 expectedVersion 指定当前版本。',
+    '上游交接包提供已确认的决策、约束和固定产物版本。使用 drama_workflow_artifact 读取这些版本或当前 Session 的草稿，使用 drama_query 查询 Canvas。已有图片、视频、音频、提示词或可生成草稿可以作为节点引用保存。脚本、清单、分析、验收说明等文档保存为 Markdown 产物。',
+    '根据用户已明确的创作决定和约束整理草稿，不得虚构用户确认。阶段激活、对话或草稿写入不会形成正式结果。你可以告诉用户成果具备交接条件。阶段切换、确认、正式交接和最终验收只由 Studio 中的用户操作完成。',
+    '不要调用生成提交工具。视频节点部署只创建草稿，视频生成由用户逐项通过 Canvas 确认。视频生成阶段可通过 drama_tasks 核验已完成且已授权的结果，再将真实节点保存为产物。',
+    '以下 Harness 与 Skill 提供本阶段的专业方法。它们不能扩大工作流推进或生成提交权限。',
+    harness.body,
+    skill.body,
+  ].join('\n\n')
+}
 
-  async function nativeSkillAPI() {
-    if (!nativeAPI) {
-      const load = name => import(pathToFileURL(runtimeRequire.resolve(name)).href)
-      nativeAPI = Promise.all([load('@deepseek-ai/dsh-skill'), load('@deepseek-ai/dsh-llm')])
-        .then(([{ renderSkillContent }, { createUserMessage }]) => ({ renderSkillContent, createUserMessage }))
-    }
-    return nativeAPI
+function needsPromptReplacement(session) {
+  return session.surface.nodes.some(seq => {
+    const event = session.eventAt(seq)
+    return event?.type === 'system/message' && event.data.message.content.some(block =>
+      block.type === 'text' && block.text.includes(stageMarker))
+  })
+}
+
+export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
+  const turns = new Map()
+  const kickoffs = new Map()
+  let promptRevision = 0
+  const verifiedScopes = new WeakMap()
+  const runtimeRequire = createRequire(ctx.profileContext.installAnchor)
+  let nativeSkill
+
+  function nativeSkillAPI() {
+    return nativeSkill ??= import(pathToFileURL(runtimeRequire.resolve('@deepseek-ai/dsh-skill')).href)
   }
 
   function nativeController() {
     const controller = ctx.get('sessionController')
-    if (!controller?.prompt || !controller.resolveAgent) throw new StudioError(503, 'DSH 原生会话执行服务不可用')
+    if (!controller?.prompt || !controller.resolveAgent || !ctx.get('systemPrompt')?.assemble) {
+      throw new StudioError(503, '当前 DSH Host 未提供所需的原生会话及指令装填接口')
+    }
     return controller
   }
 
@@ -121,8 +157,7 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
     const presets = ctx.get('agentPresets')
     const registry = (agent && presets?.serviceFor(agent, 'skills')) || ctx.get('skills')
     if (!registry?.get || !registry.list) throw new StudioError(503, 'DSH 原生全局 Skill 目录不可用')
-    // Web presets mount their filesystem provider in the preset scope.
-    // Omitting cwd excludes project roots from the native lookup.
+    // Omit cwd so same-named project files cannot replace the global binding.
     const query = ctx.get('sessionQuery')
     if (agent || !presets || !query) return read(registry, { scope: agent, signal: lifetime })
     const observation = await query.observeSession(sessionId)
@@ -146,10 +181,40 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
     throw new StudioError(409, `DSH 原生全局目录未加载 ${stage.skill}。请核对 Skill 名称和用户调用权限：${path}`)
   }
 
+  async function checkPromptScope(agent) {
+    const revision = promptRevision
+    if (verifiedScopes.get(agent) === revision) return
+    const assembly = await ctx.get('systemPrompt').assemble({ scope: agent, agent, [probeKey]: true })
+    if (!assembly.sections.some(section => section.name === stageSection)) {
+      throw new StudioError(409, '当前 DSH 会话预设锁定了完整系统指令，无法可靠装填阶段 Harness')
+    }
+    verifiedScopes.set(agent, revision)
+  }
+
+  async function loadCapabilities(agent, workflowId, stage) {
+    nativeController()
+    if (!ctx.tools.get('drama_save_artifact', agent) || !ctx.tools.get('drama_workflow_artifact', agent)) {
+      throw new StudioError(409, '当前 DSH Session 未启用阶段产物工具')
+    }
+    const paths = filePaths(await realpath(ctx.profileContext.home), workflowId, stage)
+    const [skill, harness, { renderSkillContent }] = await Promise.all([
+      localFile(paths.skillPath, 'Skill').then(() => globalSkills(agent.id,
+        (registry, options) => registry.get(stage.skill, options), agent)),
+      localFile(paths.harnessPath, 'Harness', true),
+      nativeSkillAPI(),
+      checkPromptScope(agent),
+    ])
+    const body = renderSkillContent(await checkNativeSkill(skill, stage, paths.skillPath))
+    return { skill: { body, sha256: sha256(body) }, harness }
+  }
+
+  async function readSession(sessionId, workspace, signal = lifetime) {
+    return kernel(sessionId, workspace, 'workflow_session', {}, signal, 'workflow')
+  }
+
   async function get(sessionId, workspace, input) {
     const view = await kernel(sessionId, workspace, 'workflow_get', input, lifetime, 'human')
-    const home = ctx.profileContext.home
-    const root = await realpath(home)
+    const root = await realpath(ctx.profileContext.home)
     let nativeCatalog
     return {
       ...view,
@@ -158,7 +223,8 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
         const results = await Promise.allSettled([
           (async () => {
             await localFile(paths.skillPath, 'Skill')
-            const skills = await (nativeCatalog ??= globalSkills(sessionId, (registry, options) => registry.list(options))).catch(() => {
+            const skills = await (nativeCatalog ??= globalSkills(sessionId,
+              (registry, options) => registry.list(options))).catch(() => {
               throw new StudioError(503, `DSH 原生全局 Skill 目录无法读取：${paths.skillPath}`)
             })
             await checkNativeSkill(skills.find(skill => skill.name === stage.skill), stage, paths.skillPath)
@@ -176,211 +242,311 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
     }
   }
 
-  function forget(run) {
-    if (run.finished && (run.ended || run.turn === undefined) && active.get(run.sessionId) === run) {
-      active.delete(run.sessionId)
+  async function resolveAgent(sessionId) {
+    const { agent } = await nativeController().resolveAgent(sessionId)
+    if (!agent) throw new StudioError(409, '无法打开指定的 DSH Session')
+    return agent
+  }
+
+  function publicFailure(error) {
+    return error instanceof StudioError ? error.message : 'DSH 无法执行当前阶段，请检查会话和模型设置'
+  }
+
+  async function recordKickoffFailure(kickoff, error) {
+    if (kickoffs.get(kickoff.sessionId) === kickoff) kickoffs.delete(kickoff.sessionId)
+    try {
+      await kernel(kickoff.sessionId, kickoff.workspace, 'workflow_kickoff_failed', {
+        operationId: randomUUID(), handoffId: kickoff.handoffId, error,
+      }, undefined, 'workflow')
+    } catch (failure) {
+      if (failure.status !== 409 && !lifetime.aborted) {
+        console.error('[my-drama-studio] Workflow kickoff', kickoff.handoffId, failure.message)
+      }
     }
   }
 
-  function finish(run, error) {
-    if (run.settlement) return run.settlement
-    const values = { runId: run.runId, ...(error ? { error } : { nodeIds: [...run.nodeIds] }) }
-    run.settlement = (async () => {
-      for (let attempt = 0; ; attempt++) {
-        try {
-          return await kernel(run.sessionId, run.workspace, 'workflow_finish', values, undefined, 'workflow')
-        } catch (failure) {
-          if (attempt >= 2 || failure.status < 500 || lifetime.aborted) throw failure
-          await delay(150 * (attempt + 1))
+  function finishTurn(turn, error) {
+    if (turn.settlement) return turn.settlement
+    turn.settlement = (async () => {
+      try {
+        await turn.prepared
+        if (!turn.started) {
+          if (turn.kickoff && error) await recordKickoffFailure(turn.kickoff, error)
+          else if (turn.stage && error && !lifetime.aborted) {
+            await kernel(turn.agent.id, turn.workspace, 'workflow_turn_failed', {
+              operationId: randomUUID(), stageId: turn.stage.id, error,
+            }, undefined, 'workflow')
+          }
+          return
         }
+        const input = { operationId: randomUUID(), runId: turn.runId, ...(error && { error }) }
+        for (let attempt = 0; ; attempt++) {
+          try {
+            return await kernel(turn.agent.id, turn.workspace, 'workflow_turn_finish', input, undefined, 'workflow')
+          } catch (failure) {
+            if (attempt >= 2 || failure.status < 500 || lifetime.aborted) throw failure
+            await delay(150 * (attempt + 1))
+          }
+        }
+      } catch (failure) {
+        if (!lifetime.aborted) console.error('[my-drama-studio] Workflow settlement', turn.runId, failure.message)
+      } finally {
+        if (turns.get(turn.agent.id) === turn) turns.delete(turn.agent.id)
       }
-    })().finally(() => {
-      run.finished = true
-      forget(run)
-    })
-    return run.settlement
+    })()
+    return turn.settlement
   }
 
-  function finishFromNative(run, error) {
-    void finish(run, error).catch(failure => {
-      console.error('[my-drama-studio] Workflow settlement', run.runId, failure.message)
-    })
+  async function prepareTurn(turn, signal) {
+    await turn.previous
+    if (turn.staleKickoff && !turn.hasChat) return
+    const { agent } = turn
+    try {
+      const workspace = await workspaceFor(ctx, agent.id)
+      turn.workspace = workspace
+      const { session, stage, workflowId } = await readSession(agent.id, workspace, signal)
+      if (turn.kickoff && (turn.kickoff.handoffId !== session.pendingHandoffId || !sameWorkspace(workspace, turn.kickoff.workspace))) {
+        await recordKickoffFailure(turn.kickoff, '交接启动请求已失效')
+        turn.kickoff = undefined
+        turn.staleKickoff = true
+        if (!turn.hasChat) return
+      }
+      if (!session.activeStageId) return
+      if (stage?.id !== session.activeStageId || !workflowId) throw new StudioError(503, '无法读取当前阶段定义')
+      turn.stage = stage
+      turn.workflowId = workflowId
+      turn.handoffId = turn.kickoff?.handoffId
+      Object.assign(turn, await loadCapabilities(agent, workflowId, stage))
+      const current = await workspaceFor(ctx, agent.id)
+      if (!sameWorkspace(current, workspace)) throw new StudioError(409, 'Session 的 Workspace 已切换')
+      signal.throwIfAborted()
+      turn.runId = randomUUID()
+      // Complete the write even if the Agent is cancelled during admission. Settlement
+      // then closes the same run instead of leaving SQLite in Running.
+      const input = {
+        operationId: turn.runId, runId: turn.runId, stageId: stage.id,
+        skillSha256: turn.skill.sha256, harnessSha256: turn.harness.sha256,
+        ...(turn.handoffId && { handoffId: turn.handoffId }),
+      }
+      const admit = () => kernel(agent.id, workspace, 'workflow_turn_start', input, lifetime, 'workflow')
+      const admitted = await admit().catch(error => {
+        if (error.status >= 500 && !lifetime.aborted) return admit()
+        throw error
+      })
+      turn.started = true
+      if (turn.kickoff && kickoffs.get(agent.id) === turn.kickoff) kickoffs.delete(agent.id)
+      turn.instructions = stageInstructions(turn, admitted)
+    } catch (error) {
+      if (!turn.workspace && !turn.kickoff && error.status === 404) return
+      if (!signal.aborted) turn.failure = publicFailure(error)
+    }
   }
 
-  ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
-    const run = active.get(agent.id)
-    if (run?.agent === agent && run.requestId === requestId(message)) run.turn = turn
+  ctx.on('agent/inbox/claimed', ({ agent, message, turn: number }) => {
+    let turn = turns.get(agent.id)
+    if (turn?.agent !== agent || turn.number !== number) {
+      turn = { agent, number, previous: turn?.settlement, nodeIds: new Set() }
+      turns.set(agent.id, turn)
+    }
+    if (!isKickoffMessage(message)) {
+      turn.hasChat = true
+      return
+    }
+    const kickoff = kickoffs.get(agent.id)
+    if (kickoff?.agent === agent && kickoff.requestId === requestId(message) &&
+        message.content.length === 1 && message.content[0].type === 'text' && message.content[0].text === kickoff.prompt) {
+      turn.kickoff = kickoff
+    } else {
+      turn.staleKickoff = true
+    }
   })
 
   ctx.on('agent/inbox/discarded', ({ agent, message }) => {
-    const run = active.get(agent.id)
-    if (run?.agent === agent && run.requestId === requestId(message)) finishFromNative(run, 'DSH 已移除等待执行的阶段任务')
+    const kickoff = kickoffs.get(agent.id)
+    if (kickoff?.agent === agent && kickoff.requestId === requestId(message)) {
+      void recordKickoffFailure(kickoff, 'DSH 已移除等待执行的交接任务')
+    }
   })
 
   ctx.on('agent/created', ({ agent }) => {
-    // DSH keeps queued messages across restart. Discard abandoned Studio input on resume.
+    // A restarted Host never replays a deferred transition. Pending kickoff is
+    // visible in Studio until the browser explicitly retries it.
     for (const message of [...agent.inbox.nextTurn, ...agent.inbox.nextStep]) {
-      if (isWorkflowMessage(message)) agent.inbox.remove(message.id)
+      if (isKickoffMessage(message)) agent.inbox.remove(message.id)
     }
   })
 
-  ctx.on('agent/pre-step', async ({ agent, messages, turn, signal }, next) => {
-    const message = messages.find(isWorkflowMessage)
-    const run = active.get(agent.id)
-    const ownTurn = run?.agent === agent && run.turn === turn && !run.ended
-    if (!message) {
-      if (!ownTurn || !run.running) return next()
-      const decision = await next()
-      // A user follow-up may invoke the same Skill through native slash handling.
-      return decision.kind === 'enter' ? { ...decision, messages: keepPinnedSkill(decision.messages, run) } : decision
+  ctx.on('system-prompt/change', () => { promptRevision++ })
+  ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
+    const revision = promptRevision
+    const assembly = await next()
+    if (context[probeKey]) {
+      return { ...assembly, sections: [...assembly.sections, { name: stageSection, text: '', interpolate: false }] }
     }
-    if (!ownTurn || run.requestId !== requestId(message) || run.settlement || lifetime.aborted) {
+    const { agent, signal } = context
+    const turn = agent && turns.get(agent.id)
+    if (signal && turn && turn.agent === agent && !turn.settlement) {
+      await (turn.prepared ??= prepareTurn(turn, signal))
+    }
+    if (signal && turn?.instructions && !turn.settlement) {
+      try {
+        await checkPromptScope(agent)
+        if (revision !== promptRevision) throw new StudioError(409, 'DSH 原生指令设置已更改，请重新发送本轮消息')
+        turn.promptRevision = revision
+        return {
+          ...assembly,
+          sections: [...assembly.sections, { name: stageSection, text: turn.instructions, interpolate: false }],
+          tools: assembly.tools.filter(tool => tool.name !== 'drama_submit' &&
+            (turn.stage.id !== generationStage || tool.name !== 'drama_append')),
+        }
+      } catch (error) {
+        turn.failure = publicFailure(error)
+      }
+    }
+    return { ...assembly, tools: assembly.tools.filter(tool => !artifactTools.has(tool.name)) }
+  }, { prepend: true })
+
+  ctx.on('agent/pre-step', async ({ agent, turn: number, step }, next) => {
+    const turn = turns.get(agent.id)
+    const ownTurn = turn?.agent === agent && turn.number === number
+    if (ownTurn && (turn.failure || turn.staleKickoff && !turn.hasChat)) return { kind: 'reject' }
+    const decision = await next()
+    if (ownTurn && turn.instructions && turn.promptRevision !== promptRevision) {
+      turn.failure = 'DSH 原生指令设置已更改，请重新发送本轮消息'
       return { kind: 'reject' }
     }
-    try {
-      if (message.content.length !== 1 || message.content[0].type !== 'text' || message.content[0].text !== run.prompt) {
-        throw new StudioError(409, '原生对话队列中的阶段指令已被修改，请重新启动')
-      }
-      const workspace = await workspaceFor(ctx, agent.id)
-      if (workspace.id !== run.workspace.id || workspace.path !== run.workspace.path) {
-        throw new StudioError(409, 'Session 的 Workspace 已切换')
-      }
-      const decision = await next()
-      if (decision.kind === 'reject') return decision
-      const admission = await kernel(run.sessionId, run.workspace, 'workflow_running', {
-        runId: run.runId, skillSha256: run.skillSha256, harnessSha256: run.harnessSha256,
-      }, signal, 'workflow')
-      if (admission.status !== 'running') throw new StudioError(409, '阶段启动预留已失效，请重新启动')
-      run.running = true
-      return { ...decision, messages: [...keepPinnedSkill(decision.messages, run), run.skillMessage] }
-    } catch (error) {
-      if (!signal.aborted) run.failure = error instanceof StudioError ? error.message : '无法记录 DSH Agent 已启动'
-      return { kind: 'reject' }
+    if (decision.kind === 'reject') return decision
+    const messages = ownTurn ? decision.messages.filter(message => {
+      if (isKickoffMessage(message)) return requestId(message) === turn.kickoff?.requestId
+      return !turn.instructions || message.source?.kind !== 'skill-invocation' || message.source.name !== turn.stage.skill
+    }) : decision.messages
+    // DeepSeek can retain old system messages in its request series. A new
+    // series makes the native loop replace them when switching, exiting or
+    // beginning a stage turn with updated confirmed inputs.
+    if (step === 1 && ((ownTurn && turn.instructions) || needsPromptReplacement(agent.session))) {
+      return { ...decision, messages, startsRequestSeries: true }
     }
+    return { ...decision, messages }
   }, { prepend: true })
 
   ctx.on('session/event', (session, event) => {
-    const run = active.get(session.id)
-    if (!run || run.agent?.session !== session || run.turn === undefined || run.ended) return
-    const { type, data } = event
-    if (type === 'user/message' && data.id === run.skillMessage?.id) run.skillLoaded = true
-    if (data?.turn !== run.turn) return
-    if (type === 'tool/call' && data.name === 'drama_append') run.appendCalls.add(data.callId)
-    if (type === 'tool/result' && run.appendCalls.delete(data.message.toolCallId) && !data.message.isError) {
-      for (const id of outputIds(data.message)) run.nodeIds.add(id)
+    const turn = turns.get(session.id)
+    if (event.type === 'turn/end' && turn?.agent.session === session && event.data.turn === turn.number) {
+      void finishTurn(turn, turn.failure ?? endError(event.data.reason))
     }
-    if (type !== 'turn/end') return
-    run.ended = true
-    forget(run)
-    const error = run.failure ?? (data.reason.kind !== 'completed' ? endError(data.reason)
-      : !run.skillLoaded ? `DSH 未载入阶段 Skill：${run.skillPath}`
-        : run.stage.id !== generationStage && !run.nodeIds.size ? '阶段没有通过 drama_append 产出可验收的 Canvas 节点' : undefined)
-    finishFromNative(run, error)
   })
 
   ctx.on('agent/disposed', ({ agent }) => {
-    const run = active.get(agent.id)
-    if (run?.agent !== agent) return
-    run.ended = true
-    forget(run)
-    finishFromNative(run, 'DSH Agent 会话已释放')
+    const turn = turns.get(agent.id)
+    if (turn?.agent === agent) void finishTurn(turn, 'DSH Agent 会话已释放')
+    const kickoff = kickoffs.get(agent.id)
+    if (kickoff?.agent === agent) void recordKickoffFailure(kickoff, 'DSH Agent 会话已释放')
   })
 
   ctx.effect(() => async () => {
-    await Promise.allSettled([...active.values()].map(async run => {
-      if (!run.settlement && run.agent) {
-        const pending = [...run.agent.inbox.nextTurn, ...run.agent.inbox.nextStep]
-          .find(message => requestId(message) === run.requestId)
-        if (pending) run.agent.inbox.remove(pending.id)
-        else if (run.turn !== undefined) nativeController().cancel({ sessionId: run.sessionId })
-      }
-      await finish(run, 'Studio Host 已退出，阶段执行中断')
-    }))
+    await Promise.allSettled([...turns.values()].map(turn => finishTurn(turn, 'Studio Host 已退出，当前执行中断')))
   })
 
   ctx.effect(() => ctx.tools.guard(exec => {
     if (exec.name !== 'skill' || !exec.agent) return
-    const run = active.get(exec.agent.id)
-    if (run?.agent === exec.agent && run.running && !run.ended && exec.arguments?.name === run.stage.skill) {
-      return '当前工作流固定使用启动时的 Skill 快照，请使用原生会话中已注入的阶段指令'
+    const turn = turns.get(exec.agent.id)
+    if (turn?.agent === exec.agent && turn.started && !turn.settlement && exec.arguments?.name === turn.stage.skill) {
+      return '当前阶段已通过 DSH 加载全局 Skill，继续使用本轮系统指令中的版本'
     }
   }))
 
   function authorizeTool(agent, workspace, action, data) {
-    const run = active.get(agent.id)
-    if (run?.agent !== agent || run.turn === undefined || run.ended) return
-    if (action === 'submit') throw new StudioError(403, '工作流阶段不授权模型生成，请在 Canvas 中独立确认提交')
-    if (workspace.id !== run.workspace.id || workspace.path !== run.workspace.path) {
-      throw new StudioError(409, 'Session 的 Workspace 已切换')
+    const turn = turns.get(agent.id)
+    const running = turn?.agent === agent && turn.started && !turn.settlement
+    if (!running) {
+      if (action === 'workflow_save_artifact' || action === 'workflow_artifact_get') {
+        throw new StudioError(403, '请先激活阶段，并在当前 Session 的对话中操作阶段产物')
+      }
+      return
     }
+    if (!sameWorkspace(workspace, turn.workspace)) throw new StudioError(409, 'Session 的 Workspace 已切换')
+    if (action === 'workflow_save_artifact') return { ...data, runId: turn.runId }
+    if (action === 'workflow_artifact_get') return data
+    if (action === 'submit') throw new StudioError(403, '工作流阶段不授权模型生成，请在 Canvas 中独立确认提交')
     if (action !== 'append') return
-    if (run.stage.id === generationStage) throw new StudioError(403, '视频生成阶段只读取经 Canvas 授权生成的结果')
-    if (!run.running || !run.skillLoaded || run.settlement) {
-      throw new StudioError(403, 'DSH 必须载入阶段 Skill 后才可追加产物')
+    if (turn.stage.id === generationStage) throw new StudioError(403, '视频生成阶段只读取经 Canvas 授权生成的结果')
+    if (data.nodes?.some(node => documentNodes.has(node.type))) {
+      throw new StudioError(403, '请使用 drama_save_artifact 保存文档成果')
     }
     const additions = new Set((data.nodes ?? []).map(node => node.id))
-    if (data.edges?.some(edge => !additions.has(edge.target) && !run.nodeIds.has(edge.target))) {
-      throw new StudioError(403, '工作流连线只允许指向本轮新建节点')
+    if (data.edges?.some(edge => !additions.has(edge.target) && !turn.nodeIds.has(edge.target))) {
+      throw new StudioError(403, '当前工作流阶段的连线只允许指向本轮新建节点')
     }
   }
 
-  async function start(sessionId, workspace, input) {
-    const reservation = await kernel(sessionId, workspace, 'workflow_reserve', input, lifetime, 'workflow')
-    const { runId, duplicate, stage, inputs, generationResults, workflowId, workflowName,
-      workspaceId, canvasId, definitionVersion } = reservation
-    if (duplicate) return { runId }
-    const run = { sessionId, workspace, runId, stage, requestId: requestPrefix + runId, appendCalls: new Set(), nodeIds: new Set() }
+  function trackToolResult(agent, action, result) {
+    const turn = turns.get(agent.id)
+    if (action === 'append' && turn?.agent === agent && turn.started && !turn.settlement) {
+      for (const id of result.ids ?? []) turn.nodeIds.add(id)
+    }
+  }
+
+  async function activate(sessionId, workspace, input) {
+    const { operationId, stageId } = input
+    let versions
+    if (stageId) {
+      const view = await kernel(sessionId, workspace, 'workflow_get', {}, lifetime, 'human')
+      const stage = view.stages.find(item => item.id === stageId)
+      if (!stage) throw new StudioError(400, '未知的工作流阶段')
+      const agent = await resolveAgent(sessionId)
+      const { skill, harness } = await loadCapabilities(agent, view.id, stage)
+      versions = { skillSha256: skill.sha256, harnessSha256: harness.sha256 }
+    }
+    const current = await workspaceFor(ctx, sessionId)
+    if (!sameWorkspace(current, workspace)) throw new StudioError(409, 'Session 的 Workspace 已切换')
+    return kernel(sessionId, workspace, 'workflow_activate', { operationId, stageId, ...versions }, lifetime, 'human')
+  }
+
+  async function submitKickoff(kickoff) {
+    const { sessionId, workspace, handoffId } = kickoff
     try {
-      if (active.has(sessionId)) throw new StudioError(409, '当前 Session 正在执行一个工作流阶段')
-      active.set(sessionId, run)
-      const controller = nativeController()
-      const { agent } = await controller.resolveAgent(sessionId)
-      if (!agent) throw new StudioError(409, '无法打开指定的 DSH Session')
-      run.agent = agent
-      const home = ctx.profileContext.home
-      const { skillPath, harnessPath } = filePaths(await realpath(home), workflowId, stage)
-      run.skillPath = skillPath
-      const [skill, harness, { renderSkillContent, createUserMessage }] = await Promise.all([
-        localFile(skillPath, 'Skill').then(() => globalSkills(sessionId, (registry, options) => registry.get(stage.skill, options), agent)),
-        localFile(harnessPath, 'Harness', true),
-        nativeSkillAPI(),
-      ])
-      const skillContent = renderSkillContent(await checkNativeSkill(skill, stage, skillPath))
-      run.skillSha256 = sha256(skillContent)
-      run.harnessSha256 = harness.sha256
-      run.skillMessage = createUserMessage({
-        content: [{ type: 'text', text: skillContent }],
-        source: { kind: 'skill-invocation', name: stage.skill, form: 'instructions' },
-      })
-      const generation = stage.id === generationStage
-      if (generation && !generationResults?.length) throw new StudioError(409, '请先在 Canvas 逐项确认并完成视频生成')
-      const tools = toolNames.filter(name => (!generation || name !== 'drama_append') && ctx.tools.get(name, agent))
-      if (!generation && !tools.includes('drama_append')) throw new StudioError(409, '当前 DSH Session 未启用 drama_append')
+      const { session, stage, workflowId } = await readSession(sessionId, workspace)
+      if (session.pendingHandoffId !== handoffId || !stage) {
+        if (kickoffs.get(sessionId) === kickoff) kickoffs.delete(sessionId)
+        return { session }
+      }
+      kickoff.agent = await resolveAgent(sessionId)
+      await loadCapabilities(kickoff.agent, workflowId, stage)
       const current = await workspaceFor(ctx, sessionId)
-      if (current.id !== workspace.id || current.path !== workspace.path) {
-        throw new StudioError(409, 'Session 的 Workspace 已切换')
-      }
-      if (agent.status !== 'idle' || agent.inbox.nextTurn.length || agent.inbox.nextStep.length) {
-        throw new StudioError(409, '当前 DSH Session 仍有任务，请在会话空闲且队列清空后重试')
-      }
-      run.prompt = [
-        '执行 Drama Studio 当前工作流阶段。沿用已注入的 Skill 快照。按已确认的节点 ID 读取所需输入并核对 revision。',
-        JSON.stringify({ workspace: { id: workspaceId, path: workspace.path, canvasId },
-          workflow: { id: workflowId, name: workflowName, definitionVersion }, stage: { id: stage.id, name: stage.name, runId },
-          skill: stage.skill, harnessPath, harness: harness.body, approvedInputs: inputs, generationResults, studioTools: tools }).replaceAll('/', '\\/'),
-        generation ? '核对 Canvas 已独立授权并完成的视频结果。只读取并报告，Studio 将自动关联实际生成的视频节点。'
-          : '使用 drama_append 新增应交付的产物节点。新连线只指向本轮新建节点，可以复用已有媒体作为来源。只创建视频草稿和所需媒体引用。',
-      ].join('\n')
-      const admission = await controller.prompt({ sessionId, requestId: run.requestId, mode: 'queue',
-        content: [{ type: 'text', text: run.prompt }] }, lifetime)
-      if (!admission?.accepted) throw new StudioError(409, 'DSH 未接受阶段任务')
-      return { runId }
+      if (!sameWorkspace(current, workspace)) throw new StudioError(409, 'Session 的 Workspace 已切换')
+      kickoff.prompt = `已确认交接。请开始「${stage.name}」，从已确认的交接包和固定产物版本读取所需信息，按当前阶段规则开展第一轮工作。`
+      const admission = await nativeController().prompt({
+        sessionId, requestId: kickoff.requestId, mode: 'queue', content: [{ type: 'text', text: kickoff.prompt }],
+      }, lifetime)
+      if (!admission?.accepted) throw new StudioError(409, 'DSH 未接受交接任务')
     } catch (error) {
-      const failure = error instanceof StudioError ? error : new StudioError(409, 'DSH 无法启动阶段，请检查会话及模型设置')
-      await finish(run, failure.message)
-      throw failure
+      await recordKickoffFailure(kickoff, publicFailure(error))
     }
+    return readSession(sessionId, workspace)
   }
 
-  return { get, start, authorizeTool }
+  function kickoff(sessionId, workspace, handoffId) {
+    const current = kickoffs.get(sessionId)
+    if (current?.handoffId === handoffId && sameWorkspace(workspace, current.workspace)) return current.accepted
+    const delivery = { sessionId, workspace, handoffId, requestId: requestPrefix + handoffId + ':' + randomUUID() }
+    kickoffs.set(sessionId, delivery)
+    delivery.accepted = submitKickoff(delivery)
+    return delivery.accepted
+  }
+
+  async function confirm(sessionId, workspace, input) {
+    const handoff = await kernel(sessionId, workspace, 'workflow_handoff_confirm', input, lifetime, 'human')
+    const { session } = await readSession(sessionId, workspace)
+    if (session.pendingHandoffId !== handoff.handoffId) return { handoff, session }
+    const next = await kickoff(sessionId, workspace, handoff.handoffId)
+    return { handoff, session: next.session }
+  }
+
+  async function retry(sessionId, workspace, handoffId) {
+    const { session } = await readSession(sessionId, workspace)
+    if (!handoffId || session.pendingHandoffId !== handoffId) throw new StudioError(409, '当前 Session 没有待启动的该次交接')
+    return kickoff(sessionId, workspace, handoffId)
+  }
+
+  return { get, activate, confirm, retry, authorizeTool, trackToolResult }
 }

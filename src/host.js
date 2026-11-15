@@ -76,10 +76,11 @@ function route(ctx, path, run, method = 'POST', rawBody = false) {
 }
 
 const humanEdits = new Set(['update_node', 'delete_node', 'update_edge', 'delete_edge', 'canvas_delete', 'canvas_restore'])
-const workflowActions = new Set(['workflow_approve', 'workflow_return'])
+const workflowActions = new Set(['workflow_handoff_preview'])
 const manualSubmissions = new Set(['submit_manual', 'generateT2V', 'generateI2V', 'generateR2V', 'generateV2V'])
 const browserActions = new Set(['context', 'bind', 'disconnect', 'query', 'append', 'permission', 'tasks',
-  'cancel_task', 'resume_task', 'workflow_get', 'workflow_start', ...humanEdits, ...workflowActions, ...manualSubmissions])
+  'cancel_task', 'resume_task', 'workflow_get', 'workflow_activate', 'workflow_handoff_confirm', 'workflow_handoff_retry',
+  ...humanEdits, ...workflowActions, ...manualSubmissions])
 
 export async function apply(ctx, config) {
   const activity = new EventEmitter().setMaxListeners(0)
@@ -153,7 +154,9 @@ export async function apply(ctx, config) {
     const { sessionId, workspace } = await verify(ticket, peer)
     const input = action === 'context' ? keys(data ?? {}) : keysData(data)
     if (action === 'workflow_get') return workflow.get(sessionId, workspace, input)
-    if (action === 'workflow_start') return workflow.start(sessionId, workspace, input)
+    if (action === 'workflow_activate') return workflow.activate(sessionId, workspace, keys(input, 'operationId', 'stageId'))
+    if (action === 'workflow_handoff_confirm') return workflow.confirm(sessionId, workspace, keys(input, 'operationId', 'handoffId'))
+    if (action === 'workflow_handoff_retry') return workflow.retry(sessionId, workspace, keys(input, 'handoffId').handoffId)
     if (humanEdits.has(action) || workflowActions.has(action) || action === 'append') {
       return kernel(sessionId, workspace, action, input, undefined, 'human')
     }
@@ -253,8 +256,19 @@ export async function apply(ctx, config) {
   })
 
   route(ctx, '/api/drama/media', async (body, peer, req, res) => {
-    const { ticket, id, type, assetId } = keys(body, 'ticket', 'id', 'type', 'assetId')
+    const { ticket, id, type, assetId, artifactId, version } = keys(body, 'ticket', 'id', 'type', 'assetId', 'artifactId', 'version')
     const { sessionId, workspace } = await verify(ticket, peer)
+    if (artifactId !== undefined || version !== undefined) {
+      const revision = Number(version)
+      if (!artifactId || !Number.isSafeInteger(revision) || revision < 1 || id !== undefined || type !== undefined || assetId !== undefined) {
+        throw new StudioError(400, 'Artifact ID and version are required')
+      }
+      const { node } = await kernel(sessionId, workspace, 'workflow_artifact_get', { artifactId, version: revision }, undefined, 'human')
+      if (node?.content?.assetId && !node.content.path) {
+        return streamImportedMedia(req, res, workspace.path, node.type, node.content.assetId)
+      }
+      return streamMedia(req, res, workspace.path, node?.type, node?.content?.path)
+    }
     if (assetId !== undefined) {
       if (id !== undefined || !type) throw new StudioError(400, 'Media type and asset id are required')
       if (!(await kernel(sessionId, workspace, 'context')).connected) throw new StudioError(403, '请先连接当前会话与画布')
@@ -266,7 +280,7 @@ export async function apply(ctx, config) {
     return streamMedia(req, res, workspace.path, node?.type, node?.content.path)
   }, 'GET')
 
-  registerTools(ctx, workspaceFor, kernel, keys, workflow.authorizeTool)
+  registerTools(ctx, workspaceFor, kernel, keys, workflow)
   void recoverWorkspaces(ctx, kernel, lifetime.signal)
   console.info('[my-drama-studio] My Drama Studio Host loaded')
 }

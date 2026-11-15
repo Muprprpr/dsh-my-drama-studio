@@ -15,8 +15,8 @@ export const inject = ['agents', 'connection', 'llm', 'sessionController', 'tool
 
 const provider = 'drama-fixture'
 const model = 'scripted'
-const restartStage = 'content-analysis'
-const restartSkill = 'drama-' + restartStage
+const sourceStage = 'content-analysis'
+const restartStage = 'shooting-script'
 
 export function apply(ctx) {
   const life = new AbortController()
@@ -188,22 +188,22 @@ async function verify(ctx, signal) {
     assert.equal(restored.status.autoGenerate, false)
     assert.equal(restored.status.aiRunning, false, 'An interrupted native turn was treated as a persistent lock')
     const workflow = await until(async () => {
-      const view = await readWorkflow(restored.ticket)
-      return view.stages[0]?.status === 'failed' && view
+      const view = await readWorkflow((await init(state.executorSessionId)).ticket)
+      return view.session.status === 'failed' && view
     }, signal, 'interrupted Workflow recovery')
     assert.equal(workflow.id, state.workflowId)
-    assert.equal(workflow.stages[0].id, state.stageId)
-    assert.equal(workflow.stages[0].runId, state.runId)
-    assert.equal(workflow.stages[0].skill, restartSkill)
-    assert.equal(workflow.stages[0].sessionId, state.executorSessionId)
-    assert.equal(workflow.stages[0].workspaceId, state.workspaceId)
-    assert.equal(workflow.stages[0].canvasId, state.canvasId)
-    assert.equal(workflow.stages[0].definitionVersion, 1)
-    assert.equal(workflow.stages[0].skillSha256, state.skillSha256)
-    assert.equal(workflow.stages[0].harnessSha256, state.harnessSha256)
-    assert.equal(workflow.stages[0].files.harnessReady, true)
-    assert.equal(workflow.stages[0].files.skillReady, true)
-    assert.ok(workflow.stages[0].error)
+    assert.equal(workflow.session.activeStageId, restartStage)
+    assert.ok(workflow.session.error)
+    assert.equal(workflow.stages[0].status, 'handed_off')
+    assert.equal(workflow.stages[1].status, 'not_started')
+    assert.ok(workflow.stages[1].files.harnessReady && workflow.stages[1].files.skillReady)
+    assert.equal(workflow.handoffs.length, 1)
+    assert.equal(workflow.handoffs[0].handoffId, state.handoffId)
+    assert.equal(workflow.handoffs[0].sourceSessionId, state.executorSessionId)
+    assert.equal(workflow.artifacts.find(item => item.artifactId === state.artifactId)?.content, 'Restart fixture: pinned analysis')
+    const otherView = await readWorkflow(restored.ticket)
+    assert.equal(otherView.session.status, 'normal')
+    assert.equal(otherView.handoffs[0].handoffId, state.handoffId)
     const [note] = (await ok(await request('operation', {
       ticket: restored.ticket, action: 'query', data: { id: state.noteId },
     }), 'read note after restart')).nodes
@@ -220,12 +220,15 @@ async function verify(ctx, signal) {
   }
 
   await mkdir(workspacePath, { recursive: true })
-  const skillPath = join(process.env.DSH_HOME, 'skills', restartSkill)
-  const harnessPath = join(process.env.DSH_HOME, 'drama-studio', 'workflows', 'drama-production', 'stages', restartStage)
-  await mkdir(skillPath, { recursive: true })
-  await mkdir(harnessPath, { recursive: true })
-  await writeFile(join(skillPath, 'SKILL.md'), `---\nname: ${restartSkill}\ndescription: Verify Workflow interruptions.\n---\nCreate a Canvas note.\n`)
-  await writeFile(join(harnessPath, 'harness.md'), 'Keep output on the project Canvas.')
+  for (const stage of [sourceStage, restartStage]) {
+    const skill = 'drama-' + stage
+    const skillPath = join(process.env.DSH_HOME, 'skills', skill)
+    const harnessPath = join(process.env.DSH_HOME, 'drama-studio', 'workflows', 'drama-production', 'stages', stage)
+    await mkdir(skillPath, { recursive: true })
+    await mkdir(harnessPath, { recursive: true })
+    await writeFile(join(skillPath, 'SKILL.md'), `---\nname: ${skill}\ndescription: Verify Workflow interruptions.\n---\nSave a draft.\n`)
+    await writeFile(join(harnessPath, 'harness.md'), 'Keep the draft scoped to the current stage.')
+  }
   const workspace = await ctx.workspaceRegistry.create(workspacePath)
   const a = (await sessions.create({ workspaceId: workspace.id })).sessionId
   const b = (await sessions.create({ workspaceId: workspace.id })).sessionId
@@ -436,38 +439,41 @@ async function verify(ctx, signal) {
   await op(rebound.ticket, 'update_node', edit(noteId, 3, 'Editable after Agent disposal'))
 
   const saved = await readWorkflow(aBound.ticket)
-  const stageId = saved.stages[0].id
-  assert.equal(stageId, restartStage)
+  assert.equal(saved.session.status, 'normal')
+  await op(aBound.ticket, 'workflow_activate', { stageId: sourceStage })
   await op(aBound.ticket, 'permission', { enabled: true })
+  const artifact = await succeed(a, 'drama_save_artifact', {
+    operationId: randomUUID(), title: 'Restart analysis', content: 'Restart fixture: pinned analysis',
+  })
+  await until(async () => (await readWorkflow(aBound.ticket)).session.status === 'active', signal, 'source turn settled')
+  const preview = await op(aBound.ticket, 'workflow_handoff_preview', { stageId: sourceStage })
   const hold = { entered: false, release: new EventTarget() }
   script.push({ hold })
-  const { runId } = await op(aBound.ticket, 'workflow_start', { stageId, revision: saved.revision })
+  await op(aBound.ticket, 'workflow_handoff_confirm', { handoffId: preview.handoffId })
   await until(() => hold.entered, signal, 'running native Workflow turn')
-  const running = await readWorkflow(rebound.ticket)
-  assert.equal(running.stages[0].status, 'running')
-  assert.equal(running.stages[0].runId, runId)
-  assert.match(running.stages[0].skillSha256, /^[a-f0-9]{64}$/u)
-  assert.match(running.stages[0].harnessSha256, /^[a-f0-9]{64}$/u)
+  const running = await readWorkflow(aBound.ticket)
+  assert.equal(running.session.status, 'running')
+  assert.equal(running.session.activeStageId, restartStage)
+  assert.equal(running.stages[0].status, 'handed_off')
+  assert.equal((await readWorkflow(rebound.ticket)).session.status, 'normal')
   const workflowAgent = ctx.agents.get(a)
   const workflowTool = (name, args) => ctx.tools.execute({ agent: workflowAgent, callId: randomUUID(), name,
     arguments: { operationId: randomUUID(), ...args }, signal })
   const oldTarget = await workflowTool('drama_append', { edges: [{ source: noteId, target: linkId }] })
   assert.equal(oldTarget.isError, true)
-  assert.match(oldTarget.content[0].text, /工作流连线只允许指向本轮新建节点/u)
+  assert.match(oldTarget.content[0].text, /阶段.*连线/u)
   const workflowSubmit = await workflowTool('drama_submit', { nodeId: video.id })
   assert.equal(workflowSubmit.isError, true)
-  assert.match(workflowSubmit.content[0].text, /工作流阶段不授权模型生成/u)
-  const loadSkill = async sessionId => ctx.tools.execute({ agent: (await sessions.resolveAgent(sessionId)).agent,
-    callId: randomUUID(), name: 'skill', arguments: { name: restartSkill }, signal })
-  assert.match((await loadSkill(a)).content[0].text, /固定使用启动时的 Skill 快照/u)
-  assert.equal((await loadSkill(b)).isError, false, 'The Workflow pin blocked an ordinary Session Skill load')
+  assert.match(workflowSubmit.content[0].text, /阶段.*生成/u)
+  for (const action of ['approve', 'handoff', 'activate']) {
+    assert.equal(ctx.tools.get('drama_workflow_' + action, workflowAgent), undefined)
+  }
   await locked(rebound.ticket, 'delete_node', { id: noteId, revision: 4 })
   await writeFile(statePath, JSON.stringify({
     sessionId: b, canvasId: rebound.status.canvasId, ticket: rebound.ticket, videoId: video.id, noteId,
-    workflowId: saved.id, stageId, runId, workspaceId: workspace.id, executorSessionId: a,
-    skillSha256: running.stages[0].skillSha256, harnessSha256: running.stages[0].harnessSha256,
+    workflowId: saved.id, executorSessionId: a, handoffId: preview.handoffId, artifactId: artifact.artifactId,
   }))
-  console.info(`[drama-agent-fixture] PASS native Agent: canvas-wide locks, append while active, overlapping turns, other Workspace isolation, cancel/error/dispose unlock, Agent update/delete rejected, Workflow old-target and submit rejected, held Workflow at restart (${nativeCalls} native tool calls)`)
+  console.info(`[drama-agent-fixture] PASS native Agent: canvas-wide locks, append while active, overlapping turns, other Workspace isolation, cancel/error/dispose unlock, Agent update/delete rejected, Workflow submit rejected, confirmed handoff and held target turn at restart (${nativeCalls} native tool calls)`)
 }
 
 async function until(check, signal, label, timeout = 15_000) {

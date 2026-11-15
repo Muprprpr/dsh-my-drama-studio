@@ -22,16 +22,24 @@ const append = {
   edges: { type: 'array', items: edge },
 }
 
-export function registerTools(ctx, workspaceFor, kernel, keys, authorizeWorkflowTool) {
-  for (const [action, description, parameters] of [
+export function registerTools(ctx, workspaceFor, kernel, keys, workflow) {
+  for (const [action, description, parameters, name = `drama_${action}`] of [
     ['context', 'Read the current native Session, its Workspace Canvas binding and generation permission.', object({})],
     ['query', 'Read shared creative nodes and references for this Session’s Canvas. Filter by shot, type or source Session.', object(query)],
     ['append', 'Append creative nodes and references atomically. To revise a node as an Agent, append a new node with basedOn. Video prompts must be complete and inline, with only real media inputs.', object(append, ['operationId'])],
     ['submit', 'Submit a snapshot of an image or video draft by node ID. The current Session must already have automatic generation permission. Omit profileId to use the draft preset or the configured mode default.', object({ operationId: string, nodeId: string, profileId: string }, ['operationId', 'nodeId'])],
     ['tasks', 'Read generation task states for this Session’s shared Canvas.', object({})],
+    ['workflow_save_artifact', 'Save a versioned draft for the current stage. Set exactly one of content (Markdown document) or nodeId (existing Canvas media, prompt or generation node). To revise a draft, provide its artifactId and current expectedVersion. Use a unique operationId and reuse it when retrying a write.', object({
+      operationId: string, title: string, content: string, nodeId: string, artifactId: string,
+      expectedVersion: { type: 'integer', minimum: 1 }, summary: string,
+      confirmedDecisions: { type: 'array', items: string }, constraints: { type: 'array', items: string },
+    }, ['operationId', 'title']), 'drama_save_artifact'],
+    ['workflow_artifact_get', 'Read an exact version of an available stage artifact using the artifactId supplied in the stage instructions or by the save tool.', object({
+      artifactId: string, version: { type: 'integer', minimum: 1 },
+    }, ['artifactId', 'version']), 'drama_workflow_artifact'],
   ]) {
     ctx.tools.register({
-      name: `drama_${action}`,
+      name,
       description,
       parameters,
       output: {
@@ -43,8 +51,10 @@ export function registerTools(ctx, workspaceFor, kernel, keys, authorizeWorkflow
         const sessionId = exec.agent?.session.id
         if (!sessionId) throw new StudioError(403, 'A native DSH Agent Session is required')
         const workspace = await workspaceFor(ctx, sessionId)
-        authorizeWorkflowTool(exec.agent, workspace, action, data)
-        const result = await kernel(sessionId, workspace, action, data, exec.signal)
+        const workflowData = workflow.authorizeTool(exec.agent, workspace, action, data)
+        const result = await kernel(sessionId, workspace, action, workflowData ?? data,
+          exec.signal, workflowData ? 'workflow' : undefined)
+        workflow.trackToolResult(exec.agent, action, result)
         return action === 'context' ? { ...result, workspacePath: workspace.path } : result
       },
     })
