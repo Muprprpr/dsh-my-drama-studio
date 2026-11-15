@@ -434,11 +434,12 @@ func generationInput(ctx context.Context, tx *sql.Tx, workspace, id, kind, snaps
 
 func mediaGenerationReference(asset NodeInput) (GenerationReference, error) {
 	var media struct{ URL, Path string }
-	if json.Unmarshal(asset.Content, &media) != nil || (!providerURL(media.URL) && media.Path == "") {
+	if json.Unmarshal(asset.Content, &media) != nil || (media.Path == "" && !providerURL(media.URL)) {
 		return GenerationReference{}, invalid("模型参考素材需要项目内媒体或可访问的外部 HTTP/HTTPS URL")
 	}
 	ref := GenerationReference{Type: asset.Type, Path: media.Path}
-	if providerURL(media.URL) {
+	// Match canvas previews, which prefer the project file when both are set.
+	if ref.Path == "" {
 		ref.URL = media.URL
 	}
 	return ref, nil

@@ -757,7 +757,7 @@ func validateVideo(ctx context.Context, tx *sql.Tx, id string, draft bool) error
 		}
 	}
 	if doc != nil {
-		plain, err := doc.render(func(assetMention) (string, error) { return "", nil })
+		plain, err := doc.render(false, func(assetMention) (string, error) { return "", nil })
 		if err != nil {
 			return err
 		}

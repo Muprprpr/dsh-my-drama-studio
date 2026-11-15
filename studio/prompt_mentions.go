@@ -36,11 +36,11 @@ func parsePromptDoc(raw json.RawMessage) (*promptElement, error) {
 	if err := json.Unmarshal(raw, &doc); err != nil || doc.Type != "doc" || doc.Text != "" || len(doc.Attrs) != 0 {
 		return nil, invalid("提示词文档格式无效")
 	}
-	_, err := doc.render(func(assetMention) (string, error) { return "", nil })
+	_, err := doc.render(false, func(assetMention) (string, error) { return "", nil })
 	return &doc, err
 }
 
-func (doc *promptElement) render(mention func(assetMention) (string, error)) (string, error) {
+func (doc *promptElement) render(numberedMentions bool, mention func(assetMention) (string, error)) (string, error) {
 	var prompt strings.Builder
 	for index, paragraph := range doc.Content {
 		if paragraph.Type != "paragraph" || paragraph.Text != "" || len(paragraph.Attrs) != 0 {
@@ -49,6 +49,7 @@ func (doc *promptElement) render(mention func(assetMention) (string, error)) (st
 		if index > 0 {
 			prompt.WriteByte('\n')
 		}
+		afterOrdinal := false
 		for _, part := range paragraph.Content {
 			if len(part.Content) != 0 {
 				return "", invalid("提示词行内内容格式无效")
@@ -58,12 +59,19 @@ func (doc *promptElement) render(mention func(assetMention) (string, error)) (st
 				if len(part.Attrs) != 0 {
 					return "", invalid("提示词文本格式无效")
 				}
+				if part.Text != "" {
+					if afterOrdinal && part.Text[0] >= '0' && part.Text[0] <= '9' {
+						prompt.WriteByte(' ')
+					}
+					afterOrdinal = false
+				}
 				prompt.WriteString(part.Text)
 			case "hardBreak":
 				if part.Text != "" || len(part.Attrs) != 0 {
 					return "", invalid("提示词换行格式无效")
 				}
 				prompt.WriteByte('\n')
+				afterOrdinal = false
 			case "assetMention":
 				data, err := parseAssetMention(part.Attrs)
 				if err != nil || part.Text != "" {
@@ -74,6 +82,7 @@ func (doc *promptElement) render(mention func(assetMention) (string, error)) (st
 					return "", err
 				}
 				prompt.WriteString(token)
+				afterOrdinal = numberedMentions
 			default:
 				return "", invalid("提示词文档包含不支持的行内内容")
 			}
@@ -111,7 +120,7 @@ func normalizePromptDoc(kind string, raw json.RawMessage) (json.RawMessage, erro
 		// Prompt notes preserve their existing text/description/prompt field.
 		return raw, err
 	}
-	plain, err := doc.render(func(data assetMention) (string, error) {
+	plain, err := doc.render(false, func(data assetMention) (string, error) {
 		label := data.Label
 		if label == "" {
 			label = assetMentionLabels[data.AssetType]
@@ -172,7 +181,7 @@ func compileAssetMentions(ctx context.Context, tx *sql.Tx, workspace string, tar
 	var sources []string
 	targetRef, _ := mediaGenerationReference(target)
 	ordinals := make(map[assetMention]string)
-	prompt, err := doc.render(func(mention assetMention) (string, error) {
+	prompt, err := doc.render(true, func(mention assetMention) (string, error) {
 		key := assetMention{AssetType: mention.AssetType, AssetID: mention.AssetID}
 		if token, ok := ordinals[key]; ok {
 			return token, nil
@@ -231,7 +240,7 @@ func (p *project) projectMentionedAssets(ctx context.Context, tx *sql.Tx, result
 		if err != nil || doc == nil {
 			continue
 		}
-		_, err = doc.render(func(mention assetMention) (string, error) {
+		_, err = doc.render(false, func(mention assetMention) (string, error) {
 			key := assetMention{AssetType: mention.AssetType, AssetID: mention.AssetID}
 			if seen[key] {
 				return "", nil
