@@ -36,6 +36,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev.ps1 -Launc
 
 渠道和模型设置保存在当前 DSH Profile，供该 Profile 内所有项目共享。API Key 由 DSH 凭据服务保存，设置只显示是否已填。原 Web Profile 的旧 DPAPI 配置在首次读取时导入，已有任务保留提交时的模型和参数。 [New API Task 文档](https://github.com/QuantumNous/new-api-docs-v1/blob/main/content/docs/en/plugins/usage.mdx) · [秘塔 H3 接入指南](https://metaso.cn/minimax-h3/new-api-guide) · [MiniMax 原生接口](https://platform.minimax.cn/docs/api-reference/video-generation-v2-create) · [OpenAI 兼容创建契约](https://developers.openai.com/api/reference/resources/videos/methods/create)
 
+保存渠道、模型预设或生成设置后，DSH Host 通知当前 Profile 中已连接的 Canvas 读取最新配置。节点沿用所选模型预设，生成确认会显示该预设绑定的渠道与协议。新渠道须在模型预设中绑定后才会成为可选项。
+
+生成确认使用 Host 发布的配置版本。配置更新后，已打开的确认需要重新打开。若保存与提交同时到达，配置已更新时，新提交返回冲突，重新读取配置后可再次确认。进入队列的任务继续使用已保存的渠道和参数快照。同一操作 ID 的重试返回已入队的任务。数据存储格式沿用现有版本，旧客户端提交仍可使用原有请求字段。升级时使用同次构建的 Host、Browser 和 Go 工件。回滚到旧工件会恢复旧的刷新和确认行为。
+
 ### Custom REST 配置示例
 
 以下字段路径对应示例供应商返回的 JSON，按实际接口替换。任务查询和提交地址相对于 Base URL，亦可填写同源完整地址。状态值区分大小写。

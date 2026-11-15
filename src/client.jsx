@@ -1,7 +1,7 @@
-import React, { useCallback, useEffect, useState, useSyncExternalStore } from 'react'
+import React, { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react'
 import { CanvasViewport } from './canvas.jsx'
 import { videoMode } from './canvas-node.jsx'
-import { ProviderSettings, getProviderSettingsRevision, subscribeProviderSettings } from './provider-settings.jsx'
+import { ProviderSettings, protocols } from './provider-settings.jsx'
 import { WorkflowProgress } from './workflow-panel.jsx'
 import {
   Button, IconChevronDownOutlineRegular, IconPanelLeftOutlineRegular, Menu, MenuItemButton, StateDot, Switch, Tooltip,
@@ -205,7 +205,8 @@ function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
   const [filters, setFilters] = useState({})
   const [providerData, setProviderData] = useState(null)
   const [providerError, setProviderError] = useState('')
-  const settingsRevision = useSyncExternalStore(subscribeProviderSettings, getProviderSettingsRevision)
+  const [providerVersion, setProviderVersion] = useState()
+  const [providerReload, setProviderReload] = useState(0)
   const [revision, setRevision] = useState(0)
   const [error, setError] = useState('')
   const ticket = session?.ticket
@@ -237,6 +238,7 @@ function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
     subscribe(ticket, session.status.eventSeq, controller.signal, batch => {
       if (typeof batch.aiRunning === 'boolean') {
         setActivity({ ticket, running: batch.aiRunning })
+        if (typeof batch.providerVersion === 'string') setProviderVersion(batch.providerVersion)
         return
       }
       if (batch.events.length && batch.events.every(event => event.type === 'workflow')) return
@@ -260,7 +262,17 @@ function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
       if (!controller.signal.aborted) setProviderError(failure.message)
     })
     return () => controller.abort()
-  }, [visible, connected, settingsRevision])
+  }, [visible, connected, providerVersion, providerReload])
+
+  const generationProfiles = useMemo(() => {
+    const channels = new Map((providerData?.channels ?? []).map(channel => [channel.id, channel]))
+    return (providerData?.profiles ?? []).map(profile => {
+      const channel = channels.get(profile.channelId)
+      return channel ? { ...profile, channelLabel: `渠道 ${channel.name} · ${protocols[channel.protocol] ?? channel.protocol}` } : profile
+    })
+  }, [providerData])
+  const providerSettingsReady = Boolean(providerData && !providerError &&
+    (providerVersion === undefined || providerData.providerVersion === providerVersion))
 
   async function append(data) {
     const result = await operation(ticket, 'append', { ...data, operationId: crypto.randomUUID() })
@@ -282,15 +294,20 @@ function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
     }
   }
 
-  async function submitGeneration(node, profileId) {
+  async function submitGeneration(node, profileId, providerVersion) {
     const request = {
-      operationId: crypto.randomUUID(), nodeId: node.id, profileId, confirmed: true,
+      operationId: crypto.randomUUID(), nodeId: node.id, profileId, confirmed: true, providerVersion,
     }
-    const result = node.type === 'video'
-      ? await videoGeneration[videoMode(node)](ticket, request)
-      : await operation(ticket, 'submit_manual', request)
-    setRevision(value => value + 1)
-    return result
+    try {
+      const result = node.type === 'video'
+        ? await videoGeneration[videoMode(node)](ticket, request)
+        : await operation(ticket, 'submit_manual', request)
+      setRevision(value => value + 1)
+      return result
+    } catch (failure) {
+      if (failure.status === 409) setProviderReload(value => value + 1)
+      throw failure
+    }
   }
 
   async function changeTask(action, taskId) {
@@ -321,7 +338,8 @@ function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
         setFilters={setFilters} append={append} mutate={mutate} aiRunning={aiRunning}
         uploadFile={(type, file) => uploadMedia(ticket, type, file)}
         mediaURL={node => mediaURL(ticket, node)}
-        generationProfiles={providerData?.profiles ?? []} generationDefaults={providerData?.generation}
+        generationProfiles={generationProfiles} generationDefaults={providerData?.generation}
+        providerVersion={providerData?.providerVersion} providerSettingsReady={providerSettingsReady}
         queryCanvas={queryCanvas} submitGeneration={submitGeneration} changeTask={changeTask} />
         : !issue && <p className="drama-shell-empty">{session && !connected ? '从输入栏连接项目画布' : '正在读取画布…'}</p>}
       {issue && <p role="alert" className="drama-shell-error">{issue}</p>}

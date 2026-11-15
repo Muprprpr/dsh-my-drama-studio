@@ -80,6 +80,7 @@ function usePositions(key) {
 export function CanvasViewport({
   snapshot, filters, setFilters, append, mutate, aiRunning, mediaURL, uploadFile,
   submitGeneration, changeTask, queryCanvas, generationProfiles = [], generationDefaults,
+  providerVersion, providerSettingsReady,
 }) {
   const { nodes, edges, hasMore, status, tasks = [], referenceNodes = [], lockedNodeIds = [] } = snapshot
   const [positions, setPositions] = usePositions(`drama-layout:${status.canvasId}:${status.sessionId}`)
@@ -222,6 +223,7 @@ export function CanvasViewport({
         draft, editor: draft && editorFor(draft), rename: rename?.id === node.id ? rename.token : undefined,
         referenceFocus: referenceFocus?.id === node.id ? referenceFocus.token : undefined,
         index, edges, resolvedMedia, mentionedAssets, mediaURL, generationProfiles, generationDefaults,
+        providerVersion, providerSettingsReady,
         tasks: taskIndex.get(node.id), selectedResult: selectedResultIds.has(node.id),
       },
     }
@@ -242,7 +244,8 @@ export function CanvasViewport({
         ...actions, edit: () => selectNode(draft.id), delete: () => closeDraft(draft.id),
         upload: undefined, chooseAsset: undefined,
       }, rename: rename?.id === draft.id ? rename.token : undefined,
-      index, edges, resolvedMedia, mentionedAssets, mediaURL, generationProfiles, generationDefaults } })
+      index, edges, resolvedMedia, mentionedAssets, mediaURL, generationProfiles, generationDefaults,
+      providerVersion, providerSettingsReady } })
   }
 
   const graphEdges = visibleReferences

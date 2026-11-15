@@ -229,21 +229,32 @@ function paramSummary(profile, generationDefaults, overrides, mode) {
   ].filter(Boolean)
 }
 
-function GenerateControl({ node, profile, generationDefaults, actions, unavailable, latest }) {
+function GenerateControl({ node, profile, generationDefaults, providerVersion, providerSettingsReady, actions, unavailable, latest }) {
   const mode = node.type === 'image' ? 't2i' : videoMode(node)
-  const [confirming, setConfirming] = useState(false)
+  const [confirmation, setConfirmation] = useState(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const ready = providerSettingsReady && Boolean(providerVersion)
+  const invalidated = Boolean(confirmation && (
+    !ready || confirmation.version !== providerVersion || confirmation.profileId !== profile?.id
+  ))
+  const stale = Boolean(confirmation?.stale || invalidated)
+  const blocked = !ready || !profile?.configured || Boolean(unavailable)
+
+  useEffect(() => {
+    if (invalidated) setConfirmation(current => current && !current.stale ? { ...current, stale: true } : current)
+  }, [invalidated])
 
   if (!actions.submitGeneration || !['image', 'video'].includes(node.type) || mode === 'asset') return null
   async function submit() {
-    if (!profile?.configured || busy || unavailable) return
+    if (!confirmation || stale || blocked || busy) return
     setBusy(true)
     setError('')
     try {
-      await actions.submitGeneration(node, profile.id)
-      setConfirming(false)
+      await actions.submitGeneration(node, profile.id, confirmation.version)
+      setConfirmation(null)
     } catch (failure) {
+      if (failure.status === 409) setConfirmation(current => current && { ...current, stale: true })
       setError(failure.message)
     } finally {
       setBusy(false)
@@ -252,17 +263,22 @@ function GenerateControl({ node, profile, generationDefaults, actions, unavailab
 
   return <>
     <Button size="sm" variant="primary" className="drama-node-generate" icon={<IconSparkleRegular size={14} />}
-      disabled={Boolean(unavailable)} title={unavailable}
-      onClick={() => { setError(''); setConfirming(true) }}>{latest ? '重新生成…' : '生成…'}</Button>
-    {confirming && <Modal open title="确认生成" closeLabel="关闭生成确认"
-      onClose={() => { if (!busy) setConfirming(false) }} footer={<>
-        <Button size="sm" disabled={busy} onClick={() => setConfirming(false)}>取消</Button>
-        <Button size="sm" variant="primary" disabled={busy || !profile?.configured || Boolean(unavailable)} onClick={submit}>
+      disabled={blocked} title={unavailable}
+      onClick={() => { setError(''); setConfirmation({ version: providerVersion, profileId: profile.id }) }}>
+      {latest ? '重新生成…' : '生成…'}</Button>
+    {confirmation && <Modal open title="确认生成" closeLabel="关闭生成确认"
+      onClose={() => { if (!busy) setConfirmation(null) }} footer={<>
+        <Button size="sm" disabled={busy} onClick={() => setConfirmation(null)}>取消</Button>
+        <Button size="sm" variant="primary" disabled={busy || stale || blocked} onClick={submit}>
           {busy ? '正在提交' : '确认提交'}
         </Button>
       </>}>
-      {profile && <p className="drama-node-dialog-summary">{[profile.name, profile.model,
-        ...paramSummary(profile, generationDefaults, node.content.params, mode)].join(' · ')}</p>}
+      {!stale && profile && <>
+        <p className="drama-node-dialog-summary">{[profile.name, profile.model,
+          ...paramSummary(profile, generationDefaults, node.content.params, mode)].join(' · ')}</p>
+        {profile.channelLabel && <p className="drama-node-caption" data-testid="drama-generation-channel">{profile.channelLabel}</p>}
+      </>}
+      {stale && <p className="drama-node-form-error" role="alert">本次生成确认已失效，请关闭后重新确认。</p>}
       {error && <p className="drama-node-form-error" role="alert">{error}</p>}
     </Modal>}
   </>
@@ -329,7 +345,8 @@ function referenceReady(item, resolvedMedia) {
 
 export function GraphNode({ data, selected }) {
   const { node, draft, editor, compact, mediaURL, index, edges, tasks = [], generationProfiles = [],
-    generationDefaults, resolvedMedia, mentionedAssets, rename, referenceFocus, selectedResult, isFocused, actions = {} } = data
+    generationDefaults, providerVersion, providerSettingsReady, resolvedMedia, mentionedAssets, rename,
+    referenceFocus, selectedResult, isFocused, actions = {} } = data
   const compactEditor = draft?.edit && (node.type === 'image' || node.type === 'video')
   const panelRef = useNodeEditorPlacement(node.id, Boolean(compactEditor && editor), Boolean(isFocused))
   const latest = tasks[0]
@@ -418,7 +435,7 @@ export function GraphNode({ data, selected }) {
       className={'drama-node-editor-panel' + (compactEditor ? ' is-creative' : '')}>
       <NodeEditor draft={draft} {...editor} node={node} index={index} resolvedMedia={resolvedMedia} rename={rename} referenceFocus={referenceFocus}
         mediaURL={mediaURL} mentionedAssets={mentionedAssets} generationProfiles={generationProfiles} generationDefaults={generationDefaults}
-        actions={actions} latest={latest} isFocused={isFocused} />
+        providerVersion={providerVersion} providerSettingsReady={providerSettingsReady} actions={actions} latest={latest} isFocused={isFocused} />
     </div>}
   </article>
 }
@@ -529,7 +546,8 @@ function promptAssetKey(node) {
 
 function NodeEditor({
   draft, append, mutate, mutationReason, media = [], queryCanvas, finish, close, mediaURL, index,
-  generationProfiles, generationDefaults, node, actions, latest, resolvedMedia, mentionedAssets, rename, referenceFocus, uploadReference,
+  generationProfiles, generationDefaults, providerVersion, providerSettingsReady, node, actions, latest, resolvedMedia,
+  mentionedAssets, rename, referenceFocus, uploadReference,
   importFile, attachAsset, reportSaveError, isFocused,
 }) {
   const { base, preset, seed, duplicate, edit, group } = draft
@@ -748,6 +766,7 @@ function NodeEditor({
     !prompt.trim() && !hasTextRef && (type === 'video' ? '生成前请填写完整视频提示词。' : '请填写提示词。'),
     referenceItems.some(item => !referenceReady(item, resolvedMedia)) && '等待上游素材。',
     issue,
+    (!providerSettingsReady || !providerVersion) && '正在同步生成设置。',
     !savedProfile?.configured && '请选择已配置的生成预设。',
   ].find(Boolean)
   const unavailable = actions.taskLockReason || (promptComposing && '请先完成提示词输入。') ||
@@ -1090,6 +1109,7 @@ function NodeEditor({
         {(shownError || generation && (prompt.trim() || references.length > 0) && generationIssue) &&
           <p className="drama-node-creative-status" role={error ? 'alert' : 'status'}>{shownError || generationIssue}</p>}
         {generation && <GenerateControl node={effectiveNode} profile={savedProfile} generationDefaults={generationDefaults}
+          providerVersion={providerVersion} providerSettingsReady={providerSettingsReady}
           actions={actions} unavailable={unavailable} latest={latest} />}
       </div>
       {settings && <Modal open title="节点详情" closeLabel="关闭节点详情"

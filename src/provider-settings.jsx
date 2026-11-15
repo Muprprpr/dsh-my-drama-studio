@@ -3,7 +3,7 @@ import { Button, Checkbox, IconChevronDownOutlineRegular, Input, Menu, Segmented
 import { providerRequest } from './studio-api.js'
 import style from './provider-settings.css'
 
-const protocols = {
+export const protocols = {
   'new-api': 'New API Task / Video',
   'openai-video': 'OpenAI 兼容视频',
   'custom-rest': 'Custom REST',
@@ -23,18 +23,6 @@ const tabs = { channels: '视频渠道', models: '模型预设', generation: '�
 const optionalNumber = value => value === '' ? undefined : Number(value)
 const optionList = (value = '') => [...new Set(value.split(/[,，]/u).map(item => item.trim()).filter(Boolean))]
 const items = labels => Object.entries(labels).map(([id, label]) => ({ id, label }))
-
-const changes = new EventTarget()
-let settingsRevision = 0
-export const getProviderSettingsRevision = () => settingsRevision
-export function subscribeProviderSettings(listener) {
-  changes.addEventListener('changed', listener)
-  return () => changes.removeEventListener('changed', listener)
-}
-function notifyProviderSettings() {
-  settingsRevision += 1
-  changes.dispatchEvent(new Event('changed'))
-}
 
 function Choice({ label, value, items: entries, onChange, disabled }) {
   const [open, setOpen] = useState(false)
@@ -275,6 +263,7 @@ function Channels({ data, busy, run, clearFeedback, setError }) {
               <strong>{channel.name}</strong>
               <small>{protocols[channel.protocol] ?? channel.protocol}{channel.baseUrl ? ' · ' + channel.baseUrl : ''}</small>
               <small>{channel.configured ? '密钥已设置' : channel.advanced?.auth === 'none' ? '无鉴权' : '密钥未设置'}</small>
+              {!profiles.some(profile => profile.channelId === channel.id) && <small>未绑定模型预设</small>}
             </div>
             <div className="drama-provider-actions">
               <Button size="sm" disabled={busy} onClick={() => edit(channel)}>编辑渠道</Button>
@@ -607,7 +596,6 @@ export function ProviderSettings() {
       const result = await providerRequest(action, input)
       if (success) {
         setData(result)
-        notifyProviderSettings()
         setMessage(success)
       } else if (action === 'channel_test') {
         setData(current => ({

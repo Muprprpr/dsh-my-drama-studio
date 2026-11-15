@@ -57,10 +57,12 @@ type submitArgs struct {
 
 func (p *project) submit(ctx context.Context, r Request, providers providerRegistry, expectedMode string) (any, error) {
 	var args submitArgs
+	var providerVersion string
 	if r.Action != "submit" {
 		var manual struct {
 			submitArgs
-			Confirmed bool `json:"confirmed"`
+			Confirmed       bool   `json:"confirmed"`
+			ProviderVersion string `json:"providerVersion,omitempty"`
 		}
 		if err := decodeData(r.Data, &manual); err != nil {
 			return nil, err
@@ -69,6 +71,7 @@ func (p *project) submit(ctx context.Context, r Request, providers providerRegis
 			return nil, invalid("手动生成需要明确确认")
 		}
 		args = manual.submitArgs
+		providerVersion = manual.ProviderVersion
 	} else if err := decodeData(r.Data, &args); err != nil {
 		return nil, err
 	}
@@ -98,6 +101,7 @@ func (p *project) submit(ctx context.Context, r Request, providers providerRegis
 		if args.ProfileID == "" {
 			args.ProfileID = pinned
 		}
+		input.providerVersion = providerVersion
 		if err := providers.Prepare(&input, args.ProfileID); err != nil {
 			return nil, err
 		}

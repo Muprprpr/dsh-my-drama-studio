@@ -62,6 +62,7 @@ type providerView struct {
 
 type ProviderSettings struct {
 	mu           sync.RWMutex
+	version      string
 	data         providerData
 	client       *http.Client
 	legacyPath   string
@@ -251,6 +252,9 @@ func validateProfile(profile ProviderProfile) error {
 func (s *ProviderSettings) Prepare(input *GenerationInput, id string) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if input.providerVersion != "" && input.providerVersion != s.version {
+		return &requestError{http.StatusConflict, "生成配置已更新，请重新打开生成确认"}
+	}
 	return s.prepareChannel(input, id)
 }
 

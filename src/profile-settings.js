@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { isDeepStrictEqual } from 'node:util'
@@ -20,7 +20,7 @@ const namespace = 'my-drama-studio'
 const changes = new Set(['channel_save', 'channel_remove', 'provider_save', 'provider_remove', 'generation_save'])
 const globalWorkspace = { id: '', path: '' }
 
-export async function openProfileSettings(ctx, config, kernel) {
+export async function openProfileSettings(ctx, config, kernel, onChange) {
   const profileHash = createHash('sha256').update(ctx.profileContext.dir.toLowerCase()).digest('hex')
   const prefix = `my-drama-studio/profile-${profileHash}-`
   const invoke = (action, data) => kernel('', globalWorkspace, action, data)
@@ -43,13 +43,41 @@ export async function openProfileSettings(ctx, config, kernel) {
     return result
   }
 
-  async function configure(document) {
+  const digestKey = randomBytes(32)
+  let configuredDocument
+  let configuredCredentialDigest
+  let providerVersion
+
+  async function applyConfiguration(document, keys, includeView) {
+    const snapshot = JSON.parse(JSON.stringify(document))
+    const digest = createHmac('sha256', digestKey)
+      .update(JSON.stringify(Object.entries(keys).sort(([a], [b]) => a.localeCompare(b))))
+      .digest('hex')
+    if (digest === configuredCredentialDigest && isDeepStrictEqual(snapshot, configuredDocument)) {
+      return includeView ? invoke('provider_settings') : undefined
+    }
+    const nextVersion = randomUUID()
+    let view
+    try {
+      view = await invoke('provider_configure', { config: snapshot, keys, providerVersion: nextVersion })
+    } catch (error) {
+      configuredDocument = undefined
+      throw error
+    }
+    configuredDocument = snapshot
+    configuredCredentialDigest = digest
+    providerVersion = nextVersion
+    onChange()
+    return view
+  }
+
+  async function configure(document, includeView = false) {
     const ids = new Set([...(document.channels ?? []).map(channel => channel.id), ...(document.retired ?? [])])
     const entries = await Promise.all([...ids].map(async id => {
       const record = await ctx.credentials.readRecord(credential(id))
       return [id, record?.kind === 'api-key' ? record.key : undefined]
     }))
-    return invoke('provider_configure', { config: document, keys: Object.fromEntries(entries.filter(([, value]) => value)) })
+    return applyConfiguration(document, Object.fromEntries(entries.filter(([, value]) => value)), includeView)
   }
 
   async function persist(next, revision) {
@@ -76,12 +104,12 @@ export async function openProfileSettings(ctx, config, kernel) {
       console.warn('[my-drama-studio] Could not read legacy Windows provider settings')
     }
   }
-  if (legacy) await invoke('provider_configure', legacy)
+  if (legacy) await applyConfiguration(legacy.config, legacy.keys ?? {})
   else await configure(initial)
 
   async function migrateLegacy(form) {
     if (!legacy || Object.keys(form.value.studio ?? {}).length > 0) return form
-    const refs = Object.entries(legacy.keys)
+    const refs = Object.entries(legacy.keys ?? {})
     for (const [id, key] of refs) await updateKey(id, key)
     await persist(legacy.config, form.revision)
     legacy = undefined
@@ -102,13 +130,13 @@ export async function openProfileSettings(ctx, config, kernel) {
     }
   })
 
-  return function providerRequest(action, data) {
+  function request(action, data) {
     if (action === 'channel_test') return invoke(action, data)
     return serialize(async () => {
       const form = await migrateLegacy(descriptor())
       const current = form.value.studio ?? {}
       if (action === 'provider_settings') {
-        return { ...await configure(current), revision: form.revision }
+        return { ...await configure(current, true), revision: form.revision, providerVersion }
       }
       if (!changes.has(action)) throw new StudioError(400, '未知设置操作')
       const { revision, apiKey, ...input } = data
@@ -130,8 +158,21 @@ export async function openProfileSettings(ctx, config, kernel) {
         throw error
       }
       const updated = descriptor()
-      const view = await configure(updated.value.studio ?? {})
-      return { ...view, revision: updated.revision }
+      const view = await configure(updated.value.studio ?? {}, true)
+      return { ...view, revision: updated.revision, providerVersion }
     })
   }
+
+  function guardSubmit(expected, enqueue) {
+    return serialize(async () => {
+      if (expected !== undefined) {
+        if (typeof expected !== 'string' || !expected) throw new StudioError(400, '生成配置版本无效')
+        const form = await migrateLegacy(descriptor())
+        await configure(form.value.studio ?? {})
+      }
+      return enqueue()
+    })
+  }
+
+  return { request, getVersion: () => providerVersion, guardSubmit }
 }

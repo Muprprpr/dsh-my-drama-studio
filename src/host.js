@@ -77,9 +77,9 @@ function route(ctx, path, run, method = 'POST', rawBody = false) {
 
 const humanEdits = new Set(['update_node', 'delete_node', 'update_edge', 'delete_edge', 'canvas_delete', 'canvas_restore'])
 const workflowActions = new Set(['workflow_approve', 'workflow_return'])
-const browserActions = new Set(['context', 'bind', 'disconnect', 'query', 'append', 'permission', 'submit_manual', 'tasks',
-  'generateT2V', 'generateI2V', 'generateR2V', 'generateV2V', 'cancel_task', 'resume_task', 'workflow_get', 'workflow_start',
-  ...humanEdits, ...workflowActions])
+const manualSubmissions = new Set(['submit_manual', 'generateT2V', 'generateI2V', 'generateR2V', 'generateV2V'])
+const browserActions = new Set(['context', 'bind', 'disconnect', 'query', 'append', 'permission', 'tasks',
+  'cancel_task', 'resume_task', 'workflow_get', 'workflow_start', ...humanEdits, ...workflowActions, ...manualSubmissions])
 
 export async function apply(ctx, config) {
   const activity = new EventEmitter().setMaxListeners(0)
@@ -94,7 +94,7 @@ export async function apply(ctx, config) {
   }
 
   const kernel = await startKernel(ctx, checkHumanWrite)
-  const providerRequest = await openProfileSettings(ctx, config, kernel)
+  const providers = await openProfileSettings(ctx, config, kernel, () => activity.emit('provider-change'))
   const signingKey = randomBytes(32)
   const lifetime = new AbortController()
   const workflow = workflowBridge(ctx, kernel, workspaceFor, lifetime.signal)
@@ -144,7 +144,7 @@ export async function apply(ctx, config) {
 
   route(ctx, '/api/drama/providers', async body => {
     const { action, data } = keys(body, 'action', 'data')
-    return providerRequest(action, keysData(data))
+    return providers.request(action, keysData(data))
   })
 
   route(ctx, '/api/drama/operation', async (body, peer) => {
@@ -156,6 +156,12 @@ export async function apply(ctx, config) {
     if (action === 'workflow_start') return workflow.start(sessionId, workspace, input)
     if (humanEdits.has(action) || workflowActions.has(action) || action === 'append') {
       return kernel(sessionId, workspace, action, input, undefined, 'human')
+    }
+    if (manualSubmissions.has(action)) {
+      return providers.guardSubmit(input.providerVersion, async () => {
+        const target = await verify(ticket, peer)
+        return kernel(target.sessionId, target.workspace, action, input)
+      })
     }
     const result = await kernel(sessionId, workspace, action, input)
     if (action === 'query') await addActivity(result.status, sessionId, workspace)
@@ -192,7 +198,9 @@ export async function apply(ctx, config) {
     let currentWait
     let published
     function onActivity(sessionId) {
-      if (!trackedSessions.has(sessionId)) return
+      if (trackedSessions.has(sessionId)) refreshTransient()
+    }
+    function refreshTransient() {
       refreshActivity = true
       // Wake the pending DB read without adding a durable Canvas event.
       currentWait?.abort()
@@ -201,6 +209,7 @@ export async function apply(ctx, config) {
       if (!res.write(frame)) await once(res, 'drain', { signal })
     }
     activity.on('change', onActivity)
+    activity.on('provider-change', refreshTransient)
     try {
       while (!signal.aborted) {
         const { sessionId, workspace } = await verify(ticket, peer)
@@ -208,7 +217,7 @@ export async function apply(ctx, config) {
           refreshActivity = false
           const connected = await connectedSessions(sessionId, workspace, signal)
           trackedSessions = new Set(connected)
-          const frame = JSON.stringify(workspaceActivity(workspace.sessionIds, connected))
+          const frame = JSON.stringify({ ...workspaceActivity(workspace.sessionIds, connected), providerVersion: providers.getVersion() })
           if (published !== frame && !signal.aborted) {
             await write(`data: ${frame}\n\n`)
             published = frame
@@ -238,6 +247,7 @@ export async function apply(ctx, config) {
       if (!signal.aborted) res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`)
     } finally {
       activity.off('change', onActivity)
+      activity.off('provider-change', refreshTransient)
       res.end()
     }
   })

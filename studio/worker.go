@@ -33,6 +33,7 @@ type GenerationInput struct {
 	References      []GenerationReference `json:"references,omitempty"`
 	Params          VideoParams           `json:"params,omitzero"`
 	OutputDirectory string                `json:"outputDirectory,omitempty"`
+	providerVersion string                // Checked at admission and omitted from the stored job.
 }
 
 type sourceGroup struct {

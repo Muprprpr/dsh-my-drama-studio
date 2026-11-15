@@ -367,8 +367,9 @@ func (s *ProviderSettings) executeProfileSettings(ctx context.Context, action st
 	switch action {
 	case "provider_configure":
 		var args struct {
-			Config providerData      `json:"config"`
-			Keys   map[string]string `json:"keys"`
+			Config          providerData      `json:"config"`
+			Keys            map[string]string `json:"keys"`
+			ProviderVersion string            `json:"providerVersion,omitempty"`
 		}
 		if err := decodeData(raw, &args); err != nil {
 			return nil, err
@@ -387,6 +388,7 @@ func (s *ProviderSettings) executeProfileSettings(ctx context.Context, action st
 		}
 		s.data = args.Config
 		s.data.Keys = args.Keys
+		s.version = args.ProviderVersion
 		s.normalize()
 		s.mu.Unlock()
 		return s.view(), nil

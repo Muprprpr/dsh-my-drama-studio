@@ -413,7 +413,7 @@ async function initialize(page, url) {
   const onboarding = page.getByRole('button', { name: 'Continue', exact: true })
   if (new URL(url).search) await onboarding.click()
   else {
-    await page.getByText('Studio Shared', { exact: true }).waitFor()
+    await page.getByLabel('Sessions', { exact: true }).getByText('Studio Shared', { exact: true }).waitFor()
     if (await onboarding.isVisible()) await onboarding.click()
   }
   assert.ok(await page.evaluate(() =>
@@ -2190,6 +2190,152 @@ async function configureVideoFixture(page) {
   })
   return { settings, configured }
 }
+
+test('Open Canvas confirmation requires fresh approval after a provider change in another page', {
+  timeout: 120_000, skip: !hasVideo,
+}, async () => {
+  await withWeb(async ({ page, context, url, records }) => {
+    const [record] = records
+    const settings = (action, data) => ok(page, 'providers', { action, data })
+    const original = await settings('channel_save', {
+      channel: { name: '旧路由夹具', protocol: 'new-api', baseUrl: 'https://old-video.invalid' },
+      apiKey: 'uiux-local-fixture-token',
+    })
+    const newChannelName = '新路由夹具'
+    const channels = await settings('channel_save', {
+      revision: original.revision,
+      channel: { name: newChannelName, protocol: 'openai-video', baseUrl: 'https://video.example.com/old' },
+      apiKey: 'uiux-previous-fixture-token',
+    })
+    const newChannel = channels.channels.find(channel => channel.name === newChannelName)
+    assert.ok(newChannel)
+    const profileName = '跨页面视频预设'
+    const profiles = await settings('provider_save', {
+      revision: channels.revision,
+      profile: {
+        name: profileName, channelId: original.channels[0].id, model: 'fixture-old', modes: ['t2v'],
+        defaults: { duration: 4 }, limits: { durationMin: 1, durationMax: 12 },
+      },
+    })
+    const [profile] = profiles.profiles
+    await settings('generation_save', {
+      revision: profiles.revision,
+      generation: { defaultModelId: profile.id, maxConcurrent: 2, outputDirectory: 'assets/native-results' },
+    })
+
+    await select(page, record)
+    await open(page, record)
+    const ticket = await ticketFor(page, record.sessionId)
+    const { id } = await pick(page, '视频生成', ticket, 'video')
+    await chooseVideoMode(page, ticket, id, 't2v')
+    const prompt = '固定中景。人物推开餐厅门，在门口停顿。'
+    await updateVideo(page, ticket, id, prompt)
+    await card(page, id).locator('.drama-node-titlebar').click()
+    const editor = nodeEditor(page, id)
+    const generate = editor.getByRole('button', { name: '生成…', exact: true })
+    const parameters = editor.getByRole('group', { name: '有效生成参数', exact: true })
+    await parameters.getByText('4 秒', { exact: true }).waitFor()
+    const promptBox = editor.getByRole('textbox', { name: '提示词', exact: true })
+    await promptBox.evaluate(element => { element.dataset.testEditorInstance = 'original' })
+
+    const peer = await context.newPage()
+    await initialize(peer, new URL(url).origin)
+    await peer.getByRole('button', { name: 'Account menu', exact: true }).click()
+    await peer.getByRole('menuitem', { name: 'Settings', exact: true }).click()
+    const dialog = peer.getByRole('dialog', { name: 'Settings', exact: true })
+    await dialog.getByRole('button', { name: 'Drama Studio', exact: true }).click()
+    const peerSettings = dialog.getByTestId('drama-settings')
+    await peerSettings.getByRole('tab', { name: '模型预设', exact: true }).click()
+    await peerSettings.getByRole('listitem').filter({ hasText: profileName })
+      .getByRole('button', { name: '编辑预设', exact: true }).click()
+    await peerSettings.getByRole('button', { name: '绑定渠道', exact: true }).click()
+    await peer.getByRole('menuitem', { name: newChannelName, exact: true }).click()
+    await peerSettings.getByLabel('API Model ID', { exact: true }).fill('fixture-video')
+    await peerSettings.getByText('模型默认参数', { exact: true }).click()
+    await peerSettings.getByLabel('模型默认时长（秒）', { exact: true }).fill('8')
+
+    await page.bringToFront()
+    await generate.click()
+    const confirmation = page.getByRole('dialog', { name: '确认生成', exact: true })
+    const submit = confirmation.getByRole('button', { name: '确认提交', exact: true })
+    await confirmation.getByText(/fixture-old.*4 秒/u).waitFor()
+    assert.ok(await submit.isEnabled())
+    const { providerVersion } = await settings('provider_settings', {})
+    assert.ok(providerVersion)
+    await peer.bringToFront()
+    await peerSettings.getByRole('button', { name: '保存预设', exact: true }).click()
+    await peerSettings.getByText('预设已保存', { exact: true }).waitFor()
+    const updated = await settings('provider_settings', {})
+    assert.equal(updated.generation.defaultModelId, profile.id)
+    const rebound = updated.profiles.find(item => item.id === profile.id)
+    assert.equal(rebound?.channelId, newChannel.id)
+    assert.equal(rebound?.model, 'fixture-video')
+    assert.notEqual(updated.providerVersion, providerVersion)
+    const stale = await request(page, 'operation', { ticket, action: 'generateT2V', data: {
+      operationId: randomUUID(), nodeId: id, profileId: profile.id, confirmed: true, providerVersion,
+    } })
+    assert.equal(stale.status, 409, stale.body.error)
+    assert.deepEqual((await operate(page, ticket, 'tasks', {})).tasks, [])
+
+    await peerSettings.getByRole('tab', { name: '视频渠道', exact: true }).click()
+    await peerSettings.getByRole('listitem').filter({ hasText: newChannelName })
+      .getByRole('button', { name: '编辑渠道', exact: true }).click()
+    await peerSettings.getByLabel('Base URL', { exact: true }).fill('https://video.example.com')
+    await peerSettings.getByRole('button', { name: '保存渠道', exact: true }).click()
+    await peerSettings.getByText('渠道已保存', { exact: true }).waitFor()
+    const afterURLSave = await settings('provider_settings', {})
+    assert.notEqual(afterURLSave.providerVersion, updated.providerVersion)
+    assert.equal(afterURLSave.channels.find(item => item.id === newChannel.id).baseUrl, 'https://video.example.com')
+
+    await peerSettings.getByRole('listitem').filter({ hasText: newChannelName })
+      .getByRole('button', { name: '编辑渠道', exact: true }).click()
+    await peerSettings.locator('input[type="password"]').fill('uiux-local-fixture-token')
+    await peerSettings.getByRole('button', { name: '保存渠道', exact: true }).click()
+    await peerSettings.getByText('渠道已保存', { exact: true }).waitFor()
+    const afterKeySave = await settings('provider_settings', {})
+    assert.notEqual(afterKeySave.providerVersion, afterURLSave.providerVersion, 'a credential-only save must change the provider version')
+    assert.deepEqual(afterKeySave.profiles, afterURLSave.profiles)
+
+    await page.bringToFront()
+    await poll(async () => !(await confirmation.isVisible()) || await submit.isDisabled(),
+      'a confirmation opened before the provider change could still submit')
+    assert.deepEqual((await operate(page, ticket, 'tasks', {})).tasks, [])
+    if (await confirmation.isVisible()) {
+      await confirmation.getByRole('button', { name: '取消', exact: true }).click()
+    }
+    await parameters.getByText('8 秒', { exact: true }).waitFor()
+    assert.equal(await promptBox.getAttribute('data-test-editor-instance'), 'original')
+    assert.equal(await promptBox.innerText(), prompt)
+    const [saved] = (await query(page, ticket, { id })).nodes
+    assert.equal(saved.content.profileId, undefined, 'updating the default must not rewrite the draft')
+
+    await generate.click()
+    await confirmation.getByText(new RegExp(newChannelName, 'u')).waitFor()
+    await confirmation.getByText(/fixture-video.*8 秒/u).waitFor()
+    const submitted = page.waitForRequest(req => new URL(req.url()).pathname === '/api/drama/operation' &&
+      req.method() === 'POST' && req.postDataJSON()?.action === 'generateT2V')
+    await submit.click()
+    const submission = (await submitted).postDataJSON()
+    assert.equal(submission.data.providerVersion, afterKeySave.providerVersion)
+    const task = await poll(async () => {
+      const { tasks } = await operate(page, ticket, 'tasks', {})
+      return tasks.find(item => item.nodeId === id && item.providerTaskId)
+    }, 'the rebound preset did not reach the configured fixture route', 20_000)
+    assert.equal(task.providerTaskId, 'uiux-fixture-task')
+    assert.equal(task.provider, 'openai-video')
+    assert.equal(task.channelId, newChannel.id)
+    assert.equal(task.model, 'fixture-video')
+    const generationChange = await settings('generation_save', {
+      revision: afterKeySave.revision,
+      generation: { ...afterKeySave.generation, maxConcurrent: 3 },
+    })
+    assert.notEqual(generationChange.providerVersion, submission.data.providerVersion)
+    const replay = await ok(page, 'operation', submission)
+    assert.equal(replay.task.id, task.id, 'replaying a confirmed operation must return its existing task')
+    assert.equal((await operate(page, ticket, 'tasks', {})).tasks.length, 1)
+    await peer.close()
+  }, { providerFixture: true })
+})
 
 test('U4 native task drawer follows real Go worker in isolated provider fixture', { timeout: 150_000, skip: !hasVideo }, async () => {
   await withWeb(async ({ page, records, home }) => {
