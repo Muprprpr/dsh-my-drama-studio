@@ -5,6 +5,7 @@ import style from './workflow-panel.css'
 
 const finalStage = 'final-review'
 const generationStage = 'video-generation'
+const runningMessage = '当前阶段正在执行，请等待本轮完成后再切换。'
 const stageStatuses = {
   not_started: ['未开始', 'idle'],
   draft_available: ['有草稿', 'warning'],
@@ -146,7 +147,8 @@ export function WorkflowProgress({ session, refreshSession, openArtifacts, openC
   const choices = interaction.choices[stage?.id] ?? {}
   const refs = selectedRefs(ownGroups, choices)
   const sessionStatus = stage && nativeRunning ? 'running' : state?.status
-  const previewAllowed = sessionStatus !== 'running' && (stage?.id === generationStage
+  const running = sessionStatus === 'running'
+  const previewAllowed = !running && (stage?.id === generationStage
     ? stage.generation?.state === 'ready' : refs.length > 0)
   const review = interaction.review?.sourceStageId === stage?.id ? interaction.review : null
 
@@ -202,7 +204,7 @@ export function WorkflowProgress({ session, refreshSession, openArtifacts, openC
           return <li key={candidate.id}>
             <button type="button" aria-current={stage?.id === candidate.id ? 'step' : undefined}
               data-status={candidate.status} title={candidate.name + ' · ' + label}
-              disabled={Boolean(interaction.busy)} onClick={() => {
+              disabled={Boolean(interaction.busy) || (running && stage?.id !== candidate.id)} onClick={() => {
                 if (stage?.id !== candidate.id) void activate(candidate.id)
                 else browse()
               }}>
@@ -217,16 +219,19 @@ export function WorkflowProgress({ session, refreshSession, openArtifacts, openC
           {stage && <span>{sessionStatuses[sessionStatus]}</span>}
         </div>
         <Button type="button" size="sm" onClick={browse}>阶段产物</Button>
-        {stage && <Button type="button" size="sm" disabled={Boolean(interaction.busy)}
+        {stage && <Button type="button" size="sm" disabled={Boolean(interaction.busy) || running}
           onClick={() => void activate('')}>退出阶段</Button>}
         {state?.pendingHandoffId ? <Button type="button" size="sm" variant="primary"
-          disabled={Boolean(interaction.busy) || sessionStatus === 'running'} onClick={retry}>启动交接后的任务</Button>
+          disabled={Boolean(interaction.busy) || running} onClick={retry}>启动交接后的任务</Button>
           : review ? <Button type="button" size="sm" variant="primary" onClick={showPreview}>查看交接预览</Button>
           : previewAllowed && <Button type="button" size="sm" variant="primary" data-testid="drama-workflow-action"
             disabled={Boolean(interaction.busy)} onClick={preview}>
             {stage.id === finalStage ? '生成成片验收包' : '生成交接预览'}
           </Button>}
       </div>
+      {running && feedback !== runningMessage && <div className="drama-workflow-feedback">
+        <p role="status">{runningMessage}</p>
+      </div>}
       {stage?.generation?.message && <div className="drama-workflow-feedback">
         <p role="status">{stage.generation.message}</p>
         <Button type="button" size="sm" onClick={openCanvas}>打开画布</Button>

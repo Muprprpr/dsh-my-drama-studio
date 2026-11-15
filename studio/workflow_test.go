@@ -13,7 +13,22 @@ import (
 	"github.com/google/uuid"
 )
 
-var testWorkflowVersions = workflowFileVersions{SkillSHA256: strings.Repeat("a", 64), HarnessSHA256: strings.Repeat("b", 64)}
+func workflowTestSnapshot(stageID, version string) *workflowSnapshot {
+	if stageID == "" {
+		return nil
+	}
+	stage := dramaWorkflowStages[workflowStageIndex(stageID)]
+	skillBody, harnessBody := "Rendered "+stageID+" Skill "+version, stageID+" Harness "+version
+	return &workflowSnapshot{
+		StageID: stageID, SkillBody: skillBody, HarnessBody: harnessBody,
+		SkillPath:         "skills/" + stage.Skill + "/SKILL.md",
+		HarnessPath:       "drama-studio/workflows/" + dramaWorkflowID + "/" + stage.Harness,
+		SkillSourceSHA256: workflowDigest([]byte("Raw " + stageID + " Skill " + version)),
+		workflowFileVersions: workflowFileVersions{
+			SkillSHA256: workflowDigest([]byte(skillBody)), HarnessSHA256: workflowDigest([]byte(harnessBody)),
+		},
+	}
+}
 
 func workflowOp() operation { return operation{ID: uuid.NewString()} }
 
@@ -54,20 +69,26 @@ func (f *workflowTest) view(session string) workflowView {
 
 func (f *workflowTest) activate(session, stage string) workflowView {
 	f.t.Helper()
-	versions := testWorkflowVersions
-	if stage == "" {
-		versions = workflowFileVersions{}
-	}
-	return f.call(session, "human", "workflow_activate", workflowActivateArgs{
-		operation: workflowOp(), StageID: stage, workflowFileVersions: versions,
-	}).(workflowView)
+	return f.call(session, "human", "workflow_activate", f.activation(session, stage, "V1")).(workflowView)
+}
+
+func (f *workflowTest) activation(session, stage, version string) workflowActivateArgs {
+	f.t.Helper()
+	activation := f.view(session).Session.Activation
+	return workflowActivateArgs{operation: workflowOp(), StageID: stage,
+		ExpectedActivation: &activation, Snapshot: workflowTestSnapshot(stage, version)}
 }
 
 func (f *workflowTest) start(session, stage, handoff string) workflowTurnResult {
 	f.t.Helper()
-	return f.call(session, "workflow", "workflow_turn_start", workflowTurnStartArgs{
-		operation: workflowOp(), RunID: uuid.NewString(), StageID: stage, HandoffID: handoff, workflowFileVersions: testWorkflowVersions,
-	}).(workflowTurnResult)
+	return f.call(session, "workflow", "workflow_turn_start", f.admission(session, stage, handoff)).(workflowTurnResult)
+}
+
+func (f *workflowTest) admission(session, stage, handoff string) workflowTurnStartArgs {
+	f.t.Helper()
+	current := f.view(session).Session
+	return workflowTurnStartArgs{operation: workflowOp(), RunID: uuid.NewString(), StageID: stage,
+		HandoffID: handoff, Activation: current.Activation, SnapshotID: current.SnapshotID}
 }
 
 func (f *workflowTest) finish(session, run, reason string) {
@@ -94,7 +115,7 @@ func (f *workflowTest) preview(session string, refs ...workflowArtifactRef) work
 func (f *workflowTest) confirm(session string, h workflowHandoff) workflowHandoff {
 	f.t.Helper()
 	return f.call(session, "human", "workflow_handoff_confirm", workflowConfirmArgs{
-		operation: workflowOp(), HandoffID: h.HandoffID,
+		operation: workflowOp(), HandoffID: h.HandoffID, Snapshot: workflowTestSnapshot(h.TargetStageID, "V1"),
 	}).(workflowHandoff)
 }
 
@@ -175,8 +196,23 @@ func TestWorkflowSessionDraftsAndExplicitHandoff(t *testing.T) {
 	f.check("a", "workflow", "workflow_handoff_preview", workflowPreviewArgs{operation: workflowOp()}, http.StatusForbidden)
 	f.check("a", "workflow", "workflow_handoff_confirm", workflowConfirmArgs{
 		operation: workflowOp(), HandoffID: aPreview.HandoffID}, http.StatusForbidden)
-	confirm := workflowConfirmArgs{operation: workflowOp(), HandoffID: aPreview.HandoffID}
+	targetQuery := map[string]string{"handoffId": aPreview.HandoffID}
+	if result := f.call("a", "workflow", "workflow_handoff_target", targetQuery).(workflowHandoffTarget); result.TargetStage == nil || result.TargetStage.ID != target {
+		t.Fatalf("wrong handoff target: %+v", result)
+	}
+	f.check("b", "workflow", "workflow_handoff_target", targetQuery, http.StatusConflict)
+	f.check("a", "human", "workflow_handoff_confirm", workflowConfirmArgs{
+		operation: workflowOp(), HandoffID: aPreview.HandoffID,
+	}, http.StatusBadRequest)
+	if v := f.view("a"); v.Session.ActiveStageID != stage || len(v.Handoffs) != 0 {
+		t.Fatalf("missing target snapshot partially confirmed a handoff: %+v", v)
+	}
+	confirm := workflowConfirmArgs{operation: workflowOp(), HandoffID: aPreview.HandoffID, Snapshot: workflowTestSnapshot(target, "V1")}
 	a := f.call("a", "human", "workflow_handoff_confirm", confirm).(workflowHandoff)
+	if out := f.call("a", "workflow", "workflow_handoff_target", targetQuery).(workflowHandoffTarget); out.TargetStage != nil {
+		t.Fatalf("confirmed replay should not need target files: %+v", out)
+	}
+	confirm.Snapshot = nil
 	var replay workflowHandoff
 	replayed := f.call("a", "human", "workflow_handoff_confirm", confirm).(json.RawMessage)
 	if err := json.Unmarshal(replayed, &replay); err != nil || a.HandoffID != replay.HandoffID {
@@ -196,7 +232,7 @@ func TestWorkflowSessionDraftsAndExplicitHandoff(t *testing.T) {
 	}
 	f.reopen(nil)
 	if v := f.view("a"); len(v.Handoffs) != 1 || len(v.Artifacts) != 3 || v.Session.ActiveStageID != target ||
-		v.Session.PendingHandoffID != a.HandoffID || v.Session.Status != "active" {
+		v.Session.PendingHandoffID != a.HandoffID || v.Session.Status != "active" || !v.Session.TransitionPending || v.Session.SnapshotID == "" {
 		t.Fatalf("restart changed formal package, draft history or initial delivery: %+v", v)
 	}
 	f.call("a", "workflow", "workflow_kickoff_failed", workflowKickoffFailedArgs{
@@ -207,14 +243,12 @@ func TestWorkflowSessionDraftsAndExplicitHandoff(t *testing.T) {
 	}
 	initial := f.start("a", target, a.HandoffID)
 	if len(initial.Inputs) != 1 || initial.Inputs[0].Artifacts[0].Content != a1.Content ||
-		initial.Session.PendingHandoffID != "" || initial.Session.SkillSHA256 != testWorkflowVersions.SkillSHA256 {
+		initial.Session.PendingHandoffID != "" || initial.Session.SkillSHA256 != workflowTestSnapshot(target, "V1").SkillSHA256 {
 		t.Fatalf("initial turn missed exact approved input: %+v", initial)
 	}
 	f.draft("a", initial.Session.RunID, "素材说明", workflowArtifact{})
 	f.finish("a", initial.Session.RunID, "")
-	f.check("a", "workflow", "workflow_turn_start", workflowTurnStartArgs{
-		operation: workflowOp(), StageID: target, HandoffID: a.HandoffID, RunID: uuid.NewString(), workflowFileVersions: testWorkflowVersions,
-	}, http.StatusConflict)
+	f.check("a", "workflow", "workflow_turn_start", f.admission("a", target, a.HandoffID), http.StatusConflict)
 	binding := f.confirm("a", f.preview("a"))
 	b := f.confirm("b", f.preview("b"))
 	if b.SourceRevision <= binding.SourceRevision || f.view("normal").Stages[workflowStageIndex(target)].Status != workflowStale {
@@ -244,13 +278,234 @@ func TestWorkflowWorkspaceIsolationAndAbandonedTurnRecovery(t *testing.T) {
 		t.Fatalf("interrupted native run changed active stage, drafts or formal progress: %+v", v)
 	}
 	resumed := f.start("one", "storyboard", "")
-	f.activate("one", "content-analysis")
+	f.check("one", "human", "workflow_activate", f.activation("one", "content-analysis", "V1"), http.StatusConflict)
+	f.check("one", "human", "workflow_activate", f.activation("one", "", ""), http.StatusConflict)
+	if peerSession := f.activate("peer", "content-analysis").Session; peerSession.ActiveStageID != "content-analysis" {
+		t.Fatalf("running Session blocked a peer's activation: %+v", peerSession)
+	}
 	f.finish("one", resumed.Session.RunID, "Old turn failed")
+	f.activate("one", "content-analysis")
 	if v := f.view("one"); v.Session.Status != "active" || v.Session.ActiveStageID != "content-analysis" || len(v.Artifacts) != 1 {
 		t.Fatalf("old attempt overwrote the new activation: %+v", v)
 	}
 	if v := f.activate("one", ""); v.Session.Status != "normal" || len(v.Artifacts) != 1 {
 		t.Fatalf("exit activated work or removed existing drafts: %+v", v)
+	}
+}
+
+func TestWorkflowFrozenSnapshotAndExactTransition(t *testing.T) {
+	f := newWorkflowTest(t, nil)
+	const stage = "storyboard"
+	v1 := f.activate("a", stage)
+	if v1.Snapshot != nil || v1.Session.SnapshotID == "" || v1.Session.Activation != 1 ||
+		v1.Session.ActivatedAt == "" || !v1.Session.TransitionPending {
+		t.Fatalf("expected browser metadata without private snapshot body: %+v", v1.workflowSessionResult)
+	}
+	f.check("a", "human", "workflow_session", nil, http.StatusForbidden)
+	read := func(id string) workflowSessionResult {
+		return f.call(id, "workflow", "workflow_session", nil).(workflowSessionResult)
+	}
+	stateOnly := f.call("a", "workflow", "workflow_session", map[string]bool{"stateOnly": true}).(workflowSessionResult)
+	if stateOnly.Snapshot != nil || stateOnly.Session != v1.Session {
+		t.Fatalf("state-only read changed activation metadata: %+v", stateOnly)
+	}
+	dedup := f.activate("dedup", stage)
+	if dedup.Session.SnapshotID != v1.Session.SnapshotID {
+		t.Fatal("identical contents did not reuse their snapshot")
+	}
+	repeated := f.call("a", "human", "workflow_activate", f.activation("a", stage, "V2")).(workflowView)
+	if repeated.Session != v1.Session || *read("a").Snapshot != *workflowTestSnapshot(stage, "V1") {
+		t.Fatalf("same-stage click replaced the frozen activation: %+v", repeated.Session)
+	}
+	fresh := f.call("b", "human", "workflow_activate", f.activation("b", stage, "V2")).(workflowView)
+	if fresh.Session.SnapshotID == v1.Session.SnapshotID || *read("b").Snapshot != *workflowTestSnapshot(stage, "V2") {
+		t.Fatalf("new activation failed to use its own version: %+v", fresh.Session)
+	}
+	failed := f.start("a", stage, "")
+	f.finish("a", failed.Session.RunID, "Cancelled")
+	if !read("a").Session.TransitionPending {
+		t.Fatal("failed turn released the transition")
+	}
+	abandoned := f.start("a", stage, "")
+	f.reopen(nil)
+	restored := read("a")
+	if !restored.Session.TransitionPending || restored.Session.Status != workflowFailed ||
+		restored.Session.RunID != "" || restored.Session.SnapshotID != v1.Session.SnapshotID ||
+		*restored.Snapshot != *workflowTestSnapshot(stage, "V1") {
+		t.Fatalf("restart lost the pending transition, snapshot, or run recovery: %+v", restored)
+	}
+	p, err := f.s.open(context.Background(), f.dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshotID, skillSHA, harnessSHA, status string
+	if err := p.db.QueryRow(`SELECT snapshot_id,skill_sha,harness_sha,status FROM workflow_turns WHERE id=?`, abandoned.Session.RunID).
+		Scan(&snapshotID, &skillSHA, &harnessSHA, &status); err != nil || snapshotID != v1.Session.SnapshotID ||
+		skillSHA != v1.Session.SkillSHA256 || harnessSHA != v1.Session.HarnessSHA256 || status != workflowFailed {
+		t.Fatalf("interrupted turn lost its provenance: %s %s %s %s / %v", snapshotID, skillSHA, harnessSHA, status, err)
+	}
+	var snapshotCount int
+	if err := p.db.QueryRow(`SELECT count(*) FROM workflow_capability_snapshots`).Scan(&snapshotCount); err != nil || snapshotCount != 2 {
+		t.Fatalf("unexpected number of stored versions: %d / %v", snapshotCount, err)
+	}
+	transition := func(activation int64) workflowSession {
+		return f.call("a", "workflow", "workflow_transition_complete", workflowTransitionArgs{
+			operation: workflowOp(), Activation: activation,
+		}).(workflowSessionResult).Session
+	}
+	ready := f.start("a", stage, "")
+	f.finish("a", ready.Session.RunID, "")
+	if transition(v1.Session.Activation).TransitionPending || !read("b").Session.TransitionPending {
+		t.Fatal("transition completion missed its own generation or touched a peer Session")
+	}
+	exit := f.activate("a", "").Session
+	if exit.Activation != v1.Session.Activation+1 || !exit.TransitionPending ||
+		exit.ActiveStageID != "" || exit.SnapshotID != "" {
+		t.Fatalf("exit must create a guarded normal activation: %+v", exit)
+	}
+	if !transition(v1.Session.Activation).TransitionPending {
+		t.Fatal("late stage completion cleared the exit barrier")
+	}
+	f.reopen(nil)
+	if !read("a").Session.TransitionPending || transition(exit.Activation).TransitionPending {
+		t.Fatal("normal-chat transition did not survive restart or clear on exact generation")
+	}
+	reactivated := f.call("a", "human", "workflow_activate", f.activation("a", stage, "V2")).(workflowView).Session
+	if reactivated.Activation != exit.Activation+1 || reactivated.SnapshotID != fresh.Session.SnapshotID ||
+		!reactivated.TransitionPending {
+		t.Fatalf("reactivation did not use the new snapshot: %+v", reactivated)
+	}
+	f.call("a", "workflow", "workflow_turn_failed", workflowTurnFailedArgs{
+		operation: workflowOp(), StageID: stage, Activation: v1.Session.Activation, Error: "late old failure",
+	})
+	if got := read("a").Session; got != reactivated {
+		t.Fatalf("late failure affected a newer activation of the same stage: %+v", got)
+	}
+}
+
+func TestWorkflowConcurrentStageSwitchAndTurnAdmission(t *testing.T) {
+	f := newWorkflowTest(t, nil)
+	initial := f.activate("session", "storyboard").Session
+	admission := f.admission("session", "storyboard", "")
+	switchStage := f.activation("session", "asset-binding", "V1")
+	peer := New(nil)
+	defer peer.Close()
+	ready := make(chan struct{})
+	started, switched := make(chan error, 1), make(chan error, 1)
+	go func() {
+		<-ready
+		_, err := editCall(f.s, f.dir, "session", "workflow", "workflow_turn_start", admission)
+		started <- err
+	}()
+	go func() {
+		<-ready
+		_, err := editCall(peer, f.dir, "session", "human", "workflow_activate", switchStage)
+		switched <- err
+	}()
+	close(ready)
+	startErr, switchErr := <-started, <-switched
+	cur := f.view("session").Session
+	var conflict *requestError
+	switch {
+	case startErr == nil && errors.As(switchErr, &conflict) && conflict.code == http.StatusConflict:
+		if cur.RunID != admission.RunID || cur.Activation != initial.Activation || cur.ActiveStageID != initial.ActiveStageID {
+			t.Fatalf("admitted turn lost its activation: %+v", cur)
+		}
+		f.finish("session", admission.RunID, "")
+	case switchErr == nil && errors.As(startErr, &conflict) && conflict.code == http.StatusConflict:
+		if cur.RunID != "" || cur.Activation != initial.Activation+1 || cur.ActiveStageID != switchStage.StageID {
+			t.Fatalf("switched stage admitted a stale turn: %+v", cur)
+		}
+	default:
+		t.Fatalf("expected exactly one atomic winner, got start=%v switch=%v", startErr, switchErr)
+	}
+}
+
+func TestWorkflowActivationRollsBackStagedSnapshot(t *testing.T) {
+	f := newWorkflowTest(t, nil)
+	bindSession(t, f.s, f.dir, "session")
+	p, err := f.s.open(context.Background(), f.dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := f.activation("session", "storyboard", "V1")
+	bad.Snapshot.SkillPath = "skills/../other.md"
+	f.check("session", "human", "workflow_activate", bad, http.StatusBadRequest)
+	bad = f.activation("session", "storyboard", "V1")
+	bad.Snapshot.SkillBody += " altered"
+	f.check("session", "human", "workflow_activate", bad, http.StatusBadRequest)
+
+	// Abort after SQLite has staged both the snapshot and the activation.
+	if _, err := p.db.Exec(`CREATE TRIGGER reject_activation_event BEFORE INSERT ON events
+		WHEN NEW.type='workflow' BEGIN SELECT RAISE(ABORT, 'interrupted activation fixture'); END`); err != nil {
+		t.Fatal(err)
+	}
+	activation := f.activation("session", "storyboard", "V1")
+	if _, err := editCall(f.s, f.dir, "session", "human", "workflow_activate", activation); err == nil ||
+		!strings.Contains(err.Error(), "interrupted activation fixture") {
+		t.Fatalf("expected a failed activation transaction: %v", err)
+	}
+	f.reopen(nil)
+	if view := f.view("session"); view.Session.Activation != 0 || view.Session.SnapshotID != "" ||
+		view.Session.ActiveStageID != "" || view.Session.TransitionPending {
+		t.Fatalf("interrupted activation leaked changed phase state: %+v", view.Session)
+	}
+	p, err = f.s.open(context.Background(), f.dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := p.db.QueryRow(`SELECT count(*) FROM workflow_capability_snapshots`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("interrupted activation leaked a staged snapshot: %d / %v", count, err)
+	}
+	if _, err := p.db.Exec(`DROP TRIGGER reject_activation_event`); err != nil {
+		t.Fatal(err)
+	}
+	if retry := f.call("session", "human", "workflow_activate", activation).(workflowView); retry.Session.SnapshotID == "" {
+		t.Fatal("retry could not use original operation ID after rollback")
+	}
+}
+
+func TestWorkflowActivationMigrationRetainsLegacyMetadata(t *testing.T) {
+	f := newWorkflowTest(t, nil)
+	bindSession(t, f.s, f.dir, "legacy")
+	p, err := f.s.open(context.Background(), f.dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyVersions := workflowTestSnapshot("storyboard", "old").workflowFileVersions
+	if _, err := p.db.Exec(`DELETE FROM workflow_migrations WHERE name='activation-snapshots-v1';
+		ALTER TABLE workflow_sessions DROP COLUMN snapshot_id;
+		ALTER TABLE workflow_sessions DROP COLUMN activated_at;
+		ALTER TABLE workflow_sessions DROP COLUMN transition_pending;
+		ALTER TABLE workflow_turns DROP COLUMN snapshot_id;
+		DROP TABLE workflow_capability_snapshots;
+		INSERT INTO workflow_sessions(session_id,stage_id,activation,skill_sha,harness_sha)
+			VALUES('legacy','storyboard',3,?,?),('already-exited','',4,'','');
+		INSERT INTO workflow_turns(id,session_id,stage_id,activation,status,input_key,skill_sha,harness_sha,started_at)
+			VALUES('legacy-turn','legacy','storyboard',3,'running','',?,?,'unknown');`,
+		legacyVersions.SkillSHA256, legacyVersions.HarnessSHA256, legacyVersions.SkillSHA256, legacyVersions.HarnessSHA256); err != nil {
+		t.Fatal(err)
+	}
+	f.reopen(nil)
+	legacy := f.call("legacy", "workflow", "workflow_session", nil).(workflowSessionResult)
+	if !legacy.Session.LegacyActivation || !legacy.Session.TransitionPending || legacy.Session.Activation != 3 ||
+		legacy.Session.ActiveStageID != "storyboard" || legacy.Session.workflowFileVersions != legacyVersions ||
+		legacy.Session.SnapshotID != "" || legacy.Snapshot != nil || legacy.Session.RunID != "" {
+		t.Fatalf("migration changed legacy activation or manufactured a snapshot: %+v", legacy)
+	}
+	if exited := f.view("already-exited").Session; exited.Activation != 4 || !exited.TransitionPending ||
+		exited.ActiveStageID != "" || exited.LegacyActivation {
+		t.Fatalf("exited legacy Session was not protected conservatively: %+v", exited)
+	}
+	f.check("legacy", "human", "workflow_activate", f.activation("legacy", "storyboard", "V1"), http.StatusConflict)
+	exit := f.activate("legacy", "")
+	if exit.Session.Activation != 4 || !exit.Session.TransitionPending {
+		t.Fatalf("legacy exit did not start a new protected generation: %+v", exit.Session)
+	}
+	active := f.activate("legacy", "storyboard")
+	if active.Session.Activation != 5 || active.Session.SnapshotID == "" || active.Session.LegacyActivation {
+		t.Fatalf("legacy Session could not explicitly adopt a new snapshot: %+v", active.Session)
 	}
 }
 
@@ -269,17 +524,17 @@ func TestWorkflowConcurrentConfirmation(t *testing.T) {
 	ready := make(chan struct{})
 	result := make(chan error, 2)
 	for session, h := range previews {
-		go func(session, id string) {
+		go func(session string, handoff workflowHandoff) {
 			<-ready
 			kernel := f.s
 			if session == "b" {
 				kernel = otherKernel
 			}
 			_, err := editCall(kernel, f.dir, session, "human", "workflow_handoff_confirm", workflowConfirmArgs{
-				operation: workflowOp(), HandoffID: id,
+				operation: workflowOp(), HandoffID: handoff.HandoffID, Snapshot: workflowTestSnapshot(handoff.TargetStageID, "V1"),
 			})
 			result <- err
-		}(session, h.HandoffID)
+		}(session, h)
 	}
 	close(ready)
 	first, second := <-result, <-result
@@ -303,7 +558,7 @@ func TestWorkflowLegacyApprovalMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.db.ExecContext(ctx, `DELETE FROM workflow_migrations`); err != nil {
+	if _, err := p.db.ExecContext(ctx, `DELETE FROM workflow_migrations WHERE name='formal-handoffs-v1'`); err != nil {
 		t.Fatal(err)
 	}
 	encoded, err := json.Marshal(legacyWorkflowRun{WorkflowID: dramaWorkflowID, WorkspaceID: "native-workspace",
@@ -430,9 +685,11 @@ func TestWorkflowVideoUsesAuthorizedExactResults(t *testing.T) {
 	if err := os.WriteFile(playablePath, []byte("local completion fixture"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	beforeFinal := f.view("active").Session
 	accepted := f.confirm("active", finalPreview)
 	if session := f.view("active").Session; accepted.TargetStageID != "" || session.PendingHandoffID != "" ||
-		session.ActiveStageID != "final-review" || session.Status != "active" {
+		session.ActiveStageID != "final-review" || session.Status != "active" ||
+		session.Activation != beforeFinal.Activation || session.SnapshotID != beforeFinal.SnapshotID {
 		t.Fatalf("end of chain scheduled a nonexistent stage: %+v / %+v", accepted, session)
 	}
 }

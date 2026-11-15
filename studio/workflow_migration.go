@@ -26,6 +26,25 @@ type legacyWorkflowHandoff struct {
 	stale                           bool
 }
 
+func migrateWorkflowActivations(ctx context.Context, tx *sql.Tx) error {
+	var migrated bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM workflow_migrations WHERE name='activation-snapshots-v1')`).Scan(&migrated); err != nil || migrated {
+		return err
+	}
+	// Legacy activations keep their known hashes without inventing a body.
+	// Even an exited Session may still have an older system surface on disk.
+	_, err := tx.ExecContext(ctx, `
+		CREATE TABLE workflow_capability_snapshots (id TEXT PRIMARY KEY, record TEXT NOT NULL);
+		ALTER TABLE workflow_sessions ADD COLUMN snapshot_id TEXT REFERENCES workflow_capability_snapshots(id);
+		ALTER TABLE workflow_sessions ADD COLUMN activated_at TEXT NOT NULL DEFAULT '';
+		ALTER TABLE workflow_sessions ADD COLUMN transition_pending INTEGER NOT NULL DEFAULT 0 CHECK(transition_pending IN (0,1));
+		ALTER TABLE workflow_turns ADD COLUMN snapshot_id TEXT REFERENCES workflow_capability_snapshots(id);
+		UPDATE workflow_sessions SET transition_pending=1 WHERE activation>0;
+		INSERT INTO workflow_migrations VALUES('activation-snapshots-v1');
+	`)
+	return err
+}
+
 // Import formal legacy approvals once. Keep the old execution rows for audit;
 // active legacy runs lost their Host across the build upgrade.
 func migrateWorkflowHandoffs(ctx context.Context, tx *sql.Tx) error {

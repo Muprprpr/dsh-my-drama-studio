@@ -82,6 +82,13 @@ func (p *project) saveWorkflowArtifact(ctx context.Context, r Request, args work
 		if !p.ownsWorkflowTurn(turn.id) {
 			return nil, workflowChanged
 		}
+		session, err := readWorkflowSession(ctx, tx, r.SessionID)
+		if err != nil {
+			return nil, err
+		}
+		if turn.activation != session.Activation || turn.snapshotID == "" || turn.snapshotID != session.SnapshotID {
+			return nil, workflowChanged
+		}
 		artifact := workflowArtifact{workflowArtifactNotes: args.workflowArtifactNotes, workflowFileVersions: turn.workflowFileVersions,
 			StageID: turn.stageID, SessionID: r.SessionID, Title: title, Kind: "document", Content: content,
 			CreatedAt: workflowNow(), inputKey: turn.inputKey}

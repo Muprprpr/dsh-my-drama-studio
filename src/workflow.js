@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { open, realpath, stat } from 'node:fs/promises'
 import { createRequire } from 'node:module'
-import { resolve } from 'node:path'
+import { relative, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { pathToFileURL } from 'node:url'
 import { StudioError } from './kernel.js'
@@ -12,8 +12,15 @@ const documentNodes = new Set(['script', 'shot', 'note'])
 const stageSection = 'drama-studio:workflow-stage'
 const stageMarker = '[Drama Studio Workflow Stage]'
 const probeKey = Symbol('verify workflow system prompt support')
-const maxHarnessBytes = 64 * 1024
+const maxFileBytes = { Skill: 512 * 1024, Harness: 64 * 1024 }
 const generationStage = 'video-generation'
+const managedSkills = new Set([
+  'drama-content-analysis', 'drama-shooting-script', 'drama-storyboard', 'drama-asset-binding',
+  'drama-video-deployment', 'drama-video-generation', 'drama-final-review',
+])
+const stageSkillError = '该 Skill 属于 Workflow 管理的阶段能力，请先切换到对应阶段。'
+const busyError = '当前阶段正在执行，请等待本轮完成后再切换。'
+const compactError = '阶段切换尚未完成，请先发送一条新阶段消息，再执行压缩。'
 
 function samePath(left, right) {
   return typeof left === 'string' && resolve(left).toLowerCase() === resolve(right).toLowerCase()
@@ -36,12 +43,12 @@ async function localFile(path, kind, read) {
     const info = await stat(path, { bigint: true })
     if (!info.isFile() || !info.size) throw new StudioError(400, `${kind} 必须是非空普通文件：${path}`)
     if (!read) return
-    if (info.size > maxHarnessBytes) throw new StudioError(400, `Harness 文件不能超过 64 KiB：${path}`)
+    if (info.size > maxFileBytes[kind]) throw new StudioError(400, `${kind} 文件不能超过 ${maxFileBytes[kind] / 1024} KiB：${path}`)
     const file = await open(path, 'r')
     try {
       const opened = await file.stat({ bigint: true })
-      if (opened.dev !== info.dev || opened.ino !== info.ino || !samePath(await realpath(path), path)) {
-        throw new StudioError(409, `Harness 路径已变更：${path}`)
+      if (!sameFile(info, opened) || !samePath(await realpath(path), path)) {
+        throw new StudioError(409, `${kind} 路径已变更：${path}`)
       }
       const size = Number(info.size)
       const buffer = Buffer.alloc(size + 1)
@@ -52,13 +59,13 @@ async function localFile(path, kind, read) {
         length += bytesRead
       }
       const finished = await file.stat({ bigint: true })
-      if (length !== size || finished.mtimeNs !== opened.mtimeNs || finished.ctimeNs !== opened.ctimeNs) {
-        throw new StudioError(409, `Harness 文件在读取时发生变化，请重试：${path}`)
+      if (length !== size || !sameFile(finished, opened)) {
+        throw new StudioError(409, `${kind} 文件在读取时发生变化，请重试：${path}`)
       }
       const bytes = buffer.subarray(0, length)
       const body = new TextDecoder('utf-8', { fatal: true }).decode(bytes).trim()
-      if (!body) throw new StudioError(400, `Harness 文件没有指令：${path}`)
-      return { body, sha256: sha256(bytes) }
+      if (!body) throw new StudioError(400, `${kind} 文件没有指令：${path}`)
+      return { body, sha256: sha256(bytes), info: finished }
     } finally {
       await file.close()
     }
@@ -67,6 +74,18 @@ async function localFile(path, kind, read) {
     if (error.code === 'ENOENT' || error.code === 'ENOTDIR') throw new StudioError(404, `${kind} 文件缺失：${path}`)
     if (error.code === 'ERR_ENCODING_INVALID_ENCODED_DATA') throw new StudioError(400, `${kind} 文件须为 UTF-8：${path}`)
     throw new StudioError(409, `无法读取${kind} 文件：${path}`)
+  }
+}
+
+function sameFile(left, right) {
+  return left && right && left.dev === right.dev && left.ino === right.ino &&
+    left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs
+}
+
+async function verifyUnchanged(path, kind, info) {
+  const current = await stat(path, { bigint: true }).catch(() => undefined)
+  if (!sameFile(info, current) || !samePath(await realpath(path).catch(() => undefined), path)) {
+    throw new StudioError(409, `${kind} 文件在激活时发生变化，请重试：${path}`)
   }
 }
 
@@ -104,10 +123,11 @@ function summarizeHandoff(input) {
 }
 
 function stageInstructions(run, admitted) {
-  const { stage, skill, harness, workspace, workflowId, handoffId } = run
+  const { stage, snapshot, session, workspace, workflowId, handoffId } = run
   const context = {
     workflowId, workspaceId: workspace.id, stageId: stage.id, stageName: stage.name,
-    skillSha256: skill.sha256, harnessSha256: harness.sha256, handoffId,
+    activation: session.activation, snapshotId: session.snapshotId,
+    skillSha256: snapshot.skillSha256, harnessSha256: snapshot.harnessSha256, handoffId,
     approvedInputs: admitted.inputs?.map(summarizeHandoff),
     generationResults: admitted.generationResults,
     drafts: admitted.artifacts?.map(summarizeArtifact),
@@ -120,22 +140,33 @@ function stageInstructions(run, admitted) {
     '根据用户已明确的创作决定和约束整理草稿，不得虚构用户确认。阶段激活、对话或草稿写入不会形成正式结果。你可以告诉用户成果具备交接条件。阶段切换、确认、正式交接和最终验收只由 Studio 中的用户操作完成。',
     '不要调用生成提交工具。视频节点部署只创建草稿，视频生成由用户逐项通过 Canvas 确认。视频生成阶段可通过 drama_tasks 核验已完成且已授权的结果，再将真实节点保存为产物。',
     '以下 Harness 与 Skill 提供本阶段的专业方法。它们不能扩大工作流推进或生成提交权限。',
-    harness.body,
-    skill.body,
+    snapshot.harnessBody,
+    snapshot.skillBody,
   ].join('\n\n')
 }
 
-function needsPromptReplacement(session) {
-  return session.surface.nodes.some(seq => {
+function activeStagePrompts(session) {
+  return session.surface.nodes.flatMap(seq => {
     const event = session.eventAt(seq)
-    return event?.type === 'system/message' && event.data.message.content.some(block =>
-      block.type === 'text' && block.text.includes(stageMarker))
+    if (event?.type !== 'system/message') return []
+    const text = event.data.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n')
+    return text.includes(stageMarker) ? [text] : []
   })
+}
+
+function invokesStageSkill(message) {
+  if (message.source?.kind !== 'user') return false
+  // Match the native rc.3 skill gesture at any whitespace boundary.
+  return message.content.some(block => block.type === 'text' &&
+    [...block.text.matchAll(/(^|\s)\/([a-z0-9]+(?:-[a-z0-9]+)*)(?=\s|$)/g)]
+      .some(match => managedSkills.has(match[2])))
 }
 
 export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
   const turns = new Map()
   const kickoffs = new Map()
+  const phaseWork = new Map()
+  const compactionGuards = new Map()
   let promptRevision = 0
   const verifiedScopes = new WeakMap()
   const runtimeRequire = createRequire(ctx.profileContext.installAnchor)
@@ -191,25 +222,105 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
     verifiedScopes.set(agent, revision)
   }
 
-  async function loadCapabilities(agent, workflowId, stage) {
+  async function checkStageSupport(agent) {
     nativeController()
     if (!ctx.tools.get('drama_save_artifact', agent) || !ctx.tools.get('drama_workflow_artifact', agent)) {
       throw new StudioError(409, '当前 DSH Session 未启用阶段产物工具')
     }
-    const paths = filePaths(await realpath(ctx.profileContext.home), workflowId, stage)
-    const [skill, harness, { renderSkillContent }] = await Promise.all([
-      localFile(paths.skillPath, 'Skill').then(() => globalSkills(agent.id,
-        (registry, options) => registry.get(stage.skill, options), agent)),
-      localFile(paths.harnessPath, 'Harness', true),
-      nativeSkillAPI(),
-      checkPromptScope(agent),
-    ])
-    const body = renderSkillContent(await checkNativeSkill(skill, stage, paths.skillPath))
-    return { skill: { body, sha256: sha256(body) }, harness }
+    installCompactionGuard(agent)
+    await checkPromptScope(agent)
   }
 
-  async function readSession(sessionId, workspace, signal = lifetime) {
-    return kernel(sessionId, workspace, 'workflow_session', {}, signal, 'workflow')
+  async function loadCapabilities(agent, workflowId, stage) {
+    await checkStageSupport(agent)
+    const root = await realpath(ctx.profileContext.home)
+    const paths = filePaths(root, workflowId, stage)
+    const [source, harness] = await Promise.all([
+      localFile(paths.skillPath, 'Skill', true),
+      localFile(paths.harnessPath, 'Harness', true),
+    ])
+    const [skill, { renderSkillContent }] = await Promise.all([
+      globalSkills(agent.id, (registry, options) => registry.get(stage.skill, options), agent),
+      nativeSkillAPI(),
+    ])
+    const skillBody = renderSkillContent(await checkNativeSkill(skill, stage, paths.skillPath))
+    await Promise.all([
+      verifyUnchanged(paths.skillPath, 'Skill', source.info),
+      verifyUnchanged(paths.harnessPath, 'Harness', harness.info),
+    ])
+    return {
+      stageId: stage.id,
+      skillPath: relative(root, paths.skillPath).replaceAll('\\', '/'),
+      harnessPath: relative(root, paths.harnessPath).replaceAll('\\', '/'),
+      skillSourceSha256: source.sha256,
+      skillSha256: sha256(skillBody),
+      harnessSha256: harness.sha256,
+      skillBody,
+      harnessBody: harness.body,
+    }
+  }
+
+  async function readSession(sessionId, workspace, signal = lifetime, stateOnly = false) {
+    return kernel(sessionId, workspace, 'workflow_session', stateOnly ? { stateOnly } : {}, signal, 'workflow')
+  }
+
+  async function changeStage(sessionId, run) {
+    if (phaseWork.has(sessionId)) throw new StudioError(409, busyError)
+    phaseWork.set(sessionId, 'transition')
+    try {
+      return await run()
+    } finally {
+      phaseWork.delete(sessionId)
+    }
+  }
+
+  async function guardCompaction(agent, signal, manual, run) {
+    const sessionId = agent.session.id
+    function pending() {
+      if (manual) throw new StudioError(409, compactError)
+      return null
+    }
+    const phase = phaseWork.get(sessionId)
+    if (phase === 'transition') return pending()
+    if (phase === 'compaction') {
+      if (manual) throw new StudioError(409, '当前 Session 正在压缩，请等待压缩完成。')
+      return null
+    }
+    phaseWork.set(sessionId, 'compaction')
+    try {
+      const workspace = await workspaceFor(ctx, sessionId).catch(error => {
+        if (error.status !== 404) throw error
+      })
+      const state = workspace && await readSession(sessionId, workspace, signal, true)
+      if (state?.session.transitionPending ||
+          (!state?.session.activeStageId && activeStagePrompts(agent.session).length)) return pending()
+      signal?.throwIfAborted()
+      return await run()
+    } finally {
+      phaseWork.delete(sessionId)
+    }
+  }
+
+  function installCompactionGuard(agent) {
+    const service = ctx.get('agentPresets')?.serviceFor(agent, 'compaction') ?? ctx.get('compaction')
+    const engine = service?.[Symbol.for('cordis.original')] ?? service
+    if (!engine || compactionGuards.has(engine)) return
+    const { compactIfNeeded, compactNow } = engine
+    if (typeof compactIfNeeded !== 'function' || typeof compactNow !== 'function') {
+      throw new StudioError(409, '当前 DSH 会话预设的压缩服务不支持阶段切换保护')
+    }
+    // rc.3 dispatches pressure and overflow through compactIfNeeded, and /compact
+    // through compactNow. Guard the actual scoped backend before it reads history.
+    engine.compactIfNeeded = function (owner, trigger, signal) {
+      return guardCompaction(owner, signal, false, () => compactIfNeeded.call(this, owner, trigger, signal))
+    }
+    engine.compactNow = function (owner, signal, commandId) {
+      return guardCompaction(owner, signal, true, () => compactNow.call(this, owner, signal, commandId))
+    }
+    compactionGuards.set(engine, () => {
+      engine.compactIfNeeded = compactIfNeeded
+      engine.compactNow = compactNow
+    })
   }
 
   async function get(sessionId, workspace, input) {
@@ -245,6 +356,7 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
   async function resolveAgent(sessionId) {
     const { agent } = await nativeController().resolveAgent(sessionId)
     if (!agent) throw new StudioError(409, '无法打开指定的 DSH Session')
+    installCompactionGuard(agent)
     return agent
   }
 
@@ -270,22 +382,27 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
     turn.settlement = (async () => {
       try {
         await turn.prepared
-        if (!turn.started) {
+        if (turn.started) {
+          await settle('workflow_turn_finish', { runId: turn.runId, ...(error && { error }) })
+        } else {
           if (turn.kickoff && error) await recordKickoffFailure(turn.kickoff, error)
           else if (turn.stage && error && !lifetime.aborted) {
-            await kernel(turn.agent.id, turn.workspace, 'workflow_turn_failed', {
-              operationId: randomUUID(), stageId: turn.stage.id, error,
-            }, undefined, 'workflow')
+            await settle('workflow_turn_failed', { stageId: turn.stage.id, activation: turn.session.activation, error })
           }
-          return
         }
-        const input = { operationId: randomUUID(), runId: turn.runId, ...(error && { error }) }
-        for (let attempt = 0; ; attempt++) {
-          try {
-            return await kernel(turn.agent.id, turn.workspace, 'workflow_turn_finish', input, undefined, 'workflow')
-          } catch (failure) {
-            if (attempt >= 2 || failure.status < 500 || lifetime.aborted) throw failure
-            await delay(150 * (attempt + 1))
+        if (!error && turn.transitionSeries && turn.hasAssistantReply) {
+          const prompts = activeStagePrompts(turn.agent.session)
+          const committed = turn.stage
+            ? prompts.length === 1 && prompts[0].includes(turn.instructions)
+            : prompts.length === 0
+          if (committed) {
+            // The native journal and SQLite commit independently. Persist the
+            // normalized native surface before dropping the SQLite barrier.
+            if (await ctx.get('sessions')?.flush(turn.agent.session)) {
+              await settle('workflow_transition_complete', { activation: turn.session.activation })
+            } else {
+              console.warn('[my-drama-studio] Workflow transition awaits native Session persistence', turn.agent.id)
+            }
           }
         }
       } catch (failure) {
@@ -295,6 +412,18 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
       }
     })()
     return turn.settlement
+
+    async function settle(action, data) {
+      const input = { operationId: randomUUID(), ...data }
+      for (let attempt = 0; ; attempt++) {
+        try {
+          return await kernel(turn.agent.id, turn.workspace, action, input, undefined, 'workflow')
+        } catch (failure) {
+          if (attempt >= 2 || failure.status < 500 || lifetime.aborted) throw failure
+          await delay(150 * (attempt + 1))
+        }
+      }
+    }
   }
 
   async function prepareTurn(turn, signal) {
@@ -302,9 +431,11 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
     if (turn.staleKickoff && !turn.hasChat) return
     const { agent } = turn
     try {
+      installCompactionGuard(agent)
       const workspace = await workspaceFor(ctx, agent.id)
       turn.workspace = workspace
-      const { session, stage, workflowId } = await readSession(agent.id, workspace, signal)
+      const { session, stage, workflowId, snapshot } = await readSession(agent.id, workspace, signal)
+      turn.session = session
       if (turn.kickoff && (turn.kickoff.handoffId !== session.pendingHandoffId || !sameWorkspace(workspace, turn.kickoff.workspace))) {
         await recordKickoffFailure(turn.kickoff, '交接启动请求已失效')
         turn.kickoff = undefined
@@ -316,7 +447,11 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
       turn.stage = stage
       turn.workflowId = workflowId
       turn.handoffId = turn.kickoff?.handoffId
-      Object.assign(turn, await loadCapabilities(agent, workflowId, stage))
+      if (!snapshot || !session.snapshotId) {
+        throw new StudioError(409, '当前阶段没有可恢复的能力快照，请退出阶段后重新激活。')
+      }
+      turn.snapshot = snapshot
+      await checkStageSupport(agent)
       const current = await workspaceFor(ctx, agent.id)
       if (!sameWorkspace(current, workspace)) throw new StudioError(409, 'Session 的 Workspace 已切换')
       signal.throwIfAborted()
@@ -325,7 +460,7 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
       // then closes the same run instead of leaving SQLite in Running.
       const input = {
         operationId: turn.runId, runId: turn.runId, stageId: stage.id,
-        skillSha256: turn.skill.sha256, harnessSha256: turn.harness.sha256,
+        activation: session.activation, snapshotId: session.snapshotId,
         ...(turn.handoffId && { handoffId: turn.handoffId }),
       }
       const admit = () => kernel(agent.id, workspace, 'workflow_turn_start', input, lifetime, 'workflow')
@@ -369,6 +504,11 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
   })
 
   ctx.on('agent/created', ({ agent }) => {
+    try {
+      installCompactionGuard(agent)
+    } catch (error) {
+      console.error('[my-drama-studio] Workflow compaction', error.message)
+    }
     // A restarted Host never replays a deferred transition. Pending kickoff is
     // visible in Studio until the browser explicitly retries it.
     for (const message of [...agent.inbox.nextTurn, ...agent.inbox.nextStep]) {
@@ -406,10 +546,14 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
     return { ...assembly, tools: assembly.tools.filter(tool => !artifactTools.has(tool.name)) }
   }, { prepend: true })
 
-  ctx.on('agent/pre-step', async ({ agent, turn: number, step }, next) => {
+  ctx.on('agent/pre-step', async ({ agent, turn: number, step, messages: claimed }, next) => {
     const turn = turns.get(agent.id)
     const ownTurn = turn?.agent === agent && turn.number === number
     if (ownTurn && (turn.failure || turn.staleKickoff && !turn.hasChat)) return { kind: 'reject' }
+    if (ownTurn && turn.workspace && claimed.some(invokesStageSkill)) {
+      turn.failure = stageSkillError
+      throw new StudioError(409, stageSkillError)
+    }
     const decision = await next()
     if (ownTurn && turn.instructions && turn.promptRevision !== promptRevision) {
       turn.failure = 'DSH 原生指令设置已更改，请重新发送本轮消息'
@@ -418,20 +562,25 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
     if (decision.kind === 'reject') return decision
     const messages = ownTurn ? decision.messages.filter(message => {
       if (isKickoffMessage(message)) return requestId(message) === turn.kickoff?.requestId
-      return !turn.instructions || message.source?.kind !== 'skill-invocation' || message.source.name !== turn.stage.skill
+      return !turn.workspace || message.source?.kind !== 'skill-invocation' || !managedSkills.has(message.source.name)
     }) : decision.messages
     // DeepSeek can retain old system messages in its request series. A new
     // series makes the native loop replace them when switching, exiting or
     // beginning a stage turn with updated confirmed inputs.
-    if (step === 1 && ((ownTurn && turn.instructions) || needsPromptReplacement(agent.session))) {
+    if (step === 1 && ((ownTurn && (turn.instructions || turn.session?.transitionPending)) ||
+        activeStagePrompts(agent.session).length)) {
+      if (ownTurn && turn.session?.transitionPending) turn.transitionSeries = true
       return { ...decision, messages, startsRequestSeries: true }
     }
     return { ...decision, messages }
   }, { prepend: true })
 
   ctx.on('session/event', (session, event) => {
+    if (event.type !== 'turn/end' && event.type !== 'assistant/message') return
     const turn = turns.get(session.id)
-    if (event.type === 'turn/end' && turn?.agent.session === session && event.data.turn === turn.number) {
+    if (turn?.agent.session !== session || event.data.turn !== turn.number) return
+    if (event.type === 'assistant/message' && !event.data.interrupted) turn.hasAssistantReply = true
+    if (event.type === 'turn/end') {
       void finishTurn(turn, turn.failure ?? endError(event.data.reason))
     }
   })
@@ -445,13 +594,14 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
 
   ctx.effect(() => async () => {
     await Promise.allSettled([...turns.values()].map(turn => finishTurn(turn, 'Studio Host 已退出，当前执行中断')))
+    for (const restore of compactionGuards.values()) restore()
+    compactionGuards.clear()
   })
 
   ctx.effect(() => ctx.tools.guard(exec => {
-    if (exec.name !== 'skill' || !exec.agent) return
-    const turn = turns.get(exec.agent.id)
-    if (turn?.agent === exec.agent && turn.started && !turn.settlement && exec.arguments?.name === turn.stage.skill) {
-      return '当前阶段已通过 DSH 加载全局 Skill，继续使用本轮系统指令中的版本'
+    if (exec.name === 'skill' && exec.agent && managedSkills.has(exec.arguments?.name) &&
+        ctx.workspaceRegistry.list().some(workspace => workspace.sessionIds.includes(exec.agent.id))) {
+      return stageSkillError
     }
   }))
 
@@ -488,30 +638,39 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
 
   async function activate(sessionId, workspace, input) {
     const { operationId, stageId } = input
-    let versions
-    if (stageId) {
+    return changeStage(sessionId, async () => {
       const view = await kernel(sessionId, workspace, 'workflow_get', {}, lifetime, 'human')
-      const stage = view.stages.find(item => item.id === stageId)
-      if (!stage) throw new StudioError(400, '未知的工作流阶段')
-      const agent = await resolveAgent(sessionId)
-      const { skill, harness } = await loadCapabilities(agent, view.id, stage)
-      versions = { skillSha256: skill.sha256, harnessSha256: harness.sha256 }
-    }
-    const current = await workspaceFor(ctx, sessionId)
-    if (!sameWorkspace(current, workspace)) throw new StudioError(409, 'Session 的 Workspace 已切换')
-    return kernel(sessionId, workspace, 'workflow_activate', { operationId, stageId, ...versions }, lifetime, 'human')
+      const { session } = view
+      if (session.status === 'running' && (session.activeStageId ?? '') !== stageId) {
+        throw new StudioError(409, busyError)
+      }
+      let snapshot
+      if (stageId && stageId !== session.activeStageId) {
+        const stage = view.stages.find(item => item.id === stageId)
+        if (!stage) throw new StudioError(400, '未知的工作流阶段')
+        snapshot = await loadCapabilities(await resolveAgent(sessionId), view.id, stage)
+      } else if (!stageId && session.activeStageId) {
+        await resolveAgent(sessionId)
+      }
+      const current = await workspaceFor(ctx, sessionId)
+      if (!sameWorkspace(current, workspace)) throw new StudioError(409, 'Session 的 Workspace 已切换')
+      return kernel(sessionId, workspace, 'workflow_activate', {
+        operationId, stageId, expectedActivation: session.activation, snapshot,
+      }, lifetime, 'human')
+    })
   }
 
   async function submitKickoff(kickoff) {
     const { sessionId, workspace, handoffId } = kickoff
     try {
-      const { session, stage, workflowId } = await readSession(sessionId, workspace)
+      const { session, stage } = await readSession(sessionId, workspace, lifetime, true)
       if (session.pendingHandoffId !== handoffId || !stage) {
         if (kickoffs.get(sessionId) === kickoff) kickoffs.delete(sessionId)
         return { session }
       }
       kickoff.agent = await resolveAgent(sessionId)
-      await loadCapabilities(kickoff.agent, workflowId, stage)
+      if (!session.snapshotId) throw new StudioError(409, '当前阶段没有可恢复的能力快照，请退出阶段后重新激活。')
+      await checkStageSupport(kickoff.agent)
       const current = await workspaceFor(ctx, sessionId)
       if (!sameWorkspace(current, workspace)) throw new StudioError(409, 'Session 的 Workspace 已切换')
       kickoff.prompt = `已确认交接。请开始「${stage.name}」，从已确认的交接包和固定产物版本读取所需信息，按当前阶段规则开展第一轮工作。`
@@ -522,7 +681,7 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
     } catch (error) {
       await recordKickoffFailure(kickoff, publicFailure(error))
     }
-    return readSession(sessionId, workspace)
+    return readSession(sessionId, workspace, lifetime, true)
   }
 
   function kickoff(sessionId, workspace, handoffId) {
@@ -535,15 +694,24 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
   }
 
   async function confirm(sessionId, workspace, input) {
-    const handoff = await kernel(sessionId, workspace, 'workflow_handoff_confirm', input, lifetime, 'human')
-    const { session } = await readSession(sessionId, workspace)
+    const handoff = await changeStage(sessionId, async () => {
+      const { session, workflowId } = await readSession(sessionId, workspace, lifetime, true)
+      const { targetStage } = await kernel(sessionId, workspace, 'workflow_handoff_target',
+        { handoffId: input.handoffId }, lifetime, 'workflow')
+      if (targetStage && session.status === 'running') throw new StudioError(409, busyError)
+      const snapshot = targetStage && await loadCapabilities(await resolveAgent(sessionId), workflowId, targetStage)
+      const current = await workspaceFor(ctx, sessionId)
+      if (!sameWorkspace(current, workspace)) throw new StudioError(409, 'Session 的 Workspace 已切换')
+      return kernel(sessionId, workspace, 'workflow_handoff_confirm', { ...input, snapshot }, lifetime, 'human')
+    })
+    const { session } = await readSession(sessionId, workspace, lifetime, true)
     if (session.pendingHandoffId !== handoff.handoffId) return { handoff, session }
     const next = await kickoff(sessionId, workspace, handoff.handoffId)
     return { handoff, session: next.session }
   }
 
   async function retry(sessionId, workspace, handoffId) {
-    const { session } = await readSession(sessionId, workspace)
+    const { session } = await readSession(sessionId, workspace, lifetime, true)
     if (!handoffId || session.pendingHandoffId !== handoffId) throw new StudioError(409, '当前 Session 没有待启动的该次交接')
     return kickoff(sessionId, workspace, handoffId)
   }

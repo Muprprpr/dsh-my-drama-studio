@@ -38,7 +38,58 @@ type workflowPreviewArgs struct {
 
 type workflowConfirmArgs struct {
 	operation
-	HandoffID string `json:"handoffId"`
+	HandoffID string            `json:"handoffId"`
+	Snapshot  *workflowSnapshot `json:"snapshot,omitempty"`
+}
+
+type workflowHandoffTarget struct {
+	TargetStage *workflowStage `json:"targetStage,omitempty"`
+}
+
+func (p *project) workflowHandoffTarget(ctx context.Context, sessionID, handoffID string) (workflowHandoffTarget, error) {
+	var out workflowHandoffTarget
+	if handoffID == "" {
+		return out, invalid("请先生成交接预览")
+	}
+	tx, err := p.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return out, err
+	}
+	defer tx.Rollback()
+	var record string
+	var confirmed bool
+	var activation int64
+	err = tx.QueryRowContext(ctx, `SELECT record,revision IS NOT NULL,activation FROM workflow_handoffs WHERE id=? AND session_id=?`,
+		handoffID, sessionID).Scan(&record, &confirmed, &activation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return out, workflowChanged
+	}
+	if err != nil || confirmed {
+		// Confirmation can replay its stored result without reading today's files.
+		return out, err
+	}
+	var handoff workflowHandoff
+	if err := json.Unmarshal([]byte(record), &handoff); err != nil {
+		return out, err
+	}
+	session, err := readWorkflowSession(ctx, tx, sessionID)
+	if err != nil {
+		return out, err
+	}
+	if session.RunID != "" {
+		return out, workflowTurnRunning
+	}
+	if session.Activation != activation || session.ActiveStageID != handoff.SourceStageID {
+		return out, workflowChanged
+	}
+	if handoff.TargetStageID != "" {
+		index := workflowStageIndex(handoff.TargetStageID)
+		if index < 0 {
+			return out, workflowChanged
+		}
+		out.TargetStage = &dramaWorkflowStages[index]
+	}
+	return out, nil
 }
 
 func workflowNextStage(index int) string {
@@ -213,7 +264,7 @@ func (p *project) previewWorkflowHandoff(ctx context.Context, r Request, args wo
 			return nil, err
 		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO workflow_handoffs(id,stage_id,session_id,activation,draft_watermark,record)
-			VALUES(?,?,?,?,?,?)`, handoff.HandoffID, handoff.SourceStageID, r.SessionID, session.activation, watermark, string(body))
+			VALUES(?,?,?,?,?,?)`, handoff.HandoffID, handoff.SourceStageID, r.SessionID, session.Activation, watermark, string(body))
 		return handoff, err
 	})
 }
@@ -380,7 +431,10 @@ func (p *project) confirmWorkflowHandoff(ctx context.Context, r Request, args wo
 		if err != nil {
 			return nil, err
 		}
-		if session.ActiveStageID != handoff.SourceStageID || session.activation != activation || session.RunID != "" {
+		if session.RunID != "" {
+			return nil, workflowTurnRunning
+		}
+		if session.ActiveStageID != handoff.SourceStageID || session.Activation != activation {
 			return nil, workflowChanged
 		}
 		revision, err := workflowRevision(ctx, tx)
@@ -408,6 +462,19 @@ func (p *project) confirmWorkflowHandoff(ctx context.Context, r Request, args wo
 		if err := p.checkWorkflowHandoffArtifacts(ctx, tx, latest, handoff.SourceStageID, handoff.Artifacts); err != nil {
 			return nil, err
 		}
+		if handoff.TargetStageID != "" {
+			if err := advanceWorkflowActivation(ctx, tx, r.SessionID, handoff.TargetStageID, handoff.HandoffID, args.Snapshot); err != nil {
+				return nil, err
+			}
+		} else {
+			if args.Snapshot != nil {
+				return nil, invalid("最终验收没有下一阶段，不能指定目标能力快照")
+			}
+			// Final acceptance keeps the same activation and ends any pending kickoff.
+			if _, err := tx.ExecContext(ctx, `UPDATE workflow_sessions SET pending_handoff='',error='' WHERE session_id=?`, r.SessionID); err != nil {
+				return nil, err
+			}
+		}
 		handoff.ConfirmedAt = workflowNow()
 		for i := range handoff.Artifacts {
 			handoff.Artifacts[i].HandedOff = true
@@ -425,21 +492,6 @@ func (p *project) confirmWorkflowHandoff(ctx context.Context, r Request, args wo
 				downstream.ID); err != nil {
 				return nil, err
 			}
-		}
-		var pending string
-		nextActiveStage := handoff.TargetStageID
-		versions := session.workflowFileVersions
-		if handoff.TargetStageID != "" {
-			pending = handoff.HandoffID
-			versions = workflowFileVersions{}
-		} else {
-			// Final acceptance leaves the Session active on the final stage for further review.
-			nextActiveStage = handoff.SourceStageID
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE workflow_sessions SET stage_id=?,activation=activation+1,
-			skill_sha=?,harness_sha=?,pending_handoff=?,error='' WHERE session_id=?`, nextActiveStage,
-			versions.SkillSHA256, versions.HarnessSHA256, pending, r.SessionID); err != nil {
-			return nil, err
 		}
 		if _, err := addEvent(ctx, tx, "workflow", []string{handoff.SourceStageID}); err != nil {
 			return nil, err

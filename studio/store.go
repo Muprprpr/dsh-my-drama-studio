@@ -211,6 +211,9 @@ func (s *Service) open(ctx context.Context, directory string, create bool) (*pro
 		err = migrateWorkflowHandoffs(ctx, tx)
 	}
 	if err == nil {
+		err = migrateWorkflowActivations(ctx, tx)
+	}
+	if err == nil {
 		_, err = tx.ExecContext(ctx, `INSERT INTO canvas_meta VALUES(1,?) ON CONFLICT DO NOTHING`, uuid.NewString())
 	}
 	if err == nil {

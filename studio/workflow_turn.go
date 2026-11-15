@@ -10,10 +10,11 @@ import (
 
 type workflowTurnStartArgs struct {
 	operation
-	workflowFileVersions
-	StageID   string `json:"stageId"`
-	RunID     string `json:"runId"`
-	HandoffID string `json:"handoffId,omitempty"`
+	StageID    string `json:"stageId"`
+	RunID      string `json:"runId"`
+	Activation int64  `json:"activation"`
+	SnapshotID string `json:"snapshotId"`
+	HandoffID  string `json:"handoffId,omitempty"`
 }
 
 type workflowTurnFinishArgs struct {
@@ -30,8 +31,9 @@ type workflowKickoffFailedArgs struct {
 
 type workflowTurnFailedArgs struct {
 	operation
-	StageID string `json:"stageId"`
-	Error   string `json:"error"`
+	StageID    string `json:"stageId"`
+	Activation int64  `json:"activation"`
+	Error      string `json:"error"`
 }
 
 type workflowTurnResult struct {
@@ -45,13 +47,14 @@ type workflowTurn struct {
 	id, stageID, sessionID, status, inputKey string
 	workflowFileVersions
 	activation int64
+	snapshotID string
 }
 
 func readWorkflowTurn(ctx context.Context, tx *sql.Tx, runID string) (workflowTurn, error) {
 	var turn workflowTurn
-	err := tx.QueryRowContext(ctx, `SELECT id,stage_id,session_id,status,input_key,skill_sha,harness_sha,activation
+	err := tx.QueryRowContext(ctx, `SELECT id,stage_id,session_id,status,input_key,skill_sha,harness_sha,activation,COALESCE(snapshot_id,'')
 		FROM workflow_turns WHERE id=?`, runID).Scan(&turn.id, &turn.stageID, &turn.sessionID, &turn.status,
-		&turn.inputKey, &turn.SkillSHA256, &turn.HarnessSHA256, &turn.activation)
+		&turn.inputKey, &turn.SkillSHA256, &turn.HarnessSHA256, &turn.activation, &turn.snapshotID)
 	return turn, err
 }
 
@@ -65,7 +68,8 @@ func sessionResult(session workflowSession) workflowSessionResult {
 
 func (p *project) startWorkflowTurn(ctx context.Context, r Request, args workflowTurnStartArgs) (any, error) {
 	stageIndex := workflowStageIndex(args.StageID)
-	if stageIndex < 0 || strings.TrimSpace(args.RunID) == "" || len(args.RunID) > 160 || !args.workflowFileVersions.valid() {
+	if stageIndex < 0 || strings.TrimSpace(args.RunID) == "" || len(args.RunID) > 160 ||
+		args.Activation <= 0 || !validWorkflowSHA256(args.SnapshotID) {
 		return nil, invalid("原生回合需要有效的阶段 ID、运行 ID 和能力版本")
 	}
 	var locked bool
@@ -74,7 +78,13 @@ func (p *project) startWorkflowTurn(ctx context.Context, r Request, args workflo
 		if err != nil {
 			return nil, err
 		}
-		if session.ActiveStageID != args.StageID {
+		if session.ActiveStageID != args.StageID || session.Activation != args.Activation {
+			return nil, workflowChanged
+		}
+		if session.LegacyActivation {
+			return nil, workflowLegacyActivation
+		}
+		if session.SnapshotID != args.SnapshotID {
 			return nil, workflowChanged
 		}
 		if session.RunID != "" {
@@ -105,23 +115,22 @@ func (p *project) startWorkflowTurn(ctx context.Context, r Request, args workflo
 			return nil, err
 		}
 		locked = true
-		if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_turns(id,session_id,stage_id,activation,status,input_key,skill_sha,harness_sha,started_at)
-			VALUES(?,?,?,?,'running',?,?,?,?)`, args.RunID, r.SessionID, args.StageID, session.activation,
-			workflowInputKey(inputs), args.SkillSHA256, args.HarnessSHA256, workflowNow()); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_turns(id,session_id,stage_id,activation,status,input_key,skill_sha,harness_sha,started_at,snapshot_id)
+			VALUES(?,?,?,?,'running',?,?,?,?,?)`, args.RunID, r.SessionID, args.StageID, session.Activation,
+			workflowInputKey(inputs), session.SkillSHA256, session.HarnessSHA256, workflowNow(), session.SnapshotID); err != nil {
 			return nil, err
 		}
 		if args.HandoffID != "" {
 			session.PendingHandoffID = ""
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE workflow_sessions SET skill_sha=?,harness_sha=?,pending_handoff=?,error=''
-			WHERE session_id=?`, args.SkillSHA256, args.HarnessSHA256, session.PendingHandoffID, r.SessionID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE workflow_sessions SET pending_handoff=?,error=''
+			WHERE session_id=?`, session.PendingHandoffID, r.SessionID); err != nil {
 			return nil, err
 		}
 		if _, err := addEvent(ctx, tx, "workflow", []string{r.SessionID}); err != nil {
 			return nil, err
 		}
 		session.Status, session.RunID, session.Error = workflowRunning, args.RunID, ""
-		session.workflowFileVersions = args.workflowFileVersions
 		out.workflowSessionResult = sessionResult(session)
 		return out, nil
 	})
@@ -183,12 +192,12 @@ func updateFinishedWorkflowTurn(ctx context.Context, tx *sql.Tx, turn workflowTu
 }
 
 func (p *project) failWorkflowKickoff(ctx context.Context, r Request, args workflowKickoffFailedArgs) (any, error) {
-	return p.markWorkflowAdmissionFailed(ctx, r, args.operation, "", args.HandoffID, args.Error)
+	return p.markWorkflowAdmissionFailed(ctx, r, args.operation, "", args.HandoffID, 0, args.Error)
 }
 
-func (p *project) markWorkflowAdmissionFailed(ctx context.Context, r Request, op operation, stageID, handoffID, reason string) (any, error) {
+func (p *project) markWorkflowAdmissionFailed(ctx context.Context, r Request, op operation, stageID, handoffID string, activation int64, reason string) (any, error) {
 	text := workflowErrorText(reason)
-	if text == "" || (stageID == "" && handoffID == "") {
+	if text == "" || (handoffID == "" && (stageID == "" || activation <= 0)) {
 		return nil, invalid("需要当前阶段或交接 ID 和失败原因")
 	}
 	return p.write(ctx, r, op.ID, func(tx *sql.Tx, _ Status) (any, error) {
@@ -197,7 +206,7 @@ func (p *project) markWorkflowAdmissionFailed(ctx context.Context, r Request, op
 			return nil, err
 		}
 		matches := handoffID != "" && handoffID == session.PendingHandoffID ||
-			stageID != "" && stageID == session.ActiveStageID && session.PendingHandoffID == ""
+			stageID != "" && stageID == session.ActiveStageID && activation == session.Activation && session.PendingHandoffID == ""
 		if matches && session.RunID == "" {
 			if _, err := tx.ExecContext(ctx, `UPDATE workflow_sessions SET error=? WHERE session_id=?`, text, r.SessionID); err != nil {
 				return nil, err

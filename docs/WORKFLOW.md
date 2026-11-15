@@ -2,7 +2,7 @@
 
 ## 阶段和会话
 
-项目会话在原生聊天输入框上方显示固定流程。点击阶段为当前 Session 激活对应的 Harness 和 Skill。激活时只检查能力和载入状态，随后由原生聊天框发送每次讨论、修改或生成草稿的请求。可以退出阶段恢复普通聊天，也可以切换阶段继续工作。每个 Session 独立激活、运行和失败，切换阶段保留已有草稿与版本。
+项目会话在原生聊天输入框上方显示固定流程。点击阶段时，Studio 读取对应的全局 Harness 和 Skill，并在当前 Session 的新激活记录中固定版本。随后使用原生聊天框讨论、修改和生成草稿。阶段回合执行期间，当前 Session 可以查看产物，切换和退出返回 409。回合结算后恢复操作，其他 Session 仍可独立工作。
 
 | 阶段 ID | 名称 |
 | --- | --- |
@@ -23,9 +23,15 @@ DSH_HOME/skills/drama-<stage-id>/SKILL.md
 DSH_HOME/drama-studio/workflows/drama-production/stages/<stage-id>/harness.md
 ```
 
-`SKILL.md` 使用 DSH 原生 frontmatter，`name` 为 `drama-<stage-id>`，并填写 `description`。正文描述专业工作方法。Harness 写阶段目标、允许的输入和交付约束，使用非空 UTF-8 文本，大小上限为 64 KiB。Studio 沿用当前预设下的原生 Skill 目录，使用 DSH 用户目录的 Skill。Agent 可以使用已确认输入、查询素材和保存当前阶段的独立草稿。创作决策和制作约束随所选产物进入交接包。
+`SKILL.md` 使用 DSH 原生 frontmatter，`name` 为 `drama-<stage-id>`，并填写 `description`。正文描述专业工作方法。快照接受最大 512 KiB 的 UTF-8 Skill 源文件。Harness 写阶段目标、允许的输入和交付约束，使用非空 UTF-8 文本，大小上限为 64 KiB。Studio 沿用当前预设下的原生 Skill 目录，使用 DSH 用户目录的 Skill。Agent 可以使用已确认输入、查询素材和保存当前阶段的独立草稿。创作决策和制作约束随所选产物进入交接包。
 
-Host 使用 DSH 的 `system-prompt/assemble` 在当前 Agent 的原生请求中装填阶段指令。每轮记录采用的 Skill 与 Harness SHA-256。退出或切换阶段时，原生请求序列替换上轮系统指令。锁定完整系统指令、因而无法接收阶段装填的 DSH 预设会在激活时返回错误。
+激活快照保存渲染后的完整 Skill、Harness 正文、相对路径、原始文件和渲染后 Skill 的 SHA-256。激活代数、时间及快照引用由 Workspace SQLite 保存。重复点击当前阶段继续用原来的快照。全局文件更新后，新激活采用新版本。Skill 指向的 references、templates、脚本和其他外部文件仍按各自路径读取，阶段规则和关键模板内容应写进已快照的两个正文。发布方应一起更新同一阶段的两个文件。读取过程中发现文件变化时，激活失败并可重试。
+
+Host 用 DSH 的 `system-prompt/assemble` 装填当前激活，`agent/pre-step` 请求新序列以替换活动系统指令。每轮落盘其激活代数、快照 ID 与 Hash。锁定完整提示词的预设会在激活时返回错误。
+
+进入、切换或退出阶段时，SQLite 设置本次激活的过渡保护。首个新序列的实际模型回合成功后，Host 才能清除同一代数的保护。失败、取消或进程中断时保留待处理状态。等待期间，系统暂停自动压缩，并在用户执行 `/compact` 时提示先发送一条新阶段消息。原生追加日志、已有用户消息、回复、工具结果和旧摘要仍可保留。
+
+Studio 管理的阶段 Skill 通过阶段激活进入模型请求。项目会话的原生斜杠和 `skill` 工具会拒绝直接加载这些阶段名，并提示通过阶段按钮使用。其他 DSH Skills 继续按原生方式使用。
 
 ## 草稿与正式交接
 
@@ -37,11 +43,27 @@ Host 使用 DSH 的 `system-prompt/assemble` 在当前 Agent 的原生请求中�
 
 ## 升级与恢复
 
-保持现有 `.drama-studio/studio.db` 和七阶段 ID。已验收的旧记录仍作为正式上游，旧引用继续按现有 Canvas 版本校验。历史数据中缺少的正文快照无法追溯恢复。旧版运行入口退出使用，旧工件只识别旧表中的进度。升级前应结束旧 Host，Host、Browser 和 Go 工件采用同次构建。
+保持现有 `.drama-studio/studio.db` 和七阶段 ID。迁移保留已确认的交接、历史回合、产物、激活和已有 Hash。升级时缺少正文快照的旧激活需要退出并重新激活，所生成的快照仅用于新的激活。升级前结束旧 Host，并同时替换 Host、Browser 和 Go 工件。旧工件回滚会绕过新增守卫及快照语义。如需回到旧版行为，先结束新 Host 并保留迁移后的数据库副本。
 
 刷新、切换 Session 和重启 Host 后，SQLite 恢复阶段激活、草稿版本与正式交接。原生 Agent 中断时保留执行记录，确认状态保持在最后一次事务提交的位置。重启不会自动执行初始任务。
 
-## 验证
+## 生命周期回归
+
+`tests/workflow-lifecycle.mjs` 以独立的 Home、Profile 和 Workspace 启动 DSH Web Host。通过原生 DeepSeekAdapter 向本地 SSE 夹具发送请求，断言模型收到的 system、user 和 tool 内容。测试涵盖 `leading-only` 和 `in-history` 的系统提示更新、手动与压力触发压缩、取消和失败保留过渡保护、快照版本、受管 Skill 入口、多会话和 Host 重启。浏览器专项验证执行中的阶段按钮、产物查看和服务端 409。Go 测试验证操作并发、快照与激活事务回滚及旧库迁移。
+
+使用同次构建的 `dist/host.js`、`dist/client.js` 和 `dist/studio.exe`。
+
+```powershell
+$env:DRAMA_DSH_CLI = (Resolve-Path -LiteralPath '.runtime/dsh-rc3/node_modules/@deepseek-ai/dsh/lib/bin.js').Path
+go test -count=1 ./...
+node tests/workflow-lifecycle.mjs
+node --test --test-name-pattern '^Workflow dock' tests/web.mjs
+node tests/agent-fixture.mjs
+```
+
+压缩守卫覆盖 rc.3 原生 `/compact` 与原生自动压力和溢出恢复入口。第三方插件直接调用低层 `compactRegion` 的组合需单独验证。过渡完成前，Studio 先保存已替换的原生 Session 表面，再按代数清除 SQLite 保护。
+
+## 既有工作流验证记录
 
 本次在 Windows x64、DSH `0.2.1-rc.3`、Go `1.27.2`、Node.js `25.8.0` 和 Chrome 上验证。
 

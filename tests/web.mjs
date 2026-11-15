@@ -747,6 +747,27 @@ test('Workflow dock isolates Sessions and rejects conflicting Workspace handoffs
     await poll(async () => (await read(a)).session.status === 'running' && (await read(b)).session.status === 'running',
       'Two concurrent native Agent turns did not enter the same stage')
     assert.equal((await read(c)).session.status, 'normal')
+    const runningPane = await openWorkflow(page, a)
+    const switchStage = runningPane.getByRole('button', { name: '分镜制作', exact: true })
+    const exitStage = runningPane.getByRole('button', { name: '退出阶段', exact: true })
+    const waitMessage = '当前阶段正在执行，请等待本轮完成后再切换。'
+    await runningPane.getByText(waitMessage, { exact: true }).waitFor()
+    assert.ok(await switchStage.isDisabled())
+    assert.ok(await exitStage.isDisabled())
+    assert.ok(await runningPane.getByRole('button', { name: '拍摄脚本制作', exact: true }).isEnabled())
+    await runningPane.getByRole('button', { name: '阶段产物', exact: true }).click()
+    await page.getByTestId('drama-workflow-artifacts').and(page.locator(`[data-session-id="${a.sessionId}"]`)).waitFor()
+    for (const stageId of ['storyboard', '']) {
+      const blocked = await request(page, 'operation', {
+        ticket: tickets.get(a), action: 'workflow_activate', data: { operationId: randomUUID(), stageId },
+      })
+      assert.equal(blocked.status, 409)
+      assert.equal(blocked.body.error, waitMessage)
+    }
+    assert.equal((await read(a)).session.activeStageId, 'shooting-script')
+    await write(c, 'workflow_activate', { stageId: 'storyboard' })
+    assert.equal((await read(c)).session.activeStageId, 'storyboard')
+    await write(c, 'workflow_activate', { stageId: '' })
     for (const record of [a, b]) {
       await poll(() => nativeActivity(home, record, 'workflow-held'), 'The native turn did not reach the scripted hold')
       await nativeActivity(home, record, 'workflow-release')
@@ -756,6 +777,8 @@ test('Workflow dock isolates Sessions and rejects conflicting Workspace handoffs
       return view.session.status === 'active' && view.artifacts[0]
     }, 'The isolated draft did not settle')))
     assert.deepEqual(drafts.map(item => item.title), ['Session A script', 'Session B script', 'Other workspace analysis'])
+    await poll(async () => await switchStage.isEnabled() && await exitStage.isEnabled(),
+      'Did not enable stage changes when the native turn settled')
     assert.deepEqual((await read(c)).artifacts, [])
     assert.equal((await read(other)).stages[1].status, 'not_started')
     const modelInput = await nativeActivity(home, other, 'workflow-model-input')
@@ -782,6 +805,9 @@ test('Workflow dock isolates Sessions and rejects conflicting Workspace handoffs
       const result = await request(page, 'operation', { ticket: tickets.get(loser), action, data: {} })
       assert.equal(result.status, 400, action)
     }
+    await poll(async () => (await read(a)).session.status === 'active', 'The stage did not return to active')
+    await write(a, 'workflow_activate', { stageId: 'asset-binding' })
+    assert.equal((await read(a)).session.activeStageId, 'asset-binding')
   }, { workflowFixture: true })
 })
 

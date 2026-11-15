@@ -81,18 +81,23 @@ func validWorkflowSHA256(hash string) bool {
 
 type workflowSession struct {
 	workflowFileVersions
-	ActiveStageID    string `json:"activeStageId,omitempty"`
-	Status           string `json:"status"`
-	RunID            string `json:"runId,omitempty"`
-	Error            string `json:"error,omitempty"`
-	PendingHandoffID string `json:"pendingHandoffId,omitempty"`
-	activation       int64
+	ActiveStageID     string `json:"activeStageId,omitempty"`
+	Status            string `json:"status"`
+	RunID             string `json:"runId,omitempty"`
+	Error             string `json:"error,omitempty"`
+	PendingHandoffID  string `json:"pendingHandoffId,omitempty"`
+	Activation        int64  `json:"activation"`
+	TransitionPending bool   `json:"transitionPending"`
+	SnapshotID        string `json:"snapshotId,omitempty"`
+	ActivatedAt       string `json:"activatedAt,omitempty"`
+	LegacyActivation  bool   `json:"legacyActivation,omitempty"`
 }
 
 type workflowSessionResult struct {
-	Session    workflowSession `json:"session"`
-	WorkflowID string          `json:"workflowId"`
-	Stage      *workflowStage  `json:"stage,omitempty"`
+	Session    workflowSession   `json:"session"`
+	WorkflowID string            `json:"workflowId"`
+	Stage      *workflowStage    `json:"stage,omitempty"`
+	Snapshot   *workflowSnapshot `json:"snapshot,omitempty"`
 }
 
 type workflowStageView struct {
@@ -115,11 +120,13 @@ type workflowView struct {
 
 type workflowActivateArgs struct {
 	operation
-	workflowFileVersions
-	StageID string `json:"stageId"`
+	StageID            string            `json:"stageId"`
+	ExpectedActivation *int64            `json:"expectedActivation"`
+	Snapshot           *workflowSnapshot `json:"snapshot,omitempty"`
 }
 
 var workflowChanged = &requestError{http.StatusConflict, "工作流版本已更新，请刷新后重新检查交接内容"}
+var workflowTurnRunning = &requestError{http.StatusConflict, "当前阶段正在执行，请等待本轮完成后再切换。"}
 
 func workflowNow() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
@@ -133,11 +140,12 @@ func (s *Service) executeWorkflow(ctx context.Context, r Request) (any, error) {
 		if r.Actor != "human" {
 			return nil, workflowForbidden
 		}
-	case "workflow_session", "workflow_artifact_get":
+	case "workflow_artifact_get":
 		if r.Actor != "human" && r.Actor != "workflow" {
 			return nil, workflowForbidden
 		}
-	case "workflow_turn_start", "workflow_turn_finish", "workflow_save_artifact", "workflow_kickoff_failed", "workflow_turn_failed":
+	case "workflow_session", "workflow_turn_start", "workflow_turn_finish", "workflow_save_artifact",
+		"workflow_kickoff_failed", "workflow_turn_failed", "workflow_transition_complete", "workflow_handoff_target":
 		if r.Actor != "workflow" {
 			return nil, workflowForbidden
 		}
@@ -156,11 +164,19 @@ func (s *Service) executeWorkflow(ctx context.Context, r Request) (any, error) {
 		if activation.StageID != "" && workflowStageIndex(activation.StageID) < 0 {
 			return nil, invalid("未知工作流阶段")
 		}
-		if activation.StageID != "" && !activation.workflowFileVersions.valid() {
-			return nil, invalid("阶段激活需要有效的 Skill 和 Harness SHA-256")
+		if activation.ExpectedActivation == nil || *activation.ExpectedActivation < 0 {
+			return nil, invalid("阶段激活需要当前激活序号")
 		}
 	}
-	if r.Action == "workflow_session" || r.Action == "workflow_get" {
+	var sessionQuery struct {
+		StateOnly bool `json:"stateOnly,omitempty"`
+	}
+	if r.Action == "workflow_session" {
+		if err := decodeData(r.Data, &sessionQuery); err != nil {
+			return nil, err
+		}
+	}
+	if r.Action == "workflow_get" {
 		if err := decodeData(r.Data, &struct{}{}); err != nil {
 			return nil, err
 		}
@@ -174,14 +190,20 @@ func (s *Service) executeWorkflow(ctx context.Context, r Request) (any, error) {
 		switch r.Action {
 		case "workflow_session":
 			return sessionResult(workflowSession{Status: "normal"}), nil
-		case "workflow_get", "workflow_activate":
+		case "workflow_get":
 			return emptyWorkflowView(), nil
+		case "workflow_activate":
+			if *activation.ExpectedActivation == 0 && activation.Snapshot == nil {
+				return emptyWorkflowView(), nil
+			}
+			return nil, workflowChanged
 		default:
 			return nil, workflowChanged
 		}
 	}
 	switch r.Action {
-	case "workflow_get", "workflow_session", "workflow_activate", "workflow_turn_start", "workflow_handoff_preview", "workflow_handoff_confirm":
+	case "workflow_get", "workflow_session", "workflow_activate", "workflow_turn_start", "workflow_handoff_preview",
+		"workflow_handoff_confirm", "workflow_handoff_target":
 		if err := p.recoverWorkflow(ctx, r.SessionID); err != nil {
 			return nil, err
 		}
@@ -190,10 +212,15 @@ func (s *Service) executeWorkflow(ctx context.Context, r Request) (any, error) {
 	case "workflow_get":
 		return p.workflowView(ctx, r.SessionID)
 	case "workflow_session":
-		session, err := readWorkflowSession(ctx, p.db, r.SessionID)
-		return sessionResult(session), err
+		return p.workflowSession(ctx, r.SessionID, sessionQuery.StateOnly)
 	case "workflow_activate":
 		return p.activateWorkflow(ctx, r, activation)
+	case "workflow_transition_complete":
+		var args workflowTransitionArgs
+		if err := decodeData(r.Data, &args); err != nil {
+			return nil, err
+		}
+		return p.completeWorkflowTransition(ctx, r, args)
 	case "workflow_turn_start":
 		var args workflowTurnStartArgs
 		if err := decodeData(r.Data, &args); err != nil {
@@ -217,7 +244,7 @@ func (s *Service) executeWorkflow(ctx context.Context, r Request) (any, error) {
 		if err := decodeData(r.Data, &args); err != nil {
 			return nil, err
 		}
-		return p.markWorkflowAdmissionFailed(ctx, r, args.operation, args.StageID, "", args.Error)
+		return p.markWorkflowAdmissionFailed(ctx, r, args.operation, args.StageID, "", args.Activation, args.Error)
 	case "workflow_save_artifact":
 		var args workflowSaveArtifactArgs
 		if err := decodeData(r.Data, &args); err != nil {
@@ -236,6 +263,14 @@ func (s *Service) executeWorkflow(ctx context.Context, r Request) (any, error) {
 			return nil, err
 		}
 		return p.previewWorkflowHandoff(ctx, r, args)
+	case "workflow_handoff_target":
+		var args struct {
+			HandoffID string `json:"handoffId"`
+		}
+		if err := decodeData(r.Data, &args); err != nil {
+			return nil, err
+		}
+		return p.workflowHandoffTarget(ctx, r.SessionID, args.HandoffID)
 	default:
 		var args workflowConfirmArgs
 		if err := decodeData(r.Data, &args); err != nil {
@@ -250,20 +285,24 @@ var workflowForbidden = &requestError{http.StatusForbidden, "工作流操作身�
 func readWorkflowSession(ctx context.Context, query rowQuery, id string) (workflowSession, error) {
 	session := workflowSession{Status: "normal"}
 	err := query.QueryRowContext(ctx, `SELECT stage_id, activation, skill_sha, harness_sha, pending_handoff, error,
+		COALESCE(snapshot_id,''), activated_at, transition_pending,
 		COALESCE((SELECT id FROM workflow_turns WHERE session_id=? AND status='running'),'')
 		FROM workflow_sessions WHERE session_id=?`, id, id).
-		Scan(&session.ActiveStageID, &session.activation, &session.SkillSHA256, &session.HarnessSHA256, &session.PendingHandoffID, &session.Error, &session.RunID)
+		Scan(&session.ActiveStageID, &session.Activation, &session.SkillSHA256, &session.HarnessSHA256,
+			&session.PendingHandoffID, &session.Error, &session.SnapshotID, &session.ActivatedAt, &session.TransitionPending, &session.RunID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return session, nil
 	}
 	if err != nil {
 		return session, err
 	}
+	session.LegacyActivation = session.ActiveStageID != "" && session.SnapshotID == ""
 	switch {
 	case session.ActiveStageID == "":
-		session.RunID = ""
 	case session.RunID != "":
 		session.Status = workflowRunning
+	case session.LegacyActivation:
+		session.Status, session.Error = workflowFailed, workflowLegacyActivation.text
 	case session.Error != "":
 		session.Status = workflowFailed
 	default:
@@ -278,12 +317,21 @@ func (p *project) activateWorkflow(ctx context.Context, r Request, args workflow
 		if err != nil {
 			return nil, err
 		}
-		if session.ActiveStageID != args.StageID {
-			_, err := tx.ExecContext(ctx, `INSERT INTO workflow_sessions(session_id,stage_id,activation,skill_sha,harness_sha)
-				VALUES(?,?,1,?,?) ON CONFLICT(session_id) DO UPDATE SET stage_id=excluded.stage_id,
-				activation=activation+1, skill_sha=excluded.skill_sha, harness_sha=excluded.harness_sha,
-				pending_handoff='', error=''`, r.SessionID, args.StageID, args.SkillSHA256, args.HarnessSHA256)
-			if err != nil {
+		if session.ActiveStageID == args.StageID {
+			if session.Activation != *args.ExpectedActivation {
+				return nil, workflowChanged
+			}
+			if session.LegacyActivation {
+				return nil, workflowLegacyActivation
+			}
+		} else {
+			if session.RunID != "" {
+				return nil, workflowTurnRunning
+			}
+			if session.Activation != *args.ExpectedActivation {
+				return nil, workflowChanged
+			}
+			if err := advanceWorkflowActivation(ctx, tx, r.SessionID, args.StageID, "", args.Snapshot); err != nil {
 				return nil, err
 			}
 			if _, err := addEvent(ctx, tx, "workflow", []string{r.SessionID}); err != nil {
