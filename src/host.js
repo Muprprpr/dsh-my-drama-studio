@@ -6,6 +6,9 @@ import { registerTools } from './tools.js'
 import { openProfileSettings } from './profile-settings.js'
 import { workflowBridge } from './workflow.js'
 import { ensureBuiltInAssets } from './capability-assets.js'
+import { skillLibrary } from './skill-library.js'
+import { stageBindings } from './stage-bindings.js'
+import { skillRegistry } from './workflow-capability-files.js'
 
 export const name = 'my-drama-studio'
 export const inject = ['agents', 'connection', 'webServer', 'workspaceRegistry', 'tools', 'settings', 'credentials', 'profileContext']
@@ -80,7 +83,7 @@ const humanEdits = new Set(['update_node', 'delete_node', 'update_edge', 'delete
 const workflowActions = new Set(['workflow_handoff_preview'])
 const manualSubmissions = new Set(['submit_manual', 'generateT2V', 'generateI2V', 'generateR2V', 'generateV2V'])
 const browserActions = new Set(['context', 'bind', 'disconnect', 'query', 'append', 'permission', 'tasks',
-  'cancel_task', 'resume_task', 'workflow_get', 'workflow_activate', 'workflow_handoff_confirm', 'workflow_handoff_retry',
+  'cancel_task', 'resume_task', 'workflow_get', 'workflow_profile_select', 'workflow_activate', 'workflow_handoff_confirm', 'workflow_handoff_retry',
   ...humanEdits, ...workflowActions, ...manualSubmissions])
 
 export async function apply(ctx, config) {
@@ -103,7 +106,24 @@ export async function apply(ctx, config) {
   const providers = await openProfileSettings(ctx, config, kernel, () => activity.emit('provider-change'))
   const signingKey = randomBytes(32)
   const lifetime = new AbortController()
-  const workflow = workflowBridge(ctx, kernel, workspaceFor, lifetime.signal, capabilities)
+  const registryAccess = skillRegistry(ctx, lifetime.signal)
+  const library = skillLibrary(ctx, capabilities, lifetime.signal, registryAccess)
+  const bindings = stageBindings(capabilities, library)
+  await bindings.migrate()
+  const cutoff = Date.parse(capabilities.legacyWorkspaceCutoff)
+  const legacyRecovery = new Map()
+  function recoverLegacy(workspace) {
+    if (!(Date.parse(workspace.createdAt) <= cutoff)) return
+    if (!legacyRecovery.has(workspace.id)) {
+      const recovered = kernel('', workspace, 'recover', { legacyWorkspace: true }, lifetime.signal).catch(error => {
+        legacyRecovery.delete(workspace.id)
+        throw error
+      })
+      legacyRecovery.set(workspace.id, recovered)
+    }
+    return legacyRecovery.get(workspace.id)
+  }
+  const workflow = workflowBridge(ctx, kernel, workspaceFor, lifetime.signal, { capabilities, bindings, library, registryAccess })
   ctx.effect(() => () => lifetime.abort())
   ctx.on('agent/status', ({ agent }) => activity.emit('change', agent.id))
   ctx.on('agent/disposed', ({ agent }) => activity.emit('change', agent.id))
@@ -153,12 +173,31 @@ export async function apply(ctx, config) {
     return providers.request(action, keysData(data))
   })
 
+  route(ctx, '/api/drama/skills', async body => {
+    const { action, data } = keys(body, 'action', 'data')
+    const input = keysData(data)
+    if (action === 'bindings') {
+      keys(input)
+      return bindings.settings()
+    }
+    if (action === 'bind') {
+      const { profileId, stageId, skillId } = keys(input, 'profileId', 'stageId', 'skillId')
+      return bindings.save(profileId, stageId, skillId)
+    }
+    return bindings.withUsage(await library.request(action, input))
+  })
+
   route(ctx, '/api/drama/operation', async (body, peer) => {
     const { ticket, action, data } = keys(body, 'ticket', 'action', 'data')
     if (!browserActions.has(action)) throw new StudioError(400, 'Unknown Studio action')
     const { sessionId, workspace } = await verify(ticket, peer)
     const input = action === 'context' ? keys(data ?? {}) : keysData(data)
-    if (action === 'workflow_get') return workflow.get(sessionId, workspace, input)
+    if (action.startsWith('workflow_')) await recoverLegacy(workspace)
+    if (action === 'workflow_get') return workflow.get(sessionId, workspace, keys(input))
+    if (action === 'workflow_profile_select') {
+      await kernel(sessionId, workspace, action, keys(input, 'operationId', 'workflowProfileId'), lifetime.signal, 'human')
+      return workflow.get(sessionId, workspace, {})
+    }
     if (action === 'workflow_activate') return workflow.activate(sessionId, workspace, keys(input, 'operationId', 'stageId'))
     if (action === 'workflow_handoff_confirm') return workflow.confirm(sessionId, workspace, keys(input, 'operationId', 'handoffId'))
     if (action === 'workflow_handoff_retry') return workflow.retry(sessionId, workspace, keys(input, 'handoffId').handoffId)
@@ -286,7 +325,7 @@ export async function apply(ctx, config) {
   }, 'GET')
 
   registerTools(ctx, workspaceFor, kernel, keys, workflow)
-  void recoverWorkspaces(ctx, kernel, lifetime.signal)
+  void recoverWorkspaces(ctx, workspace => recoverLegacy(workspace) ?? kernel('', workspace, 'recover', {}, lifetime.signal), lifetime.signal)
   console.info('[my-drama-studio] My Drama Studio Host loaded')
 }
 
@@ -298,11 +337,11 @@ function keysData(value) {
   return value
 }
 
-async function recoverWorkspaces(ctx, kernel, signal) {
+async function recoverWorkspaces(ctx, recover, signal) {
   for (const workspace of ctx.workspaceRegistry.list()) {
     if (signal.aborted) return
     try {
-      if (await workspace.status() === 'ok') await kernel('', workspace, 'recover', {}, signal)
+      if (await workspace.status() === 'ok') await recover(workspace)
     } catch (error) {
       if (!signal.aborted) console.error('[my-drama-studio] Workspace recovery', workspace.id, error.message)
     }

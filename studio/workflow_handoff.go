@@ -83,20 +83,18 @@ func (p *project) workflowHandoffTarget(ctx context.Context, sessionID, handoffI
 		return out, workflowChanged
 	}
 	if handoff.TargetStageID != "" {
-		index := workflowStageIndex(handoff.TargetStageID)
+		profile, err := readWorkflowProfile(ctx, tx)
+		if err != nil {
+			return out, err
+		}
+		index := profile.stageIndex(handoff.TargetStageID)
 		if index < 0 {
 			return out, workflowChanged
 		}
-		out.TargetStage = &dramaWorkflowStages[index]
+		stage := profile.stage(index)
+		out.TargetStage = &stage
 	}
 	return out, nil
-}
-
-func workflowNextStage(index int) string {
-	if index+1 >= len(dramaWorkflowStages) {
-		return ""
-	}
-	return dramaWorkflowStages[index+1].ID
 }
 
 func readWorkflowHandoffs(ctx context.Context, tx *sql.Tx) ([]workflowHandoff, error) {
@@ -136,7 +134,7 @@ func queryConfirmedWorkflowHandoffs(ctx context.Context, tx *sql.Tx, latestOnly 
 }
 
 func latestWorkflowHandoffs(history []workflowHandoff) map[string]workflowHandoff {
-	latest := make(map[string]workflowHandoff, len(dramaWorkflowStages))
+	latest := make(map[string]workflowHandoff)
 	for _, handoff := range history {
 		if _, exists := latest[handoff.SourceStageID]; !exists {
 			latest[handoff.SourceStageID] = handoff
@@ -145,9 +143,9 @@ func latestWorkflowHandoffs(history []workflowHandoff) map[string]workflowHandof
 	return latest
 }
 
-func workflowInputs(latest map[string]workflowHandoff, index int) []workflowHandoff {
+func (p *workflowProfile) inputs(latest map[string]workflowHandoff, index int) []workflowHandoff {
 	result := []workflowHandoff{}
-	for _, stage := range dramaWorkflowStages[:index] {
+	for _, stage := range p.Stages[:index] {
 		if handoff, ok := latest[stage.ID]; ok && !handoff.Stale {
 			result = append(result, handoff)
 		}
@@ -167,10 +165,14 @@ func workflowInputKey(inputs []workflowHandoff) string {
 	return ids.String()
 }
 
-func requireFreshWorkflowInputs(latest map[string]workflowHandoff, index int) error {
-	for _, stage := range dramaWorkflowStages[:index] {
-		if latest[stage.ID].Stale {
+func (p *workflowProfile) requireWorkflowInputs(latest map[string]workflowHandoff, index int) error {
+	for _, stage := range p.Stages[:index] {
+		handoff, exists := latest[stage.ID]
+		if handoff.Stale {
 			return &requestError{http.StatusConflict, fmt.Sprintf("上游阶段「%s」的正式交接已过期，请先更新", stage.Name)}
+		}
+		if !exists && slices.Contains(p.Stages[index].Requires, stage.ID) {
+			return &requestError{http.StatusConflict, fmt.Sprintf("请先确认上游阶段「%s」的正式交接", stage.Name)}
 		}
 	}
 	return nil
@@ -194,11 +196,15 @@ func (p *project) previewWorkflowHandoff(ctx context.Context, r Request, args wo
 		return nil, invalid("交接最多包含 %d 项产物", maxWorkflowOutputs)
 	}
 	return p.write(ctx, r, args.operation.ID, func(tx *sql.Tx, status Status) (any, error) {
+		profile, err := readWorkflowProfile(ctx, tx)
+		if err != nil {
+			return nil, err
+		}
 		session, err := readWorkflowSession(ctx, tx, r.SessionID)
 		if err != nil {
 			return nil, err
 		}
-		index := workflowStageIndex(session.ActiveStageID)
+		index := profile.stageIndex(session.ActiveStageID)
 		if index < 0 || session.RunID != "" || args.StageID != "" && args.StageID != session.ActiveStageID {
 			return nil, &requestError{http.StatusConflict, "请在当前阶段回合结束后生成交接预览"}
 		}
@@ -206,14 +212,14 @@ func (p *project) previewWorkflowHandoff(ctx context.Context, r Request, args wo
 		if err != nil {
 			return nil, err
 		}
-		if err := requireFreshWorkflowInputs(latest, index); err != nil {
+		if err := profile.requireWorkflowInputs(latest, index); err != nil {
 			return nil, err
 		}
 		artifacts, err := selectWorkflowArtifacts(ctx, tx, r.SessionID, session.ActiveStageID, args.Artifacts)
 		if err != nil {
 			return nil, err
 		}
-		inputKey := workflowInputKey(workflowInputs(latest, index))
+		inputKey := workflowInputKey(profile.inputs(latest, index))
 		if session.ActiveStageID == workflowGeneration {
 			artifacts, err = p.addWorkflowVideoResults(ctx, tx, latest, r.SessionID, session, inputKey, artifacts)
 			if err != nil {
@@ -254,7 +260,7 @@ func (p *project) previewWorkflowHandoff(ctx context.Context, r Request, args wo
 		}
 		handoff := workflowHandoff{
 			workflowFileVersions: session.workflowFileVersions,
-			HandoffID:            uuid.NewString(), SourceStageID: session.ActiveStageID, TargetStageID: workflowNextStage(index),
+			HandoffID:            uuid.NewString(), SourceStageID: session.ActiveStageID, TargetStageID: profile.nextStage(index),
 			WorkspaceID: status.WorkspaceID, SourceSessionID: r.SessionID, SourceRevision: revision + 1,
 			Artifacts: artifacts, CreatedAt: workflowNow(), ConfirmedDecisions: []string{}, Constraints: []string{},
 		}
@@ -448,22 +454,26 @@ func (p *project) confirmWorkflowHandoff(ctx context.Context, r Request, args wo
 		if handoff.SourceRevision != revision+1 || watermark != draftWatermark {
 			return nil, workflowChanged
 		}
-		index := workflowStageIndex(handoff.SourceStageID)
-		if index < 0 || handoff.TargetStageID != workflowNextStage(index) {
+		profile, err := readWorkflowProfile(ctx, tx)
+		if err != nil {
+			return nil, err
+		}
+		index := profile.stageIndex(handoff.SourceStageID)
+		if index < 0 || handoff.TargetStageID != profile.nextStage(index) {
 			return nil, workflowChanged
 		}
 		latest, err := readLatestWorkflowHandoffs(ctx, tx)
 		if err != nil {
 			return nil, err
 		}
-		if err := requireFreshWorkflowInputs(latest, index); err != nil {
+		if err := profile.requireWorkflowInputs(latest, index); err != nil {
 			return nil, err
 		}
 		if err := p.checkWorkflowHandoffArtifacts(ctx, tx, latest, handoff.SourceStageID, handoff.Artifacts); err != nil {
 			return nil, err
 		}
 		if handoff.TargetStageID != "" {
-			if err := advanceWorkflowActivation(ctx, tx, r.SessionID, handoff.TargetStageID, handoff.HandoffID, args.Snapshot); err != nil {
+			if err := advanceWorkflowActivation(ctx, tx, profile, r.SessionID, handoff.TargetStageID, handoff.HandoffID, args.Snapshot); err != nil {
 				return nil, err
 			}
 		} else {
@@ -487,7 +497,7 @@ func (p *project) confirmWorkflowHandoff(ctx context.Context, r Request, args wo
 			handoff.SourceRevision, string(body), handoff.HandoffID); err != nil {
 			return nil, err
 		}
-		for _, downstream := range dramaWorkflowStages[index+1:] {
+		for _, downstream := range profile.Stages[index+1:] {
 			if _, err := tx.ExecContext(ctx, `UPDATE workflow_handoffs SET stale=1 WHERE stage_id=? AND revision IS NOT NULL AND stale=0`,
 				downstream.ID); err != nil {
 				return nil, err

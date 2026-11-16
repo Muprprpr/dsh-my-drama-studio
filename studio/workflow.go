@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/http"
-	"slices"
 	"strings"
 	"time"
 )
@@ -20,8 +19,6 @@ const (
 	workflowRunning     = "running"
 	workflowFailed      = "failed"
 	dramaWorkflowID     = "drama-production"
-	dramaWorkflowName   = "AI 短剧制作"
-	dramaWorkflowRev    = 1
 	workflowDeployment  = "video-deployment"
 	workflowGeneration  = "video-generation"
 	workflowFinalReview = "final-review"
@@ -29,24 +26,11 @@ const (
 )
 
 type workflowStage struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	Skill   string `json:"skill"`
-	Harness string `json:"harness"`
-}
-
-func dramaStage(id, name string) workflowStage {
-	return workflowStage{ID: id, Name: name, Skill: "drama-" + id, Harness: "stages/" + id + "/harness.md"}
-}
-
-var dramaWorkflowStages = []workflowStage{
-	dramaStage("content-analysis", "内容分析"),
-	dramaStage("shooting-script", "拍摄脚本制作"),
-	dramaStage("storyboard", "分镜制作"),
-	dramaStage("asset-binding", "素材抽卡与绑定"),
-	dramaStage(workflowDeployment, "视频节点部署"),
-	dramaStage(workflowGeneration, "视频生成"),
-	dramaStage(workflowFinalReview, "成片验收"),
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	Skill    string   `json:"skill"`
+	Harness  string   `json:"harness"`
+	Requires []string `json:"requires,omitempty"`
 }
 
 type workflowRef struct {
@@ -94,10 +78,14 @@ type workflowSession struct {
 }
 
 type workflowSessionResult struct {
-	Session    workflowSession   `json:"session"`
-	WorkflowID string            `json:"workflowId"`
-	Stage      *workflowStage    `json:"stage,omitempty"`
-	Snapshot   *workflowSnapshot `json:"snapshot,omitempty"`
+	Session                   workflowSession   `json:"session"`
+	WorkflowID                string            `json:"workflowId"`
+	WorkflowProfileID         string            `json:"workflowProfileId,omitempty"`
+	WorkflowProfileName       string            `json:"workflowProfileName,omitempty"`
+	WorkflowDefinitionVersion int64             `json:"workflowDefinitionVersion,omitempty"`
+	ProfileSelectionRequired  bool              `json:"profileSelectionRequired"`
+	Stage                     *workflowStage    `json:"stage,omitempty"`
+	Snapshot                  *workflowSnapshot `json:"snapshot,omitempty"`
 }
 
 type workflowStageView struct {
@@ -109,13 +97,14 @@ type workflowStageView struct {
 
 type workflowView struct {
 	workflowSessionResult
-	ID        string              `json:"id"`
-	Name      string              `json:"name"`
-	Revision  int64               `json:"revision"`
-	Stages    []workflowStageView `json:"stages"`
-	Artifacts []workflowArtifact  `json:"artifacts"`
-	Handoffs  []workflowHandoff   `json:"handoffs"`
-	Inputs    []workflowHandoff   `json:"inputs"`
+	ActiveSkillID string              `json:"activeSkillId,omitempty"`
+	ID            string              `json:"id"`
+	Name          string              `json:"name"`
+	Revision      int64               `json:"revision"`
+	Stages        []workflowStageView `json:"stages"`
+	Artifacts     []workflowArtifact  `json:"artifacts"`
+	Handoffs      []workflowHandoff   `json:"handoffs"`
+	Inputs        []workflowHandoff   `json:"inputs"`
 }
 
 type workflowActivateArgs struct {
@@ -130,13 +119,9 @@ var workflowTurnRunning = &requestError{http.StatusConflict, "当前阶段正在
 
 func workflowNow() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
-func workflowStageIndex(stageID string) int {
-	return slices.IndexFunc(dramaWorkflowStages, func(stage workflowStage) bool { return stage.ID == stageID })
-}
-
 func (s *Service) executeWorkflow(ctx context.Context, r Request) (any, error) {
 	switch r.Action {
-	case "workflow_get", "workflow_activate", "workflow_handoff_preview", "workflow_handoff_confirm":
+	case "workflow_get", "workflow_profile_select", "workflow_activate", "workflow_handoff_preview", "workflow_handoff_confirm":
 		if r.Actor != "human" {
 			return nil, workflowForbidden
 		}
@@ -161,11 +146,20 @@ func (s *Service) executeWorkflow(ctx context.Context, r Request) (any, error) {
 		if err := activation.operation.validate(); err != nil {
 			return nil, err
 		}
-		if activation.StageID != "" && workflowStageIndex(activation.StageID) < 0 {
-			return nil, invalid("未知工作流阶段")
-		}
 		if activation.ExpectedActivation == nil || *activation.ExpectedActivation < 0 {
 			return nil, invalid("阶段激活需要当前激活序号")
+		}
+	}
+	var profileArgs workflowProfileArgs
+	if r.Action == "workflow_profile_select" {
+		if err := decodeData(r.Data, &profileArgs); err != nil {
+			return nil, err
+		}
+		if err := profileArgs.operation.validate(); err != nil {
+			return nil, err
+		}
+		if workflowProfiles[profileArgs.WorkflowProfileID] == nil || profileArgs.WorkflowProfileID == legacyWorkflowProfileID {
+			return nil, invalid("请选择支持的新建生产模式")
 		}
 	}
 	var sessionQuery struct {
@@ -182,19 +176,22 @@ func (s *Service) executeWorkflow(ctx context.Context, r Request) (any, error) {
 		}
 	}
 
-	p, err := s.open(ctx, r.WorkspacePath, r.Action == "workflow_activate" && activation.StageID != "")
+	p, err := s.open(ctx, r.WorkspacePath, r.Action == "workflow_profile_select")
 	if err != nil {
 		return nil, err
 	}
 	if p == nil {
 		switch r.Action {
 		case "workflow_session":
-			return sessionResult(workflowSession{Status: "normal"}), nil
+			return sessionResult(nil, workflowSession{Status: "normal"}), nil
 		case "workflow_get":
-			return emptyWorkflowView(), nil
+			return emptyWorkflowView(nil), nil
 		case "workflow_activate":
+			if activation.StageID != "" {
+				return nil, workflowProfileRequired
+			}
 			if *activation.ExpectedActivation == 0 && activation.Snapshot == nil {
-				return emptyWorkflowView(), nil
+				return emptyWorkflowView(nil), nil
 			}
 			return nil, workflowChanged
 		default:
@@ -211,6 +208,8 @@ func (s *Service) executeWorkflow(ctx context.Context, r Request) (any, error) {
 	switch r.Action {
 	case "workflow_get":
 		return p.workflowView(ctx, r.SessionID)
+	case "workflow_profile_select":
+		return p.selectWorkflowProfile(ctx, r, profileArgs)
 	case "workflow_session":
 		return p.workflowSession(ctx, r.SessionID, sessionQuery.StateOnly)
 	case "workflow_activate":
@@ -313,6 +312,20 @@ func readWorkflowSession(ctx context.Context, query rowQuery, id string) (workfl
 
 func (p *project) activateWorkflow(ctx context.Context, r Request, args workflowActivateArgs) (any, error) {
 	return p.write(ctx, r, args.operation.ID, func(tx *sql.Tx, _ Status) (any, error) {
+		profile, err := readWorkflowProfile(ctx, tx)
+		if err != nil {
+			return nil, err
+		}
+		var stageIndex int
+		if args.StageID != "" {
+			if profile == nil {
+				return nil, workflowProfileRequired
+			}
+			stageIndex = profile.stageIndex(args.StageID)
+			if stageIndex < 0 {
+				return nil, invalid("当前生产模式没有工作流阶段 %s", args.StageID)
+			}
+		}
 		session, err := readWorkflowSession(ctx, tx, r.SessionID)
 		if err != nil {
 			return nil, err
@@ -331,26 +344,40 @@ func (p *project) activateWorkflow(ctx context.Context, r Request, args workflow
 			if session.Activation != *args.ExpectedActivation {
 				return nil, workflowChanged
 			}
-			if err := advanceWorkflowActivation(ctx, tx, r.SessionID, args.StageID, "", args.Snapshot); err != nil {
+			if args.StageID != "" && len(profile.Stages[stageIndex].Requires) != 0 {
+				latest, err := readLatestWorkflowHandoffs(ctx, tx)
+				if err != nil {
+					return nil, err
+				}
+				if err := profile.requireWorkflowInputs(latest, stageIndex); err != nil {
+					return nil, err
+				}
+			}
+			if err := advanceWorkflowActivation(ctx, tx, profile, r.SessionID, args.StageID, "", args.Snapshot); err != nil {
 				return nil, err
 			}
 			if _, err := addEvent(ctx, tx, "workflow", []string{r.SessionID}); err != nil {
 				return nil, err
 			}
 		}
-		return readWorkflowView(ctx, tx, p.dir, r.SessionID)
+		return readWorkflowView(ctx, tx, p.dir, r.SessionID, profile)
 	})
 }
 
-func emptyWorkflowView() workflowView {
+func emptyWorkflowView(profile *workflowProfile) workflowView {
 	view := workflowView{
-		ID: dramaWorkflowID, Name: dramaWorkflowName, Revision: dramaWorkflowRev,
-		workflowSessionResult: sessionResult(workflowSession{Status: "normal"}),
+		ID:                    dramaWorkflowID,
+		workflowSessionResult: sessionResult(profile, workflowSession{Status: "normal"}),
 		Artifacts:             []workflowArtifact{}, Handoffs: []workflowHandoff{}, Inputs: []workflowHandoff{},
-		Stages: make([]workflowStageView, 0, len(dramaWorkflowStages)),
+		Stages: []workflowStageView{},
 	}
-	for _, stage := range dramaWorkflowStages {
-		item := workflowStageView{workflowStage: stage, Status: workflowNotStarted}
+	if profile == nil {
+		return view
+	}
+	view.Name, view.Revision = profile.Name, profile.Version
+	view.Stages = make([]workflowStageView, 0, len(profile.Stages))
+	for index, stage := range profile.Stages {
+		item := workflowStageView{workflowStage: profile.stage(index), Status: workflowNotStarted}
 		if stage.ID == workflowGeneration {
 			item.Generation = &workflowGenerationView{State: "waiting", Message: "先确认视频节点部署"}
 		}
@@ -365,24 +392,40 @@ func (p *project) workflowView(ctx context.Context, sessionID string) (workflowV
 		return workflowView{}, err
 	}
 	defer tx.Rollback()
-	return readWorkflowView(ctx, tx, p.dir, sessionID)
+	profile, err := readWorkflowProfile(ctx, tx)
+	if err != nil {
+		return workflowView{}, err
+	}
+	return readWorkflowView(ctx, tx, p.dir, sessionID, profile)
 }
 
-func readWorkflowView(ctx context.Context, tx *sql.Tx, workspace, sessionID string) (workflowView, error) {
-	view := emptyWorkflowView()
+func readWorkflowView(ctx context.Context, tx *sql.Tx, workspace, sessionID string, profile *workflowProfile) (workflowView, error) {
+	view := emptyWorkflowView(profile)
 	session, err := readWorkflowSession(ctx, tx, sessionID)
 	if err != nil {
 		return view, err
 	}
-	view.workflowSessionResult = sessionResult(session)
+	if session.SnapshotID != "" {
+		snapshot, err := readWorkflowSnapshot(ctx, tx, profile, session)
+		var conflict *requestError
+		switch {
+		case err == nil:
+			view.ActiveSkillID = snapshot.SkillID
+		case errors.As(err, &conflict) && conflict.code == http.StatusConflict:
+			session.Status, session.Error = workflowFailed, conflict.text
+		default:
+			return view, err
+		}
+	}
+	view.workflowSessionResult = sessionResult(profile, session)
 	history, err := readWorkflowHandoffs(ctx, tx)
 	if err != nil {
 		return view, err
 	}
 	latest := latestWorkflowHandoffs(history)
 	view.Handoffs = history
-	if index := workflowStageIndex(session.ActiveStageID); index >= 0 {
-		view.Inputs = workflowInputs(latest, index)
+	if index := profile.stageIndex(session.ActiveStageID); index >= 0 {
+		view.Inputs = profile.inputs(latest, index)
 	}
 	drafts, err := readOwnWorkflowArtifacts(ctx, tx, sessionID, "", false)
 	if err != nil {

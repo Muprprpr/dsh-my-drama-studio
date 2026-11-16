@@ -220,6 +220,15 @@ async function verify(ctx, signal) {
   }
 
   await mkdir(workspacePath, { recursive: true })
+  const dataDir = join(workspacePath, '.drama-studio')
+  await mkdir(dataDir)
+  const { DatabaseSync } = await import('node:sqlite')
+  const db = new DatabaseSync(join(dataDir, 'studio.db'))
+  try {
+    db.exec("CREATE TABLE canvas_meta (singleton INTEGER PRIMARY KEY, id TEXT NOT NULL); INSERT INTO canvas_meta VALUES(1,'legacy-canvas')")
+  } finally {
+    db.close()
+  }
   for (const stage of [sourceStage, restartStage]) {
     const skill = 'drama-' + stage
     const skillPath = join(process.env.DSH_HOME, 'skills', skill)

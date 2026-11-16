@@ -4,8 +4,11 @@
 
 项目会话在原生聊天输入框上方显示固定流程。点击阶段时，Studio 读取对应的全局 Harness 和 Skill，并在当前 Session 的新激活记录中固定版本。随后使用原生聊天框讨论、修改和生成草稿。阶段回合执行期间，当前 Session 可以查看产物，切换和退出返回 409。回合结算后恢复操作，其他 Session 仍可独立工作。
 
+新 Workspace 首次打开工作流时选择 **短剧生产** 或 **短视频生产**。模式和定义版本保存在 Workspace SQLite，同一 Workspace 的 Session 共享模式和正式交接。短视频按表中的八个阶段推进。短剧从拍摄脚本制作开始，共六个阶段。两种模式的后续阶段均以前一阶段的正式交接为前置条件。已有 Workspace 保留从内容分析开始的七阶段 Legacy 流程。
+
 | 阶段 ID | 名称 | 默认 Skill | Harness 相对工作流目录 |
 | --- | --- | --- | --- |
+| `topic-selection` | 选题策划 | `drama-topic-selection` | `stages/topic-selection/harness.md` |
 | `content-analysis` | 内容分析 | `drama-content-analysis` | `stages/content-analysis/harness.md` |
 | `shooting-script` | 拍摄脚本制作 | `drama-shooting-script` | `stages/shooting-script/harness.md` |
 | `storyboard` | 分镜制作 | `drama-storyboard` | `stages/storyboard/harness.md` |
@@ -29,22 +32,28 @@ DSH_HOME/drama-studio/workflows/drama-production/stages/<stage-id>/harness.md
 
 `SKILL.md` 使用 DSH 原生 frontmatter。内置文件设置 `user-invocable: true`，让 Studio 通过原生目录读取正文，并用 `disable-model-invocation: true` 从模型的普通 Skill 目录和工具中排除。Studio 查询当前预设下的原生 Skill 目录，要求来源是 `user-dsh`，且真实路径匹配全局 `skills/<name>/SKILL.md`。查询省略 Workspace 路径，因此项目同名 Skill 不会改变阶段绑定。快照支持最大 512 KiB 的 UTF-8 Skill 源文件。Harness 需为非空 UTF-8 文本，大小上限为 64 KiB。
 
-### 自定义阶段 Skill
+### Skills Library 与阶段绑定
 
-可直接编辑上表 Skill 对应的全局 `SKILL.md` 或 Harness。也可以在 `DSH_HOME/skills/<name>/SKILL.md` 下创建自己的 Skill，填写匹配目录的 `name` 和非空 `description`。建议使用与内置 Skill 相同的两个调用权限字段。自定义映射保存在 `DSH_HOME/drama-studio/workflows/drama-production/stage-skills.json`，可按下面的格式填写。
+在 DSH 的全局 Settings 打开 **Skills Library**。导入含 `SKILL.md` 的本地目录时，目录名须与 frontmatter 的 `name` 一致，`description` 须非空。Studio 将整个目录复制到当前 `DSH_HOME/skills/`，保留附属文件相对路径。可打开目录或复制完整路径，外部编辑后点击刷新。用 **复制为自定义 Skill** 派生官方 Skill 时填写新的名称，Studio 复制目录并更新副本的 frontmatter。
+
+在 **Workflow Skill Bindings** 选择生产模式和阶段，再选择通过 DSH 原生 Registry 全局来源验证的 Skill。Harness 由 Studio 固定。全局 `DSH_HOME/drama-studio/workflows/stage-bindings.json` 记录用户覆盖项。**恢复官方默认** 删除该阶段的覆盖项，下一次激活读取 Profile 的默认映射。
 
 ```json
 {
-  "content-analysis": "my-custom-analysis",
-  "storyboard": "my-storyboard-rules"
+  "schemaVersion": 1,
+  "profiles": {
+    "short-drama": {
+      "storyboard": "my-storyboard-rules"
+    }
+  }
 }
 ```
 
-键使用上表的固定阶段 ID，值使用 DSH 的小写字母、数字和单短横线分隔的 Skill 名称。未列出的阶段使用默认映射。配置错误或映射 Skill 无法通过全局来源及权限检查时，Workflow 会展示问题并阻止相应的新激活。插件装填会保留该映射文件。
+旧 `workflows/drama-production/stage-skills.json` 的有效覆盖项迁入 `legacy-drama-production`，原文件保留。迁移记录保存旧配置相对路径和 SHA-256。配置错误或映射 Skill 无法通过全局来源及权限检查时，Workflow 会展示问题并阻止相应的新激活。
 
 ### 激活快照
 
-激活快照保存渲染后的完整 Skill、Harness 正文、相对路径、原始文件和渲染后 Skill 的 SHA-256。激活代数、时间及快照引用由 Workspace SQLite 保存。重复点击当前阶段继续用原来的快照。全局文件更新后，新激活采用新版本。DSH 对 references、templates、脚本和其他附属文件执行实际读取时，使用当时的磁盘内容。激活期间修改 reference，后续回合可以读到更新内容，快照 ID、Skill 正文和 Harness 保持固定。对版本一致性有要求的阶段规则或模板内容应写进 Skill 或 Harness 正文。读取正文过程中发现文件变化时，激活失败并可重试。
+激活快照保存生产模式 ID 和定义版本、阶段和 Skill ID、渲染后的完整 Skill、Harness 正文、相对路径、原始文件和渲染后 Skill 的 SHA-256。激活代数、时间及快照引用由 Workspace SQLite 保存。重复点击当前阶段继续用原来的快照。全局文件或绑定更新后，新激活采用新版本。Skills Library 的主文件 Hash 对应 `SKILL.md`，详情中每个附属文件有独立的 Hash。DSH 实际读取 references、templates、脚本和其他附属文件时，使用当时的磁盘内容。读取正文过程中发现文件变化时，激活失败并可重试。
 
 Host 用 DSH 的 `system-prompt/assemble` 装填当前激活，`agent/pre-step` 请求新序列以替换活动系统指令。每轮落盘其激活代数、快照 ID 与 Hash。锁定完整提示词的预设会在激活时返回错误。
 

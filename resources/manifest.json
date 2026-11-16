@@ -2,6 +2,20 @@
   "schemaVersion": 1,
   "assets": [
     {
+      "id": "skill:drama-topic-selection",
+      "type": "skill",
+      "stageId": "topic-selection",
+      "source": "skills/drama-topic-selection/SKILL.md",
+      "target": "skills/drama-topic-selection/SKILL.md"
+    },
+    {
+      "id": "harness:topic-selection",
+      "type": "harness",
+      "stageId": "topic-selection",
+      "source": "workflows/drama-production/stages/topic-selection/harness.md",
+      "target": "drama-studio/workflows/drama-production/stages/topic-selection/harness.md"
+    },
+    {
       "id": "skill:drama-content-analysis",
       "type": "skill",
       "stageId": "content-analysis",

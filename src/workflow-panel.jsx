@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import React, { useEffect, useId, useRef, useState, useSyncExternalStore } from 'react'
 import { Button, MarkdownText, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
 import { artifactMediaURL, operation, subscribe } from './studio-api.js'
 import style from './workflow-panel.css'
@@ -173,6 +173,27 @@ function CapabilityFile({ file }) {
   </p>
 }
 
+function ProfileSelection({ profiles, busy, onSelect }) {
+  const group = useId()
+  const [choice, setChoice] = useState('short-drama')
+  const selected = profiles.find(profile => profile.id === choice) ?? profiles[0]
+  if (!selected) return <p role="alert">当前没有可选的生产模式。</p>
+  return <form className="drama-workflow-command" data-testid="drama-workflow-profile-picker" onSubmit={event => {
+    event.preventDefault()
+    onSelect(selected.id)
+  }}>
+    <fieldset className="drama-workflow-profile-options" disabled={busy}>
+      <legend>选择此 Workspace 的生产模式</legend>
+      {profiles.map(profile => <label key={profile.id}>
+        <input type="radio" name={group} value={profile.id} checked={selected.id === profile.id}
+          onChange={() => setChoice(profile.id)} />
+        {profile.name}{profile.id === 'short-drama' && <span>推荐</span>}
+      </label>)}
+    </fieldset>
+    <Button type="submit" size="sm" variant="primary" disabled={busy}>确认生产模式</Button>
+  </form>
+}
+
 export function WorkflowProgress({ session, refreshSession, openArtifacts, openCanvas, nativeRunning }) {
   const { ticket, status: { sessionId, workspaceId } } = session
   const { view, error: loadError } = useWorkflowView(session, refreshSession)
@@ -208,6 +229,11 @@ export function WorkflowProgress({ session, refreshSession, openArtifacts, openC
     refreshSession()
   })
 
+  const selectProfile = workflowProfileId => runAction(ticket, 'profile', async () => {
+    await mutate(ticket, 'workflow_profile_select', { workflowProfileId })
+    refreshSession()
+  })
+
   const preview = () => runAction(ticket, 'preview', async () => {
     const result = await mutate(ticket, 'workflow_handoff_preview', {
       stageId: stage.id,
@@ -234,8 +260,11 @@ export function WorkflowProgress({ session, refreshSession, openArtifacts, openC
 
   const feedback = interaction.error || state?.error || loadError
   return <section className="drama-workflow-progress" data-testid="drama-workflow"
-    data-session-id={sessionId} data-workspace-id={workspaceId} aria-label="制作工作流">
-    {stages.length > 0 ? <>
+    data-session-id={sessionId} data-workspace-id={workspaceId}
+    data-workflow-profile-id={view?.workflowProfileId} aria-label="制作工作流">
+    {view?.profileSelectionRequired ? <ProfileSelection profiles={view.availableProfiles ?? []}
+      busy={Boolean(interaction.busy)} onSelect={workflowProfileId => void selectProfile(workflowProfileId)} />
+      : stages.length > 0 ? <>
       <ol className="drama-workflow-steps" ref={steps}>
         {stages.map(candidate => {
           const [label, dot] = stageStatuses[candidate.status] ?? stageStatuses.not_started
@@ -254,7 +283,11 @@ export function WorkflowProgress({ session, refreshSession, openArtifacts, openC
       <div className="drama-workflow-command">
         <div className="drama-workflow-current" data-status={sessionStatus} data-active-stage-id={stage?.id}>
           <strong>{stage?.name ?? sessionStatuses.normal}</strong>
+          {view.workflowProfileName && <span>{view.workflowProfileName}</span>}
           {stage && <span>{sessionStatuses[sessionStatus]}</span>}
+          {stage && view.activeSkillId && <span className="drama-workflow-skill" data-testid="drama-active-skill">
+            Skill · {view.activeSkillId}
+          </span>}
         </div>
         <Button type="button" size="sm" onClick={browse}>阶段产物</Button>
         {stage && <Button type="button" size="sm" disabled={Boolean(interaction.busy) || running}

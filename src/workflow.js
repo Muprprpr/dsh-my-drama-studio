@@ -1,11 +1,10 @@
 import { randomUUID } from 'node:crypto'
-import { open, realpath, stat } from 'node:fs/promises'
-import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
-import { pathToFileURL } from 'node:url'
 import { StudioError } from './kernel.js'
-import { assetStatus, readStageSkills, sha256, skillResourceStatuses, skillTarget, stageIds, workflowTarget } from './capability-assets.js'
+import { fileError, localFile, verifyUnchanged } from './workflow-capability-files.js'
+import { assetStatus, sha256, skillResourceStatuses, skillTarget, stageIds, workflowTarget } from './capability-assets.js'
+import { newWorkflowProfiles } from './stage-bindings.js'
 
 const requestPrefix = 'drama-workflow:'
 const artifactTools = new Set(['drama_save_artifact', 'drama_workflow_artifact'])
@@ -13,78 +12,16 @@ const documentNodes = new Set(['script', 'shot', 'note'])
 const stageSection = 'drama-studio:workflow-stage'
 const stageMarker = '[Drama Studio Workflow Stage]'
 const probeKey = Symbol('verify workflow system prompt support')
-const maxFileBytes = { Skill: 512 * 1024, Harness: 64 * 1024 }
 const generationStage = 'video-generation'
 const managedSkills = new Set(stageIds.map(id => 'drama-' + id))
 const stageSkillError = '该 Skill 属于 Workflow 管理的阶段能力，请先切换到对应阶段。'
 const busyError = '当前阶段正在执行，请等待本轮完成后再切换。'
 const compactError = '阶段切换尚未完成，请先发送一条新阶段消息，再执行压缩。'
 
-function samePath(left, right) {
-  return typeof left === 'string' && resolve(left).toLowerCase() === resolve(right).toLowerCase()
-}
-
-function fileError(httpStatus, assetStatus, message) {
-  return Object.assign(new StudioError(httpStatus, message), { assetStatus })
-}
-
 function fileTargets(workflowId, stage, skill) {
   return {
     skill: skillTarget(skill),
     harness: workflowTarget(workflowId, stage.harness),
-  }
-}
-
-async function localFile(path, kind) {
-  try {
-    if (!samePath(await realpath(path), path)) throw fileError(409, 'conflict', `全局 ${kind} 必须位于规定路径：${path}`)
-    const info = await stat(path, { bigint: true })
-    if (!info.isFile()) throw fileError(409, 'conflict', `${kind} 必须是普通文件：${path}`)
-    if (!info.size) throw fileError(400, 'invalid', `${kind} 文件没有指令：${path}`)
-    if (info.size > maxFileBytes[kind]) throw fileError(400, 'invalid', `${kind} 文件不能超过 ${maxFileBytes[kind] / 1024} KiB：${path}`)
-    const file = await open(path, 'r')
-    try {
-      const opened = await file.stat({ bigint: true })
-      if (!sameFile(info, opened) || !samePath(await realpath(path), path)) {
-        throw fileError(409, 'conflict', `${kind} 路径已变更：${path}`)
-      }
-      const size = Number(info.size)
-      const buffer = Buffer.alloc(size + 1)
-      let length = 0
-      while (length < buffer.length) {
-        const { bytesRead } = await file.read(buffer, length, buffer.length - length, length)
-        if (!bytesRead) break
-        length += bytesRead
-      }
-      const finished = await file.stat({ bigint: true })
-      if (length !== size || !sameFile(finished, opened)) {
-        throw fileError(409, 'conflict', `${kind} 文件在读取时发生变化，请重试：${path}`)
-      }
-      const bytes = buffer.subarray(0, length)
-      const body = new TextDecoder('utf-8', { fatal: true }).decode(bytes).trim()
-      if (!body) throw fileError(400, 'invalid', `${kind} 文件没有指令：${path}`)
-      return { body, sha256: sha256(bytes), info: finished }
-    } finally {
-      await file.close()
-    }
-  } catch (error) {
-    if (error instanceof StudioError) throw error
-    if (error.code === 'ENOENT') throw fileError(404, 'missing', `${kind} 文件缺失：${path}`)
-    if (error.code === 'ENOTDIR') throw fileError(409, 'conflict', `${kind} 目录冲突：${path}`)
-    if (error.code === 'ERR_ENCODING_INVALID_ENCODED_DATA') throw fileError(400, 'invalid', `${kind} 文件须为 UTF-8：${path}`)
-    throw fileError(409, 'blocked', `无法读取 ${kind} 文件：${path}`)
-  }
-}
-
-function sameFile(left, right) {
-  return left && right && left.dev === right.dev && left.ino === right.ino &&
-    left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs
-}
-
-async function verifyUnchanged(path, kind, info) {
-  const current = await stat(path, { bigint: true }).catch(() => undefined)
-  if (!sameFile(info, current) || !samePath(await realpath(path).catch(() => undefined), path)) {
-    throw new StudioError(409, `${kind} 文件在激活时发生变化，请重试：${path}`)
   }
 }
 
@@ -125,6 +62,8 @@ function stageInstructions(run, admitted) {
   const { stage, snapshot, session, workspace, workflowId, handoffId } = run
   const context = {
     workflowId, workspaceId: workspace.id, stageId: stage.id, stageName: stage.name,
+    workflowProfileId: snapshot.workflowProfileId, workflowDefinitionVersion: snapshot.workflowDefinitionVersion,
+    skillId: snapshot.skillId,
     activation: session.activation, snapshotId: session.snapshotId,
     skillSha256: snapshot.skillSha256, harnessSha256: snapshot.harnessSha256, handoffId,
     approvedInputs: admitted.inputs?.map(summarizeHandoff),
@@ -161,35 +100,30 @@ function invokesStageSkill(message, names) {
       .some(match => names.has(match[2])))
 }
 
-export function workflowBridge(ctx, kernel, workspaceFor, lifetime, capabilities) {
+export function workflowBridge(ctx, kernel, workspaceFor, lifetime, { capabilities, bindings, library, registryAccess }) {
   const turns = new Map()
   const kickoffs = new Map()
   const phaseWork = new Map()
   const compactionGuards = new Map()
   let promptRevision = 0
   const verifiedScopes = new WeakMap()
-  const runtimeRequire = createRequire(ctx.profileContext.installAnchor)
-  let nativeSkill
-
-  function stageSkills() {
-    return capabilities.root ? readStageSkills(capabilities.root) : { names: {} }
-  }
 
   function reservedSkills(turn) {
-    const activeName = turn?.snapshot?.skillPath.split('/')[1]
-    return new Set([...managedSkills, ...Object.values(stageSkills().names ?? {}), activeName])
+    const activeName = turn?.snapshot?.skillId ?? turn?.snapshot?.skillPath.split('/')[1]
+    return new Set([...managedSkills, ...bindings.reservedNames(), activeName])
   }
 
   function capabilityFailure(issue) {
     return fileError({ missing: 404, conflict: 409, invalid: 409, blocked: 503 }[issue.status], issue.status, issue.error)
   }
 
-  function stageFiles(workflowId, stage, mapping) {
-    const skillName = mapping.names?.[stage.id] ?? stage.skill
+  function stageFiles(workflow, stage, mapping) {
+    const { skillId: skillName, failure } = bindings.effective(mapping, workflow.workflowProfileId, stage.id, stage.skill)
+    const workflowId = workflow.id ?? workflow.workflowId
     const targets = fileTargets(workflowId, stage, skillName)
     const root = capabilities.root ?? ctx.profileContext.home
     return {
-      skillName,
+      skillName, failure,
       targets,
       skillPath: root && resolve(root, targets.skill),
       harnessPath: root && resolve(root, targets.harness),
@@ -201,49 +135,12 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime, capabilities
     if (issue) throw capabilityFailure(issue)
   }
 
-  function nativeSkillAPI() {
-    return nativeSkill ??= import(pathToFileURL(runtimeRequire.resolve('@deepseek-ai/dsh-skill')).href)
-  }
-
   function nativeController() {
     const controller = ctx.get('sessionController')
     if (!controller?.prompt || !controller.resolveAgent || !ctx.get('systemPrompt')?.assemble) {
       throw new StudioError(503, '当前 DSH Host 未提供所需的原生会话及指令装填接口')
     }
     return controller
-  }
-
-  async function globalSkills(sessionId, read, agent = ctx.agents.get(sessionId)) {
-    const presets = ctx.get('agentPresets')
-    const registry = (agent && presets?.serviceFor(agent, 'skills')) || ctx.get('skills')
-    if (!registry?.get || !registry.list) throw new StudioError(503, 'DSH 原生全局 Skill 目录不可用')
-    // Omit cwd so same-named project files cannot replace the global binding.
-    const query = ctx.get('sessionQuery')
-    if (agent || !presets || !query) return read(registry, { scope: agent, signal: lifetime })
-    const observation = await query.observeSession(sessionId)
-    let preset
-    try {
-      preset = observation.projections?.values.agentPreset
-    } finally {
-      observation[Symbol.dispose]()
-    }
-    const lease = await presets.acquireScope(preset)
-    try {
-      return await read(registry, { scope: lease?.key, signal: lifetime })
-    } finally {
-      await lease?.[Symbol.asyncDispose]()
-    }
-  }
-
-  async function checkNativeSkill(skill, name, path) {
-    if (!skill || skill.name !== name || !skill.invocation?.userInvocable || !skill.content?.trim()) {
-      throw fileError(409, 'invalid', `DSH 原生全局目录未加载 ${name}。请核对 Skill 名称、用户调用权限和正文：${path}`)
-    }
-    if (skill.source !== 'user-dsh' || typeof skill.path !== 'string' ||
-        !samePath(await realpath(skill.path).catch(() => undefined), path)) {
-      throw fileError(409, 'conflict', `Skill ${name} 来自 ${skill.source}（${skill.path ?? '无文件路径'}），需要 user-dsh：${path}`)
-    }
-    return skill
   }
 
   async function checkPromptScope(agent) {
@@ -265,37 +162,39 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime, capabilities
     await checkPromptScope(agent)
   }
 
-  async function loadCapabilities(agent, workflowId, stage) {
-    const mapping = stageSkills()
-    const { skillName, skillPath, harnessPath, targets } = stageFiles(workflowId, stage, mapping)
-    checkBootstrap(targets.skill)
-    checkBootstrap(targets.harness)
-    if (mapping.failure) throw capabilityFailure(mapping.failure)
-    const resourceIssue = skillResourceStatuses(capabilities, skillName).find(resource => resource.error)
-    if (resourceIssue) throw capabilityFailure(resourceIssue)
-    await checkStageSupport(agent)
-    const [source, harness] = await Promise.all([
-      localFile(skillPath, 'Skill'),
-      localFile(harnessPath, 'Harness'),
-    ])
-    const [skill, { renderSkillContent }] = await Promise.all([
-      globalSkills(agent.id, (registry, options) => registry.get(skillName, options), agent),
-      nativeSkillAPI(),
-    ])
-    const skillBody = renderSkillContent(await checkNativeSkill(skill, skillName, skillPath))
-    await Promise.all([
-      verifyUnchanged(skillPath, 'Skill', source.info),
-      verifyUnchanged(harnessPath, 'Harness', harness.info),
-    ])
-    return {
-      stageId: stage.id,
-      skillPath: targets.skill,
-      harnessPath: targets.harness,
-      skillSourceSha256: source.sha256,
-      skillSha256: sha256(skillBody),
-      harnessSha256: harness.sha256,
-      skillBody,
-      harnessBody: harness.body,
+  async function loadCapabilities(agent, workflow, stage) {
+    const { workflowProfileId, workflowDefinitionVersion } = workflow
+    const { skillName, skillPath, harnessPath, targets, failure } = stageFiles(workflow, stage, bindings.read())
+    try {
+      if (failure) throw capabilityFailure(failure)
+      checkBootstrap(targets.skill)
+      checkBootstrap(targets.harness)
+      const resourceIssue = skillResourceStatuses(capabilities, skillName).find(resource => resource.error)
+      if (resourceIssue) throw capabilityFailure(resourceIssue)
+      await checkStageSupport(agent)
+      const [{ skill, source }, harness, { renderSkillContent }] = await Promise.all([
+        library.requireInstalled(skillName, agent.id, agent),
+        localFile(harnessPath, 'Harness'),
+        registryAccess.nativeSkillAPI(),
+      ])
+      const skillBody = renderSkillContent(skill)
+      await Promise.all([
+        verifyUnchanged(skillPath, 'Skill', source.info),
+        verifyUnchanged(harnessPath, 'Harness', harness.info),
+      ])
+      return {
+        workflowProfileId, workflowDefinitionVersion, stageId: stage.id, skillId: skillName,
+        skillPath: targets.skill,
+        harnessPath: targets.harness,
+        skillSourceSha256: source.sha256,
+        skillSha256: sha256(skillBody),
+        harnessSha256: harness.sha256,
+        skillBody,
+        harnessBody: harness.body,
+      }
+    } catch (error) {
+      if (!(error instanceof StudioError)) throw error
+      throw new StudioError(error.status, `${workflowProfileId} / ${stage.id} / ${skillName}：${error.message}`)
     }
   }
 
@@ -364,38 +263,40 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime, capabilities
 
   async function get(sessionId, workspace, input) {
     const view = await kernel(sessionId, workspace, 'workflow_get', input, lifetime, 'human')
-    const mapping = stageSkills()
-    const stagePaths = view.stages.map(stage => stageFiles(view.id, stage, mapping))
+    if (view.profileSelectionRequired) return { ...view, availableProfiles: newWorkflowProfiles }
+    const mapping = bindings.read()
+    const stagePaths = view.stages.map(stage => stageFiles(view, stage, mapping))
     const globalFailure = capabilities.failure ?? mapping.failure
     let skills
     if (!globalFailure) {
-      const names = [...new Set(stagePaths.map(files => files.skillName))]
-      skills = await globalSkills(sessionId, async (registry, options) =>
-        Promise.allSettled(names.map(name => registry.get(name, options)))).then(
+      const names = [...new Set(stagePaths.filter(files => !files.failure).map(files => files.skillName))]
+      skills = await library.withRegistry(sessionId, inspect => Promise.allSettled(names.map(name => inspect(name)))).then(
         results => new Map(names.map((name, index) => [name, results[index]])),
         () => new Map(),
       )
     }
-    async function inspect(target, path, kind, name) {
-      const issue = capabilities.failure ?? capabilities.errors.get(target) ?? (name && mapping.failure)
+    async function inspect(target, path, name, bindingFailure) {
+      const issue = capabilities.failure ?? capabilities.errors.get(target) ?? bindingFailure
       if (issue) return { ...issue, path: path ?? issue.path }
       try {
-        const { sha256: hash } = await localFile(path, kind)
-        const status = assetStatus(capabilities, target, hash)
-        if (!name) return status
+        if (!name) {
+          const { sha256: hash } = await localFile(path, 'Harness')
+          return assetStatus(capabilities, target, hash)
+        }
         const found = skills?.get(name)
-        if (found?.status !== 'fulfilled') throw fileError(503, 'blocked', `DSH 原生全局 Skill 目录无法读取：${path}`)
-        const skill = await checkNativeSkill(found.value, name, path)
-        return { ...status, source: skill.source }
+        if (!found) throw fileError(503, 'blocked', `DSH 原生全局 Skill 目录无法读取：${path}`)
+        if (found.status === 'rejected') throw found.reason
+        const { skill, source } = found.value
+        return { ...assetStatus(capabilities, target, source.sha256), source: skill.source }
       } catch (error) {
         return { status: error.assetStatus ?? 'blocked', path, error: error.message }
       }
     }
     const stages = await Promise.all(view.stages.map(async (stage, index) => {
-      const { skillName, skillPath, harnessPath, targets } = stagePaths[index]
+      const { skillName, skillPath, harnessPath, targets, failure } = stagePaths[index]
       const [skillAsset, harnessAsset] = await Promise.all([
-        inspect(targets.skill, skillPath, 'Skill', skillName),
-        inspect(targets.harness, harnessPath, 'Harness'),
+        inspect(targets.skill, skillPath, skillName, failure),
+        inspect(targets.harness, harnessPath),
       ])
       const resourceAssets = globalFailure ? [] : skillResourceStatuses(capabilities, skillName)
       const resourceError = resourceAssets.find(resource => resource.error)
@@ -703,6 +604,7 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime, capabilities
     const { operationId, stageId } = input
     return changeStage(sessionId, async () => {
       const view = await kernel(sessionId, workspace, 'workflow_get', {}, lifetime, 'human')
+      if (view.profileSelectionRequired) throw new StudioError(409, '请先为当前 Workspace 选择生产模式')
       const { session } = view
       if (session.status === 'running' && (session.activeStageId ?? '') !== stageId) {
         throw new StudioError(409, busyError)
@@ -711,7 +613,7 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime, capabilities
       if (stageId && stageId !== session.activeStageId) {
         const stage = view.stages.find(item => item.id === stageId)
         if (!stage) throw new StudioError(400, '未知的工作流阶段')
-        snapshot = await loadCapabilities(await resolveAgent(sessionId), view.id, stage)
+        snapshot = await loadCapabilities(await resolveAgent(sessionId), view, stage)
       } else if (!stageId && session.activeStageId) {
         await resolveAgent(sessionId)
       }
@@ -758,11 +660,12 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime, capabilities
 
   async function confirm(sessionId, workspace, input) {
     const handoff = await changeStage(sessionId, async () => {
-      const { session, workflowId } = await readSession(sessionId, workspace, lifetime, true)
+      const currentSession = await readSession(sessionId, workspace, lifetime, true)
+      const { session } = currentSession
       const { targetStage } = await kernel(sessionId, workspace, 'workflow_handoff_target',
         { handoffId: input.handoffId }, lifetime, 'workflow')
       if (targetStage && session.status === 'running') throw new StudioError(409, busyError)
-      const snapshot = targetStage && await loadCapabilities(await resolveAgent(sessionId), workflowId, targetStage)
+      const snapshot = targetStage && await loadCapabilities(await resolveAgent(sessionId), currentSession, targetStage)
       const current = await workspaceFor(ctx, sessionId)
       if (!sameWorkspace(current, workspace)) throw new StudioError(409, 'Session 的 Workspace 已切换')
       return kernel(sessionId, workspace, 'workflow_handoff_confirm', { ...input, snapshot }, lifetime, 'human')

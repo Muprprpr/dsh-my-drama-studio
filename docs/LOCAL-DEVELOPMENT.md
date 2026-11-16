@@ -92,7 +92,7 @@ Host 在装填期间使用按 DSH Home 区分的 Windows 命名管道锁。Windo
 
 ### 检查 npm 包
 
-完成构建后，从仓库根目录预览和实际打包。检查清单中有 `resources/manifest.json`、七个 `SKILL.md`、七个 `harness.md` 及清单声明的所有附属文件。
+完成构建后，从仓库根目录预览和实际打包。检查清单中有 `resources/manifest.json`、三个生产模式 JSON、八个 `SKILL.md`、八个 `harness.md` 及清单声明的所有附属文件。
 
 ```powershell
 npm.cmd pack --dry-run

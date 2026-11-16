@@ -1,0 +1,14 @@
+{
+  "id": "legacy-drama-production",
+  "name": "旧版短剧制作",
+  "version": 1,
+  "stages": [
+    { "id": "content-analysis", "name": "内容分析", "defaultSkill": "drama-content-analysis", "requires": [] },
+    { "id": "shooting-script", "name": "拍摄脚本制作", "defaultSkill": "drama-shooting-script", "requires": [] },
+    { "id": "storyboard", "name": "分镜制作", "defaultSkill": "drama-storyboard", "requires": [] },
+    { "id": "asset-binding", "name": "素材抽卡与绑定", "defaultSkill": "drama-asset-binding", "requires": [] },
+    { "id": "video-deployment", "name": "视频节点部署", "defaultSkill": "drama-video-deployment", "requires": [] },
+    { "id": "video-generation", "name": "视频生成", "defaultSkill": "drama-video-generation", "requires": [] },
+    { "id": "final-review", "name": "成片验收", "defaultSkill": "drama-final-review", "requires": [] }
+  ]
+}

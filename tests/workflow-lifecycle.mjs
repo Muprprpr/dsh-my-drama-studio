@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { existsSync } from 'node:fs'
 import { copyFile, cp, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { createRequire } from 'node:module'
+import { DatabaseSync } from 'node:sqlite'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -20,6 +21,8 @@ const provider = 'drama-wire-fixture'
 const inHistory = 'fixture-in-history'
 const replace = 'fixture-replace'
 const transitionError = /阶段切换尚未完成/u
+const legacyTarget = 'drama-studio/workflows/drama-production/stage-skills.json'
+const legacyMappingBytes = '{"final-review":"fixture-legacy-review"}\n'
 const managedSkillError = /该 Skill 属于 Workflow 管理的阶段能力/u
 const stageText = (stage, version, kind) => ['STUDIO_WIRE', stage, version, kind].join('_')
 const filler = 'Separate parts of a storyboard discussion create context pressure. '.repeat(1100)
@@ -205,7 +208,9 @@ async function verify(ctx, signal) {
     return data
   }
   const op = (ticket, action, data = {}) => request('operation', { ticket, action, data: { operationId: randomUUID(), ...data } })
-  const read = async ticket => (await ok(await request('operation', { ticket, action: 'workflow_get' }), 'workflow_get')).session
+  const view = async ticket => ok(await request('operation', { ticket, action: 'workflow_get' }), 'workflow_get')
+  const read = async ticket => (await view(ticket)).session
+  const skills = async (action, data = {}) => ok(await request('skills', { action, data }), 'skills ' + action)
   async function activate(ticket, stageId) {
     return ok(await op(ticket, 'workflow_activate', { stageId }), 'workflow_activate ' + stageId)
   }
@@ -278,6 +283,23 @@ async function verify(ctx, signal) {
 
     if (state) {
       const [{ ticket: a1 }, { ticket: a2 }, { ticket: b1 }] = await Promise.all(state.ids.map(init))
+      const [video, _frozen, custom] = (await Promise.all(state.profileIds.map(init))).map(item => item.ticket)
+      assert.equal((await view(video)).workflowProfileId, 'short-video')
+      const resumedCustom = await view(custom)
+      assert.equal(resumedCustom.workflowProfileId, 'short-drama')
+      assert.equal(resumedCustom.activeSkillId, 'fixture-custom-storyboard')
+      assert.equal(resumedCustom.session.snapshotId, state.customSnapshot)
+      assert.equal(resumedCustom.stages.find(stage => stage.id === alpha).files.skillName, 'fixture-custom-storyboard')
+      const persisted = JSON.parse(await readFile(join(home, 'drama-studio', 'workflows', 'stage-bindings.json'), 'utf8'))
+      assert.deepEqual(persisted.legacyMigration, {
+        source: legacyTarget, sha256: createHash('sha256').update(legacyMappingBytes).digest('hex'),
+      })
+      assert.equal(await readFile(join(home, legacyTarget), 'utf8'), legacyMappingBytes)
+      await skills('bind', { profileId: 'short-drama', stageId: alpha, skillId: null })
+      assert.equal((await view(custom)).session.snapshotId, state.customSnapshot)
+      await activate(custom, '')
+      await activate(custom, alpha)
+      assert.equal((await view(custom)).activeSkillId, 'drama-storyboard')
       const recovering = await settled(a1, session => session.status === 'failed', 'orphaned running turn recovered')
       assert.equal(recovering.activeStageId, beta)
       assert.equal(recovering.snapshotId, state.betaSnapshot)
@@ -302,9 +324,19 @@ async function verify(ctx, signal) {
     const ordinarySkill = join(home, 'skills', 'fixture-ordinary')
     await mkdir(ordinarySkill, { recursive: true })
     await writeFile(join(ordinarySkill, 'SKILL.md'), '---\nname: fixture-ordinary\ndescription: Ordinary independent skill.\n---\nWIRE_ORDINARY_SKILL_BODY\n')
-    async function workspace(label) {
+    async function workspace(label, legacy = true) {
       const path = join(home, label)
       await mkdir(join(path, '.git'), { recursive: true })
+      if (legacy) {
+        const folder = join(path, '.drama-studio')
+        await mkdir(folder)
+        const db = new DatabaseSync(join(folder, 'studio.db'))
+        try {
+          db.exec("CREATE TABLE canvas_meta (singleton INTEGER PRIMARY KEY, id TEXT NOT NULL); INSERT INTO canvas_meta VALUES(1,'legacy-canvas')")
+        } finally {
+          db.close()
+        }
+      }
       return ctx.workspaceRegistry.create(path)
     }
     const [projectA, projectB] = await Promise.all([workspace('workspace-a'), workspace('workspace-b')])
@@ -373,7 +405,7 @@ async function verify(ctx, signal) {
     await rm(testSkill)
     await rejectsInvalidStage(/Skill/u, 404)
     await writeFile(testSkill, '---\nname: invalid/name\ndescription: Fixture invalid Skill\n---\nBroken metadata.\n')
-    await rejectsInvalidStage(/Skill/u, 409)
+    await rejectsInvalidStage(/SKILL\.md.*name/u, 409)
     await installStage(home, invalidStage, 'V1')
     const beforeRace = await read(a2)
     const target = beforeActivation.agent
@@ -516,6 +548,96 @@ async function verify(ctx, signal) {
     await activate(disposedTicket, beta)
     await send(disposableId, disposedTicket, 'Switch to Beta after Agent disposal.', beta, 'V1')
 
+    const [videoProject, dramaProject] = await Promise.all([workspace('short-video', false), workspace('short-drama', false)])
+    const profileIds = await Promise.all([videoProject, dramaProject, dramaProject, dramaProject].map(async project => {
+      const { sessionId } = await ctx.sessionController.create({ workspaceId: project.id })
+      await select(sessionId, inHistory)
+      return sessionId
+    }))
+    const [videoSession, frozenSession, normalSession, scriptSession] = profileIds
+    const [videoTicket, frozenTicket, normalTicket, scriptTicket] = (await Promise.all(profileIds.map(init))).map(item => item.ticket)
+    for (const ticket of [videoTicket, frozenTicket]) assert.equal((await view(ticket)).profileSelectionRequired, true)
+    const video = await ok(await op(videoTicket, 'workflow_profile_select', { workflowProfileId: 'short-video' }), 'Short Video')
+    const drama = await ok(await op(frozenTicket, 'workflow_profile_select', { workflowProfileId: 'short-drama' }), 'Short Drama')
+    assert.deepEqual(video.stages.map(stage => stage.id), ['topic-selection', 'content-analysis', 'shooting-script',
+      'storyboard', 'asset-binding', 'video-deployment', 'video-generation', 'final-review'])
+    assert.deepEqual(drama.stages.map(stage => stage.id), video.stages.slice(2).map(stage => stage.id))
+    assert.equal((await view(normalTicket)).workflowProfileId, 'short-drama')
+    assert.equal((await view(a1)).workflowProfileId, 'legacy-drama-production')
+    assert.equal((await op(frozenTicket, 'workflow_profile_select', { workflowProfileId: 'short-video' })).status, 409)
+    assert.equal((await op(frozenTicket, 'workflow_activate', { stageId: alpha })).status, 409, 'Storyboard cannot skip a handoff')
+
+    const legacyMapping = await skills('bindings')
+    const findStage = (result, profileId, stageId) => result.profiles.find(profile => profile.id === profileId).stages.find(stage => stage.id === stageId)
+    assert.equal(findStage(legacyMapping, 'legacy-drama-production', 'final-review').skillId, 'fixture-legacy-review')
+    for (const profileId of ['short-video', 'short-drama']) {
+      assert.equal(findStage(legacyMapping, profileId, 'final-review').skillId, 'drama-final-review')
+    }
+    await installStage(home, 'topic-selection', 'V1')
+    await installStage(home, 'shooting-script', 'V1')
+    await activate(videoTicket, 'topic-selection')
+    await activate(frozenTicket, 'shooting-script')
+    await activate(scriptTicket, 'shooting-script')
+    await send(videoSession, videoTicket, 'Discuss a topic in the video project.', 'topic-selection', 'V1')
+    await send(frozenSession, frozenTicket, 'Save the confirmed script draft.', 'shooting-script', 'V1', { script: [{
+      call: { name: 'drama_save_artifact', args: {
+        operationId: randomUUID(), title: 'Versioned shooting script', content: '# Script\nA shared handoff.',
+      } },
+    }] })
+    const pending = await ok(await op(frozenTicket, 'workflow_handoff_preview', { stageId: 'shooting-script' }), 'Preview script handoff')
+    await ok(await op(frozenTicket, 'workflow_handoff_confirm', { handoffId: pending.handoffId }), 'Confirm script handoff')
+    await ready(frozenTicket)
+    const official = await view(frozenTicket)
+    assert.equal(official.session.activeStageId, alpha)
+    assert.equal(official.activeSkillId, 'drama-storyboard')
+    assert.equal((await view(videoTicket)).stages.find(stage => stage.id === 'shooting-script').status, 'not_started')
+    await send(normalSession, normalTicket, 'Continue plain discussion in the same drama project.')
+    await send(scriptSession, scriptTicket, 'Continue drafting independently.', 'shooting-script', 'V1')
+
+    const alternate = 'fixture-custom-storyboard'
+    const alternateDir = join(home, 'skills', alternate)
+    await mkdir(alternateDir)
+    await writeFile(join(alternateDir, 'SKILL.md'), [
+      '---', 'name: ' + alternate, 'description: Scoped storyboard fixture.', '---',
+      stageText(alpha, 'V2', 'SKILL'), 'CUSTOM_PROFILE_BOUND_STORYBOARD', '',
+    ].join('\n'))
+    await skills('refresh')
+    const bindingData = { profileId: 'short-drama', stageId: alpha }
+    const changed = await skills('bind', { ...bindingData, skillId: alternate })
+    assert.equal(findStage(changed, 'short-drama', alpha).skillId, alternate)
+    assert.equal(findStage(changed, 'short-video', alpha).skillId, 'drama-storyboard')
+    assert.equal(findStage(changed, 'short-drama', 'shooting-script').overridden, false)
+    const old = await send(frozenSession, frozenTicket, 'Keep using the activated storyboard.', alpha, 'V2')
+    assert.doesNotMatch(wireParts(old.requests.at(-1)).system, /CUSTOM_PROFILE_BOUND_STORYBOARD/u)
+    assert.equal((await view(frozenTicket)).session.snapshotId, official.session.snapshotId)
+    assert.equal((await view(frozenTicket)).activeSkillId, official.activeSkillId)
+    await activate(normalTicket, alpha)
+    const custom = await view(normalTicket)
+    assert.equal(custom.activeSkillId, alternate)
+    assert.notEqual(custom.session.skillSha256, official.session.skillSha256)
+    assert.equal(custom.session.harnessSha256, official.session.harnessSha256)
+    const fresh = await send(normalSession, normalTicket, 'Use the current profile binding.', alpha, 'V2')
+    assert.match(wireParts(fresh.requests.at(-1)).system, /CUSTOM_PROFILE_BOUND_STORYBOARD/u)
+
+    const bindingsPath = join(home, 'drama-studio', 'workflows', 'stage-bindings.json')
+    const savedBindings = await readFile(bindingsPath, 'utf8')
+    await activate(normalTicket, '')
+    for (const invalid of ['missing-profile-storyboard', '../outside']) {
+      const config = JSON.parse(savedBindings)
+      config.profiles['short-drama'][alpha] = invalid
+      await writeFile(bindingsPath, JSON.stringify(config))
+      const blocked = await op(normalTicket, 'workflow_activate', { stageId: alpha })
+      assert.equal(blocked.ok, false)
+      assert.match((await blocked.json()).error, /short-drama \/ storyboard/u)
+      assert.equal((await read(normalTicket)).activeStageId ?? '', '')
+    }
+    await writeFile(bindingsPath, savedBindings)
+    await activate(normalTicket, alpha)
+    const restored = await view(normalTicket)
+    evidence('isolated Profile snapshots', { officialSkillId: official.activeSkillId, officialSkill: official.session.skillSha256,
+      customSkillId: restored.activeSkillId, customSkill: restored.session.skillSha256, harness: restored.session.harnessSha256,
+      officialSnapshot: official.session.snapshotId, customSnapshot: restored.session.snapshotId })
+
     await activate(a2, '')
     await activate(b1, '')
     await activate(b1, alpha)
@@ -529,7 +651,8 @@ async function verify(ctx, signal) {
     await until(() => holdRestart.entered, signal, 'in-flight turn at restart')
     const runningState = await read(a1)
     assert.equal(runningState.status, 'running')
-    await writeFile(stateFile, JSON.stringify({ ids, betaSnapshot: runningState.snapshotId, alphaSnapshot: pendingB.snapshotId }))
+    await writeFile(stateFile, JSON.stringify({ ids, profileIds, customSnapshot: restored.session.snapshotId,
+      betaSnapshot: runningState.snapshotId, alphaSnapshot: pendingB.snapshotId }))
     console.info('[' + name + '] PASS wire (replace, in-history, compaction, phase guards, frozen versions, file replacement, isolated sessions, Agent dispose)')
     await until(() => false, signal, 'host stops the held fixture', 180_000)
   } finally {
@@ -564,6 +687,12 @@ async function runFixture() {
     await cp(join(repo, 'resources'), join(root, 'resources'), { recursive: true })
     await copyFile(entry, fixture)
     await copyFile(join(repo, 'package.json'), join(root, 'package.json'))
+    const legacyMapping = join(root, 'home', legacyTarget)
+    await mkdir(dirname(legacyMapping), { recursive: true })
+    await writeFile(legacyMapping, legacyMappingBytes)
+    const legacySkill = join(root, 'home', 'skills', 'fixture-legacy-review')
+    await mkdir(legacySkill, { recursive: true })
+    await writeFile(join(legacySkill, 'SKILL.md'), '---\nname: fixture-legacy-review\ndescription: Legacy review migration fixture.\n---\nReview the final cut.\n')
     const overlay = join(root, 'fixture.yml')
     const pathYAML = path => JSON.stringify(path.replaceAll('\\', '/'))
     await writeFile(overlay, [

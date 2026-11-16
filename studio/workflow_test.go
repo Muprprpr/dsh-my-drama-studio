@@ -14,12 +14,17 @@ import (
 )
 
 func workflowTestSnapshot(stageID, version string) *workflowSnapshot {
+	return profileTestSnapshot(legacyWorkflowProfile, stageID, version)
+}
+
+func profileTestSnapshot(profile *workflowProfile, stageID, version string) *workflowSnapshot {
 	if stageID == "" {
 		return nil
 	}
-	stage := dramaWorkflowStages[workflowStageIndex(stageID)]
+	stage := profile.stage(profile.stageIndex(stageID))
 	skillBody, harnessBody := "Rendered "+stageID+" Skill "+version, stageID+" Harness "+version
 	return &workflowSnapshot{
+		WorkflowProfileID: profile.ID, WorkflowDefinitionVersion: profile.Version, SkillID: stage.Skill,
 		StageID: stageID, SkillBody: skillBody, HarnessBody: harnessBody,
 		SkillPath:         "skills/" + stage.Skill + "/SKILL.md",
 		HarnessPath:       "drama-studio/workflows/" + dramaWorkflowID + "/" + stage.Harness,
@@ -29,6 +34,8 @@ func workflowTestSnapshot(stageID, version string) *workflowSnapshot {
 		},
 	}
 }
+
+func workflowStageIndex(id string) int { return legacyWorkflowProfile.stageIndex(id) }
 
 func workflowOp() operation { return operation{ID: uuid.NewString()} }
 
@@ -74,9 +81,19 @@ func (f *workflowTest) activate(session, stage string) workflowView {
 
 func (f *workflowTest) activation(session, stage, version string) workflowActivateArgs {
 	f.t.Helper()
-	activation := f.view(session).Session.Activation
+	view := f.view(session)
+	if view.ProfileSelectionRequired {
+		if _, err := f.s.Execute(context.Background(), Request{
+			WorkspaceID: "workspace", WorkspacePath: f.dir, Action: "recover",
+			Data: json.RawMessage(`{"legacyWorkspace":true}`),
+		}); err != nil {
+			f.t.Fatal(err)
+		}
+		view = f.view(session)
+	}
+	activation := view.Session.Activation
 	return workflowActivateArgs{operation: workflowOp(), StageID: stage,
-		ExpectedActivation: &activation, Snapshot: workflowTestSnapshot(stage, version)}
+		ExpectedActivation: &activation, Snapshot: profileTestSnapshot(workflowProfiles[view.WorkflowProfileID], stage, version)}
 }
 
 func (f *workflowTest) start(session, stage, handoff string) workflowTurnResult {
@@ -115,7 +132,8 @@ func (f *workflowTest) preview(session string, refs ...workflowArtifactRef) work
 func (f *workflowTest) confirm(session string, h workflowHandoff) workflowHandoff {
 	f.t.Helper()
 	return f.call(session, "human", "workflow_handoff_confirm", workflowConfirmArgs{
-		operation: workflowOp(), HandoffID: h.HandoffID, Snapshot: workflowTestSnapshot(h.TargetStageID, "V1"),
+		operation: workflowOp(), HandoffID: h.HandoffID,
+		Snapshot: profileTestSnapshot(workflowProfiles[f.view(session).WorkflowProfileID], h.TargetStageID, "V1"),
 	}).(workflowHandoff)
 }
 
@@ -132,13 +150,14 @@ func TestWorkflowSessionDraftsAndExplicitHandoff(t *testing.T) {
 	const stage = "storyboard"
 	const target = "asset-binding"
 	idx := workflowStageIndex(stage)
-	if v := f.view("normal"); v.Session.Status != "normal" || len(v.Stages) != 7 || v.Stages[idx].Status != workflowNotStarted {
+	if v := f.view("normal"); v.Session.Status != "normal" || !v.ProfileSelectionRequired || len(v.Stages) != 0 {
 		t.Fatalf("initial workflow: %+v", v)
 	}
 	if _, err := os.Stat(filepath.Join(f.dir, ".drama-studio")); !os.IsNotExist(err) {
 		t.Fatalf("reading normal chat created project state: %v", err)
 	}
-	if v := f.activate("a", stage); v.Session.Status != "active" || v.Session.ActiveStageID != stage || len(v.Handoffs) != 0 {
+	if v := f.activate("a", stage); v.Session.Status != "active" || v.Session.ActiveStageID != stage || len(v.Handoffs) != 0 ||
+		len(v.Stages) != 7 || v.Stages[idx].Status != workflowNotStarted {
 		t.Fatalf("activation started work or handoff: %+v", v)
 	}
 	f.activate("b", stage)
@@ -474,7 +493,8 @@ func TestWorkflowActivationMigrationRetainsLegacyMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	legacyVersions := workflowTestSnapshot("storyboard", "old").workflowFileVersions
-	if _, err := p.db.Exec(`DELETE FROM workflow_migrations WHERE name='activation-snapshots-v1';
+	if _, err := p.db.Exec(`DELETE FROM workflow_migrations WHERE name IN ('activation-snapshots-v1','workspace-profiles-v1');
+		DROP TABLE workflow_profile;
 		ALTER TABLE workflow_sessions DROP COLUMN snapshot_id;
 		ALTER TABLE workflow_sessions DROP COLUMN activated_at;
 		ALTER TABLE workflow_sessions DROP COLUMN transition_pending;
@@ -489,7 +509,7 @@ func TestWorkflowActivationMigrationRetainsLegacyMetadata(t *testing.T) {
 	}
 	f.reopen(nil)
 	legacy := f.call("legacy", "workflow", "workflow_session", nil).(workflowSessionResult)
-	if !legacy.Session.LegacyActivation || !legacy.Session.TransitionPending || legacy.Session.Activation != 3 ||
+	if legacy.WorkflowProfileID != legacyWorkflowProfileID || !legacy.Session.LegacyActivation || !legacy.Session.TransitionPending || legacy.Session.Activation != 3 ||
 		legacy.Session.ActiveStageID != "storyboard" || legacy.Session.workflowFileVersions != legacyVersions ||
 		legacy.Session.SnapshotID != "" || legacy.Snapshot != nil || legacy.Session.RunID != "" {
 		t.Fatalf("migration changed legacy activation or manufactured a snapshot: %+v", legacy)

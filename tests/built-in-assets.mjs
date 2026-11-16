@@ -69,7 +69,7 @@ test('A/B/C/F — clean install, concurrent/idempotent startup, custom file prot
   for (const [target, bytes] of Object.entries(userFiles)) await write(join(home, target), bytes)
   const [first, second] = await Promise.all([start(), start()])
   assert.deepEqual(first, second)
-  assert.equal(Object.keys(first.assets).length, 17)
+  assert.equal(Object.keys(first.assets).length, 19)
   for (const asset of assets) {
     const bytes = await readFile(join(resources, asset.source))
     assert.deepEqual(await readFile(join(home, asset.target)), bytes)

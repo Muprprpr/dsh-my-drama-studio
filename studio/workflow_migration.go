@@ -26,6 +26,31 @@ type legacyWorkflowHandoff struct {
 	stale                           bool
 }
 
+func migrateWorkflowProfile(ctx context.Context, tx *sql.Tx) error {
+	// Only databases already initialized by the previous Studio version are migrated.
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO workflow_profile(singleton,profile_id,definition_version)
+		SELECT 1,?,? WHERE EXISTS(SELECT 1 FROM canvas_meta WHERE singleton=1)
+			AND NOT EXISTS(SELECT 1 FROM workflow_migrations WHERE name='workspace-profiles-v1')
+		ON CONFLICT(singleton) DO NOTHING`, legacyWorkflowProfile.ID, legacyWorkflowProfile.Version); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO workflow_migrations VALUES('workspace-profiles-v1') ON CONFLICT DO NOTHING`)
+	return err
+}
+
+func (p *project) migrateRegisteredWorkflowProfile(ctx context.Context) error {
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := initWorkflowProfile(ctx, tx, legacyWorkflowProfile); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func migrateWorkflowActivations(ctx context.Context, tx *sql.Tx) error {
 	var migrated bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM workflow_migrations WHERE name='activation-snapshots-v1')`).Scan(&migrated); err != nil || migrated {
@@ -64,7 +89,7 @@ func migrateWorkflowHandoffs(ctx context.Context, tx *sql.Tx) error {
 			return err
 		}
 		var run legacyWorkflowRun
-		if workflowStageIndex(stage) < 0 {
+		if legacyWorkflowProfile.stageIndex(stage) < 0 {
 			continue
 		}
 		if err := json.Unmarshal([]byte(body), &run); err != nil {
@@ -99,7 +124,7 @@ func migrateWorkflowHandoffs(ctx context.Context, tx *sql.Tx) error {
 		revision++
 		handoff := workflowHandoff{
 			workflowFileVersions: old.workflowFileVersions,
-			HandoffID:            old.ID, SourceStageID: old.stageID, TargetStageID: workflowNextStage(workflowStageIndex(old.stageID)),
+			HandoffID:            old.ID, SourceStageID: old.stageID, TargetStageID: legacyWorkflowProfile.nextStage(legacyWorkflowProfile.stageIndex(old.stageID)),
 			WorkspaceID: old.workspaceID, SourceSessionID: old.sessionID, SourceRevision: revision,
 			CreatedAt: old.At, ConfirmedAt: old.At, ConfirmedDecisions: []string{}, Constraints: []string{},
 			Artifacts: make([]workflowArtifact, 0, len(old.Outputs)),

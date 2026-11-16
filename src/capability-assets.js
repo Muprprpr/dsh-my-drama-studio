@@ -11,10 +11,10 @@ const workflowId = 'drama-production'
 const stateTarget = 'drama-studio/managed-assets.json'
 const schemaVersion = 1
 export const stageIds = [
-  'content-analysis', 'shooting-script', 'storyboard', 'asset-binding',
+  'topic-selection', 'content-analysis', 'shooting-script', 'storyboard', 'asset-binding',
   'video-deployment', 'video-generation', 'final-review',
 ]
-const skillNamePattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u
+export const skillNamePattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u
 const skillDirectory = name => `skills/${name}/`
 export const skillTarget = name => skillDirectory(name) + 'SKILL.md'
 export const workflowTarget = (workflow, path) => `drama-studio/workflows/${workflow}/${path}`
@@ -24,7 +24,7 @@ function fail(status, message) {
   return Object.assign(new Error(message), { assetStatus: status })
 }
 
-function problem(error, path) {
+export function problem(error, path) {
   return {
     status: error.assetStatus ?? 'blocked', path,
     error: error.assetStatus ? error.message : `无法访问能力文件：${path}（${error.code ?? 'IO_ERROR'}）`,
@@ -54,7 +54,7 @@ function checkParents(root, target, create) {
   }
 }
 
-function readRegular(root, target, maxBytes = 1024 * 1024) {
+export function readRegular(root, target, maxBytes = 1024 * 1024) {
   checkParents(root, target, false)
   const path = resolve(root, target)
   const info = lstatSync(path, { throwIfNoEntry: false })
@@ -64,7 +64,7 @@ function readRegular(root, target, maxBytes = 1024 * 1024) {
   return readFileSync(path)
 }
 
-function readJSON(bytes, path) {
+export function readJSON(bytes, path) {
   try {
     return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes).replace(/^\uFEFF/u, ''))
   } catch {
@@ -140,19 +140,22 @@ function readBundle(ctx) {
   return { assets, packageVersion: packageInfo.version }
 }
 
-function readRecords(bytes, path) {
-  if (!bytes) return {}
+function readLedger(bytes, path) {
+  if (!bytes) return { assets: {} }
   const state = readJSON(bytes, path)
-  if (state?.schemaVersion !== schemaVersion || !object(state.assets) || Object.values(state.assets).some(entry =>
+  if (state?.schemaVersion !== schemaVersion || !object(state.assets) ||
+      (state.legacyWorkspaceCutoff !== undefined &&
+        (typeof state.legacyWorkspaceCutoff !== 'string' || !Number.isFinite(Date.parse(state.legacyWorkspaceCutoff)))) ||
+      Object.values(state.assets).some(entry =>
     !object(entry) || typeof entry.target !== 'string' ||
     (entry.installedHash !== undefined &&
       (typeof entry.installedHash !== 'string' || entry.installedHash.length !== 64 || !/^[0-9a-f]{64}$/u.test(entry.installedHash))))) {
     throw fail('invalid', `管理记录格式无效：${path}`)
   }
-  return state.assets
+  return state
 }
 
-function atomicWrite(root, target, bytes, previousHash) {
+export function atomicWrite(root, target, bytes, previousHash) {
   checkParents(root, target, true)
   const path = resolve(root, target)
   const temporary = resolve(dirname(path), `.drama-${randomUUID()}.tmp`)
@@ -217,6 +220,15 @@ async function lockAssets(root) {
   }
 }
 
+export async function withHomeLock(root, run) {
+  const unlock = await lockAssets(root)
+  try {
+    return await run()
+  } finally {
+    await unlock()
+  }
+}
+
 export async function ensureBuiltInAssets(ctx) {
   const state = { errors: new Map(), records: {} }
   let path = ctx.profileContext?.home
@@ -226,10 +238,12 @@ export async function ensureBuiltInAssets(ctx) {
     path = fileURLToPath(new URL('../resources', import.meta.url))
     Object.assign(state, readBundle(ctx))
     path = resolve(root, stateTarget)
-    const unlock = await lockAssets(root)
-    try {
+    await withHomeLock(root, () => {
       const previous = readRegular(root, stateTarget)
-      const records = state.records = readRecords(previous, path)
+      const ledger = readLedger(previous, path)
+      const records = state.records = ledger.assets
+      const legacyWorkspaceCutoff = state.legacyWorkspaceCutoff = ledger.legacyWorkspaceCutoff ??
+        (records['skill:drama-content-analysis'] && !records['skill:drama-topic-selection'] ? new Date().toISOString() : undefined)
       for (const asset of state.assets.values()) {
         const { id, target } = asset
         try {
@@ -256,11 +270,9 @@ export async function ensureBuiltInAssets(ctx) {
       for (const [id, record] of Object.entries(records)) {
         if (!activeIds.has(id)) record.status = 'deprecated'
       }
-      const next = Buffer.from(JSON.stringify({ schemaVersion, packageVersion: state.packageVersion, assets: records }, null, 2) + '\n')
+      const next = Buffer.from(JSON.stringify({ schemaVersion, packageVersion: state.packageVersion, legacyWorkspaceCutoff, assets: records }, null, 2) + '\n')
       if (!previous?.equals(next)) atomicWrite(root, stateTarget, next, previous && sha256(previous))
-    } finally {
-      await unlock()
-    }
+    })
   } catch (error) {
     state.failure = problem(error, error.dest ?? error.path ?? path)
   }
@@ -269,7 +281,7 @@ export async function ensureBuiltInAssets(ctx) {
 
 export function assetStatus(state, target, hash) {
   const path = resolve(state.root, target)
-  const asset = state.assets.get(target)
+  const asset = state.assets?.get(target)
   const record = asset && state.records[asset.id]
   return { status: ownership(asset, record, hash), path, hash }
 }
@@ -307,10 +319,11 @@ export function readStageSkills(root) {
     if (!bytes) return { names: {} }
     const names = readJSON(bytes, path)
     if (!object(names) || Object.entries(names).some(([stage, name]) =>
-      !stageIds.includes(stage) || typeof name !== 'string' || name !== name.trim() || !skillNamePattern.test(name))) {
+      stage === 'topic-selection' || !stageIds.includes(stage) || typeof name !== 'string' ||
+      name !== name.trim() || !skillNamePattern.test(name))) {
       throw fail('invalid', `阶段 Skill 映射须使用固定阶段 ID 和有效的 Skill 名称：${path}`)
     }
-    return { names }
+    return { names, hash: sha256(bytes) }
   } catch (error) {
     return { failure: problem(error, path) }
   }

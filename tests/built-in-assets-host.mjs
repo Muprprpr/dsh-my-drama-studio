@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
-import { access, appendFile, copyFile, cp, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { access, appendFile, copyFile, cp, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
@@ -18,6 +18,7 @@ const upgraded = 'asset-binding'
 const testVersion = '99.0.0-fixture'
 const custom = 'drama-test-resources'
 const ordinary = 'ordinary-fixture-skill'
+const imported = 'test-custom-storyboard'
 const provider = 'drama-built-in-test'
 const model = 'scripted'
 const packageName = 'dsh-my-drama-studio'
@@ -28,6 +29,7 @@ const fixedStages = [
   'content-analysis', 'shooting-script', storyboard, 'asset-binding',
   'video-deployment', 'video-generation', 'final-review',
 ]
+const managedStages = ['topic-selection', ...fixedStages]
 const ledgerPath = 'drama-studio/managed-assets.json'
 const workflowDir = 'drama-studio/workflows/drama-production'
 const skillPath = key => join('skills', key, 'SKILL.md')
@@ -107,6 +109,16 @@ async function verify(ctx, signal) {
   const project = join(dirname(home), 'workspace-' + scenario)
   await mkdir(join(project, '.git'), { recursive: true })
   await put(join(project, '.dsh', skillPath('drama-storyboard')), skillText('drama-storyboard', 'PROJECT_RULES'))
+  const workspaceDB = join(project, '.drama-studio', 'studio.db')
+  await mkdir(dirname(workspaceDB), { recursive: true })
+  const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite')
+  const existingDB = new DatabaseSync(workspaceDB)
+  try {
+    existingDB.exec('CREATE TABLE IF NOT EXISTS canvas_meta (singleton INTEGER PRIMARY KEY CHECK(singleton=1), id TEXT NOT NULL);' +
+      "INSERT INTO canvas_meta VALUES(1,'legacy-canvas-fixture') ON CONFLICT DO NOTHING")
+  } finally {
+    existingDB.close()
+  }
   const workspace = await ctx.workspaceRegistry.create(project)
   const sessions = ctx.sessionController
   const { sessionId } = await sessions.create({ workspaceId: workspace.id })
@@ -140,6 +152,7 @@ async function verify(ctx, signal) {
     await response.body?.cancel()
   }, signal, 'Studio routes')
   const op = (action, data) => request('operation', { ticket, action, data })
+  const library = (action, data) => request('skills', { action, data })
   const read = async () => ok(await op('workflow_get'), 'workflow_get')
   const activate = stageId => op('workflow_activate', { operationId: randomUUID(), stageId })
   const stageFiles = view => view.stages.find(stage => stage.id === storyboard).files
@@ -211,10 +224,12 @@ async function verify(ctx, signal) {
     return
   }
   assert.deepEqual(view.stages.map(stage => stage.id), fixedStages)
+  assert.equal(view.workflowProfileId, 'legacy-drama-production')
   const unavailable = view.stages.filter(stage => !stage.files.skillReady || !stage.files.harnessReady)
   assert.deepEqual(unavailable.map(stage => ({ id: stage.id, issues: stage.files.issues })), [])
   const ledger = JSON.parse(await readFile(join(home, ledgerPath), 'utf8'))
-  assert.equal(Object.keys(ledger.assets).length, fixedStages.length * 2 + bundledResources.length)
+  assert.equal(Object.keys(ledger.assets).filter(id => ledger.assets[id].status !== 'deprecated').length,
+    managedStages.length * 2 + bundledResources.length - (scenario === 'upgrade' ? 1 : 0))
   const native = (key, cwd) => registry.get(key, { ...nativeOptions, ...(cwd && { cwd }) })
   for (const stage of view.stages) {
     const key = 'drama-' + stage.id
@@ -241,6 +256,7 @@ async function verify(ctx, signal) {
     assert.match(official.content, /USER_OWNED_RULES/u)
     await ok(await activate(storyboard), 'activate user-owned stage Skill')
     assert.match(await chat(), /USER_OWNED_RULES/u)
+    await assert.rejects(access(join(home, skillPath(imported))), { code: 'ENOENT' })
     log('PASS user-owned Skill preserved, discovered and activated in second DSH Home')
     return
   }
@@ -252,7 +268,7 @@ async function verify(ctx, signal) {
     assert.equal(await realpath(info.dir), await realpath(packageDir))
     assert.equal(await realpath(process.cwd()), await realpath(dirname(home)))
     const manifest = JSON.parse(await readFile(join(packageDir, 'resources', 'manifest.json'), 'utf8'))
-    assert.equal(manifest.assets.length, fixedStages.length * 2 + bundledResources.length)
+    assert.equal(manifest.assets.length, managedStages.length * 2 + bundledResources.length)
     for (const asset of manifest.assets) {
       const installed = await readFile(join(home, asset.target))
       assert.deepEqual(installed, await readFile(join(packageDir, 'resources', asset.source)))
@@ -263,6 +279,9 @@ async function verify(ctx, signal) {
     }
     const paths = await readSkillResources(official)
     assert.deepEqual(stageFiles(view).resourceAssets.map(asset => asset.status), paths.map(() => 'ready'))
+    const catalog = await ok(await library('list'), 'packed Skill Library')
+    assert.deepEqual(catalog.skills.filter(skill => skill.builtIn && skill.bindable).map(skill => skill.id).sort(),
+      managedStages.map(id => 'drama-' + id).sort())
     await ok(await activate(storyboard), 'activate packed stage Skill')
     const turn = await chat(paths[0])
     assert.match(turn, /\[Drama Studio Workflow Stage\]/u)
@@ -279,6 +298,10 @@ async function verify(ctx, signal) {
     return
   }
   if (scenario === 'repeat' || scenario === 'recovery') {
+    const skill = (await ok(await library('detail', { skillId: imported }), 'read imported Skill after restart')).skill
+    assert.equal(skill.source, 'user-imported')
+    assert.equal(skill.userModified, true)
+    assert.match(skill.content, /EDITED_AFTER_IMPORT/u)
     log('PASS complete capabilities after ' + scenario + ' start')
     return
   }
@@ -315,9 +338,11 @@ async function verify(ctx, signal) {
     log('PASS real Host upgraded unchanged Skill and Harness, preserved both user-edited files')
     return
   }
-  log('PASS seven native user-dsh Skills and seven Harnesses, raw hashes and resource bases, project shadow excluded')
+  log('PASS seven legacy native user-dsh Skills and seven Harnesses, raw hashes and resource bases, project shadow excluded')
   await readSkillResources(official)
   log('PASS native Skill resourceBase resolved and read references, templates and script contents')
+  await put(join(home, skillPath(ordinary)), skillText(ordinary, 'ORDINARY_RULES'))
+  await verifyLibrary(signal, home, library, native, readSkillResources)
   await ok(await activate(storyboard), 'activate with bundled defaults')
   const frozen = (await read()).session
   assert.ok(frozen.snapshotId)
@@ -326,12 +351,22 @@ async function verify(ctx, signal) {
   for (const [index, path] of relativeResources.entries()) {
     await put(join(home, resourceTarget(custom, path)), await readFile(join(home, bundledResources[index])))
   }
-  await put(join(home, skillPath(ordinary)), skillText(ordinary, 'ORDINARY_RULES'))
-  const mappingPath = join(home, workflowDir, 'stage-skills.json')
+  const oldMappingPath = join(home, workflowDir, 'stage-skills.json')
+  const mappingPath = join(home, 'drama-studio/workflows/stage-bindings.json')
   const currentHarness = join(home, harnessPath(storyboard))
   const originalHarness = await readFile(currentHarness)
   const modifiedHarness = 'CUSTOM_HARNESS_V2\n'
-  await put(mappingPath, JSON.stringify({ [storyboard]: custom }))
+  const formerMapping = JSON.stringify({ [storyboard]: custom })
+  await put(oldMappingPath, formerMapping)
+  const settings = await ok(await library('bindings'), 'migrate legacy stage mapping')
+  const binding = id => settings.profiles.find(profile => profile.id === id).stages.find(stage => stage.id === storyboard)
+  assert.equal(binding('legacy-drama-production').skillId, custom)
+  assert.equal(binding('short-drama').skillId, 'drama-storyboard')
+  assert.equal(binding('short-video').skillId, 'drama-storyboard')
+  const migration = JSON.parse(await readFile(mappingPath, 'utf8'))
+  assert.equal(migration.legacyMigration.sha256, digest(formerMapping))
+  assert.equal(await readFile(oldMappingPath, 'utf8'), formerMapping)
+  const mapped = skill => put(mappingPath, JSON.stringify({ ...migration, profiles: { 'legacy-drama-production': { [storyboard]: skill } } }))
   await put(currentHarness, modifiedHarness)
   const mappedView = await until(async () => {
     const next = await read()
@@ -348,6 +383,8 @@ async function verify(ctx, signal) {
   assert.notEqual(view.session.snapshotId, frozen.snapshotId)
   assert.equal(view.session.harnessSha256, digest(modifiedHarness))
   assert.equal(view.session.skillSha256, digest(renderSkillContent(await native(custom))))
+  log('PASS activation snapshot ' + JSON.stringify({ profileId: view.workflowProfileId, skillId: custom,
+    skillSha256: view.session.skillSha256, harnessSha256: view.session.harnessSha256 }))
   const rendered = await chat()
   assert.match(rendered, /CUSTOM_HARNESS_V2/u)
   assert.match(rendered, /CUSTOM_RULES_V1/u)
@@ -377,7 +414,7 @@ async function verify(ctx, signal) {
   await ok(await activate(''), 'exit mapped stage')
 
   for (const key of ['missing-storyboard', '../outside']) {
-    await put(mappingPath, JSON.stringify({ [storyboard]: key }))
+    await mapped(key)
     const result = await activate(storyboard)
     assert.equal(result.ok, false)
     const error = (await result.json()).error
@@ -386,7 +423,7 @@ async function verify(ctx, signal) {
     assert.equal((await read()).session.activeStageId ?? '', '')
   }
   await put(join(home, skillPath('empty-storyboard')), skillText('empty-storyboard', ''))
-  await put(mappingPath, JSON.stringify({ [storyboard]: 'empty-storyboard' }))
+  await mapped('empty-storyboard')
   const empty = await until(async () => {
     const definition = await native('empty-storyboard')
     return definition && { content: definition.content }
@@ -394,9 +431,95 @@ async function verify(ctx, signal) {
   assert.equal(empty.content, '')
   assert.equal(stageFiles(await read()).skillReady, false)
   assert.equal((await activate(storyboard)).ok, false)
+  await mapped('foreign-stage-skill')
+  await put(join(process.env.DSH_AGENTS_HOME, skillPath('foreign-stage-skill')), skillText('foreign-stage-skill', 'EXTERNAL_SOURCE'))
+  const external = await activate(storyboard)
+  assert.equal(external.status, 409)
+  assert.match((await external.json()).error, /user-agents.*user-dsh/u)
+  await mapped('drama-storyboard')
+  await rename(currentHarness, currentHarness + '.missing')
+  const missingHarness = await activate(storyboard)
+  assert.equal(missingHarness.status, 404)
+  assert.ok((await missingHarness.json()).error.includes(currentHarness))
+  await rename(currentHarness + '.missing', currentHarness)
   await writeFile(currentHarness, originalHarness)
-  await rm(mappingPath)
+  await ok(await library('bind', { profileId: 'legacy-drama-production', stageId: storyboard, skillId: null }), 'reset legacy mapping')
+  assert.equal(await readFile(oldMappingPath, 'utf8'), formerMapping)
   log('PASS fresh or edited capabilities used at reactivation, frozen activation retained, invalid or missing mapping rejected')
+}
+
+async function verifyLibrary(signal, home, call, native, readSkillResources) {
+  async function success(action, data) {
+    const response = await call(action, data)
+    const payload = await response.json()
+    assert.ok(response.ok, action + ' HTTP ' + response.status + ' ' + JSON.stringify(payload))
+    return payload
+  }
+  async function reject(action, data, status, reason) {
+    const response = await call(action, data)
+    const payload = await response.json()
+    assert.equal(response.status, status, JSON.stringify(payload))
+    assert.match(payload.error, reason)
+  }
+  const id = imported
+  const source = join(dirname(home), id)
+  const original = skillText(id, ['ORIGINAL_CONTENT', ...relativeResources].join('\n'))
+  await put(join(source, 'SKILL.md'), original)
+  const script = 'require("node:fs").writeFileSync(' + JSON.stringify(join(source, 'unexpected-script-execution')) + ', "executed");\n'
+  for (const path of relativeResources) await put(join(source, path), path.endsWith('.js') ? script : path + '\n')
+  const list = await success('refresh')
+  assert.equal(list.directory, join(home, 'skills'))
+  assert.equal(list.canOpen, true, 'Native path opener capability')
+  assert.deepEqual(list.skills.filter(skill => skill.builtIn && skill.bindable).map(skill => skill.id).sort(),
+    managedStages.map(stage => 'drama-' + stage).sort())
+  assert.equal(list.skills.find(skill => skill.id === ordinary).source, 'user-managed')
+  assert.equal(list.skills.find(skill => skill.id === ordinary).description, 'Native integration fixture.')
+  const first = await success('import', { path: source })
+  assert.equal(first.status, 'imported')
+  assert.equal(first.skill.source, 'user-imported')
+  assert.equal(first.skill.nativeSource, 'user-dsh')
+  assert.equal(first.skill.bindable, true)
+  assert.equal(first.skill.hash, digest(original))
+  assert.equal(first.skill.content, original.trim())
+  assert.deepEqual(await success('open_directory', { skillId: id }), { opened: true, path: join(home, 'skills', id) })
+  const discovered = await until(() => native(id), signal, 'native import discovery')
+  assert.equal(discovered.source, 'user-dsh')
+  assert.equal(await realpath(discovered.path), join(home, skillPath(id)))
+  const resourceFiles = await readSkillResources(discovered)
+  assert.equal(resourceFiles.length, relativeResources.length)
+  assert.deepEqual(first.skill.resources.map(resource => resource.relativePath).sort(), [...relativeResources].sort())
+  await assert.rejects(access(join(source, 'unexpected-script-execution')), { code: 'ENOENT' })
+  assert.equal((await success('import', { path: source })).status, 'already-exists')
+  await appendFile(join(source, 'SKILL.md'), 'CHANGED_SOURCE\n')
+  await reject('import', { path: source }, 409, /已存在.*内容不同/u)
+  assert.equal(await readFile(discovered.path, 'utf8'), original)
+  const originalOfficial = await readFile(join(home, skillPath('drama-storyboard')), 'utf8')
+  const officialConflict = join(dirname(home), 'drama-storyboard')
+  await put(join(officialConflict, 'SKILL.md'), skillText('drama-storyboard', 'NO_OVERWRITE'))
+  await reject('import', { path: officialConflict }, 409, /已存在.*内容不同/u)
+  const clone = await success('clone', { skillId: 'drama-storyboard', name: 'test-custom-official' })
+  assert.equal(clone.skill.source, 'user-imported')
+  assert.match(clone.skill.content, /name: "test-custom-official"/u)
+  assert.equal(clone.skill.resources.length, relativeResources.length)
+  assert.equal(await readFile(join(home, skillPath('drama-storyboard')), 'utf8'), originalOfficial)
+  const invalid = join(dirname(home), 'invalid-skill')
+  await put(join(invalid, 'SKILL.md'), '---\nname: [unterminated\n---\nBODY\n')
+  await reject('import', { path: invalid }, 400, /YAML frontmatter/u)
+  await reject('import', { path: source + '\\..\\' + id }, 400, /Windows Skill 文件夹路径/u)
+  const linked = join(dirname(home), 'junction-skill')
+  await put(join(linked, 'SKILL.md'), skillText('junction-skill', 'LINK_ESCAPE'))
+  await symlink(join(source, 'references'), join(linked, 'references'), 'junction')
+  await reject('import', { path: linked }, 409, /普通文件或目录/u)
+  await assert.rejects(access(join(home, 'skills', 'junction-skill')), { code: 'ENOENT' })
+  await put(join(process.env.DSH_AGENTS_HOME, skillPath(id)), skillText(id, 'LOWER_PRECEDENCE'))
+  await reject('bind', { profileId: 'short-drama', stageId: storyboard, skillId: id }, 409, /同名来源.*user-dsh.*user-agents/u)
+  await rm(join(process.env.DSH_AGENTS_HOME, skillPath(id)))
+  await appendFile(discovered.path, 'EDITED_AFTER_IMPORT\n')
+  const edited = (await success('detail', { skillId: id })).skill
+  assert.equal(edited.userModified, true)
+  assert.match(edited.content, /EDITED_AFTER_IMPORT/u)
+  assert.notEqual(edited.hash, first.skill.hash)
+  log('PASS native Skill Library list/detail/refresh, imported resource reads, conflict and junction protection, edit and clone')
 }
 
 async function footprint(home, paths) {
@@ -487,8 +610,9 @@ async function run() {
   const owned = homeFor('user-owned')
   const recovered = skillPath('drama-content-analysis')
   const customFiles = ['custom-folder/user-file.txt', join(workflowDir, 'stages', 'user-stage', 'harness.md')]
-  const paths = [ledgerPath, ...customFiles, skillPath(ordinary), skillPath(custom), ...fixedStages.flatMap(stageTargets),
-    ...bundledResources, ...relativeResources.map(path => resourceTarget(custom, path))]
+  const paths = [ledgerPath, 'drama-studio/skill-imports.json', ...customFiles, skillPath(ordinary), skillPath(custom),
+    skillPath(imported), ...managedStages.flatMap(stageTargets), ...bundledResources,
+    ...relativeResources.flatMap(path => [resourceTarget(custom, path), resourceTarget(imported, path)])]
   const changedOnUpgrade = new Set([ledgerPath, ...stageTargets(upgraded), bundledResources[1]])
   const preservedOnUpgrade = paths.filter(path => !changedOnUpgrade.has(path))
   let first

@@ -58,22 +58,43 @@ func readWorkflowTurn(ctx context.Context, tx *sql.Tx, runID string) (workflowTu
 	return turn, err
 }
 
-func sessionResult(session workflowSession) workflowSessionResult {
-	result := workflowSessionResult{Session: session, WorkflowID: dramaWorkflowID}
-	if index := workflowStageIndex(session.ActiveStageID); index >= 0 {
-		result.Stage = &dramaWorkflowStages[index]
+func sessionResult(profile *workflowProfile, session workflowSession) workflowSessionResult {
+	result := workflowSessionResult{Session: session, WorkflowID: dramaWorkflowID, ProfileSelectionRequired: profile == nil}
+	if profile != nil {
+		result.WorkflowProfileID, result.WorkflowProfileName = profile.ID, profile.Name
+		result.WorkflowDefinitionVersion = profile.Version
+	}
+	if index := profile.stageIndex(session.ActiveStageID); index >= 0 {
+		stage := profile.stage(index)
+		result.Stage = &stage
 	}
 	return result
 }
 
+func readWorkflowSessionResult(ctx context.Context, query rowQuery, sessionID string) (workflowSessionResult, error) {
+	profile, err := readWorkflowProfile(ctx, query)
+	if err != nil {
+		return workflowSessionResult{}, err
+	}
+	session, err := readWorkflowSession(ctx, query, sessionID)
+	return sessionResult(profile, session), err
+}
+
 func (p *project) startWorkflowTurn(ctx context.Context, r Request, args workflowTurnStartArgs) (any, error) {
-	stageIndex := workflowStageIndex(args.StageID)
-	if stageIndex < 0 || strings.TrimSpace(args.RunID) == "" || len(args.RunID) > 160 ||
+	if args.StageID == "" || strings.TrimSpace(args.RunID) == "" || len(args.RunID) > 160 ||
 		args.Activation <= 0 || !validWorkflowSHA256(args.SnapshotID) {
 		return nil, invalid("原生回合需要有效的阶段 ID、运行 ID 和能力版本")
 	}
 	var locked bool
 	result, err := p.write(ctx, r, args.operation.ID, func(tx *sql.Tx, _ Status) (any, error) {
+		profile, err := readWorkflowProfile(ctx, tx)
+		if err != nil {
+			return nil, err
+		}
+		stageIndex := profile.stageIndex(args.StageID)
+		if stageIndex < 0 {
+			return nil, workflowChanged
+		}
 		session, err := readWorkflowSession(ctx, tx, r.SessionID)
 		if err != nil {
 			return nil, err
@@ -94,7 +115,12 @@ func (p *project) startWorkflowTurn(ctx context.Context, r Request, args workflo
 		if err != nil {
 			return nil, err
 		}
-		inputs := workflowInputs(latest, stageIndex)
+		if len(profile.Stages[stageIndex].Requires) != 0 {
+			if err := profile.requireWorkflowInputs(latest, stageIndex); err != nil {
+				return nil, err
+			}
+		}
+		inputs := profile.inputs(latest, stageIndex)
 		if args.HandoffID != "" {
 			if session.PendingHandoffID != args.HandoffID || stageIndex == 0 ||
 				!hasWorkflowInput(inputs, args.HandoffID) {
@@ -131,7 +157,7 @@ func (p *project) startWorkflowTurn(ctx context.Context, r Request, args workflo
 			return nil, err
 		}
 		session.Status, session.RunID, session.Error = workflowRunning, args.RunID, ""
-		out.workflowSessionResult = sessionResult(session)
+		out.workflowSessionResult = sessionResult(profile, session)
 		return out, nil
 	})
 	if err != nil && locked {
@@ -165,8 +191,7 @@ func (p *project) finishWorkflowTurn(ctx context.Context, r Request, args workfl
 				return nil, err
 			}
 		}
-		session, err := readWorkflowSession(ctx, tx, r.SessionID)
-		return sessionResult(session), err
+		return readWorkflowSessionResult(ctx, tx, r.SessionID)
 	})
 	if err == nil {
 		p.unlockWorkflowTurn(args.RunID)
@@ -201,6 +226,10 @@ func (p *project) markWorkflowAdmissionFailed(ctx context.Context, r Request, op
 		return nil, invalid("需要当前阶段或交接 ID 和失败原因")
 	}
 	return p.write(ctx, r, op.ID, func(tx *sql.Tx, _ Status) (any, error) {
+		profile, err := readWorkflowProfile(ctx, tx)
+		if err != nil {
+			return nil, err
+		}
 		session, err := readWorkflowSession(ctx, tx, r.SessionID)
 		if err != nil {
 			return nil, err
@@ -216,7 +245,7 @@ func (p *project) markWorkflowAdmissionFailed(ctx context.Context, r Request, op
 			}
 			session.Status, session.Error = workflowFailed, text
 		}
-		return sessionResult(session), nil
+		return sessionResult(profile, session), nil
 	})
 }
 

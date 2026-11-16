@@ -11,7 +11,10 @@
     "dist/host.js",
     "dist/studio.exe",
     "dsh.bundle.patch",
-    "resources"
+    "resources/manifest.json",
+    "resources/skills",
+    "resources/workflows",
+    "resources/workflow-profiles/*.json"
   ],
   "dsh": {
     "bundle": {
@@ -22,7 +25,8 @@
       "inject": [
         "@deepseek-ai/dsh-client-ui-conversation",
         "@deepseek-ai/dsh-client-ui-sidebar-right",
-        "@deepseek-ai/dsh-client-ui-settings-general"
+        "@deepseek-ai/dsh-client-ui-settings-general",
+        "@deepseek-ai/dsh-client-ui-workspace"
       ]
     }
   },

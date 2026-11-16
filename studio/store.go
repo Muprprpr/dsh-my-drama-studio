@@ -73,6 +73,9 @@ CREATE TABLE IF NOT EXISTS workflow_handoffs (
 );
 CREATE INDEX IF NOT EXISTS workflow_handoffs_stage ON workflow_handoffs(stage_id,revision);
 CREATE TABLE IF NOT EXISTS workflow_migrations (name TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS workflow_profile (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1), profile_id TEXT NOT NULL, definition_version INTEGER NOT NULL
+);
 DROP TRIGGER IF EXISTS nodes_no_update;
 DROP TRIGGER IF EXISTS nodes_no_delete;
 DROP TRIGGER IF EXISTS edges_no_update;
@@ -214,6 +217,9 @@ func (s *Service) open(ctx context.Context, directory string, create bool) (*pro
 		err = migrateWorkflowActivations(ctx, tx)
 	}
 	if err == nil {
+		err = migrateWorkflowProfile(ctx, tx)
+	}
+	if err == nil {
 		_, err = tx.ExecContext(ctx, `INSERT INTO canvas_meta VALUES(1,?) ON CONFLICT DO NOTHING`, uuid.NewString())
 	}
 	if err == nil {
@@ -264,10 +270,16 @@ func (s *Service) Execute(ctx context.Context, r Request) (any, error) {
 		if r.SessionID != "" || strings.TrimSpace(r.WorkspaceID) == "" {
 			return nil, invalid("恢复任务需要 DSH Workspace 身份")
 		}
-		if err := decodeData(r.Data, &struct{}{}); err != nil {
+		var recovery struct {
+			LegacyWorkspace bool `json:"legacyWorkspace,omitempty"`
+		}
+		if err := decodeData(r.Data, &recovery); err != nil {
 			return nil, err
 		}
-		p, err := s.open(ctx, r.WorkspacePath, false)
+		p, err := s.open(ctx, r.WorkspacePath, recovery.LegacyWorkspace)
+		if err == nil && p != nil && recovery.LegacyWorkspace {
+			err = p.migrateRegisteredWorkflowProfile(ctx)
+		}
 		if err == nil && p != nil {
 			err = p.recoverWorkflow(ctx, "")
 		}

@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState, useSyncExternalStore 
 import { CanvasViewport } from './canvas.jsx'
 import { videoMode } from './canvas-node.jsx'
 import { ProviderSettings, protocols } from './provider-settings.jsx'
+import { SkillsLibrary, WorkflowSkillBindings } from './skill-settings.jsx'
 import { installWorkflowStyle, WorkflowArtifacts, WorkflowProgress } from './workflow-panel.jsx'
 import {
   Button, IconChevronDownOutlineRegular, IconPanelLeftOutlineRegular, Menu, MenuItemButton, StateDot, Switch, Tooltip,
@@ -17,7 +18,7 @@ const statusChanges = new EventTarget()
 const canvasDrafts = new WeakMap()
 const videoGeneration = { t2v: generateT2V, i2v: generateI2V, r2v: generateR2V, v2v: generateV2V }
 
-export const inject = ['slots', 'sidebarRight', 'sidebarRightTabs', 'locale']
+export const inject = ['slots', 'sidebarRight', 'sidebarRightTabs', 'locale', 'uiWorkspace']
 
 export function apply(ctx) {
   const sidebar = ctx.sidebarRight
@@ -50,8 +51,16 @@ export function apply(ctx) {
     ctx.slots.register({ name: 'conversation.input.left', id: 'drama-session-control' },
       ({ sessionId, useWorkspaces }) => <SessionCanvasControl key={sessionId} sessionId={sessionId}
         sidebar={sidebar} useWorkspaces={useWorkspaces} />)))
-  ctx.effect(() => ctx.slots.inject('settings.section', () =>
-    ctx.slots.register({ name: 'settings.section', id: 'drama-studio', order: 60, label: 'Drama Studio' }, ProviderSettings)))
+  ctx.effect(() => ctx.slots.inject('settings.section', function* () {
+    yield ctx.slots.register({ name: 'settings.section', id: 'drama-studio', order: 60, label: 'Drama Studio' }, ProviderSettings)
+    yield ctx.slots.register({ name: 'settings.section', id: 'drama-skills', order: 61, label: 'Skills Library' },
+      () => <SkillsLibrary pickDirectory={() => {
+        const desktop = globalThis.__DSH_DIRECTORY_PICKER__
+        return typeof desktop?.pick === 'function' ? desktop.pick() : ctx.uiWorkspace.pickDirectory()
+      }} />)
+    yield ctx.slots.register({ name: 'settings.section', id: 'drama-skill-bindings', order: 62,
+      label: 'Workflow Skill Bindings' }, WorkflowSkillBindings)
+  }))
 }
 
 function notify(sessionId) {

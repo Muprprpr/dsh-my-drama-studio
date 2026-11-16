@@ -1,0 +1,13 @@
+{
+  "id": "short-drama",
+  "name": "短剧生产",
+  "version": 1,
+  "stages": [
+    { "id": "shooting-script", "name": "拍摄脚本制作", "defaultSkill": "drama-shooting-script", "requires": [] },
+    { "id": "storyboard", "name": "分镜制作", "defaultSkill": "drama-storyboard", "requires": ["shooting-script"] },
+    { "id": "asset-binding", "name": "素材抽卡与绑定", "defaultSkill": "drama-asset-binding", "requires": ["storyboard"] },
+    { "id": "video-deployment", "name": "视频节点部署", "defaultSkill": "drama-video-deployment", "requires": ["asset-binding"] },
+    { "id": "video-generation", "name": "视频生成", "defaultSkill": "drama-video-generation", "requires": ["video-deployment"] },
+    { "id": "final-review", "name": "成片验收", "defaultSkill": "drama-final-review", "requires": ["video-generation"] }
+  ]
+}

@@ -73,11 +73,11 @@ Agent 工具有 `drama_context`、`drama_query`、`drama_append`、`drama_submit
 
 ## 项目工作流
 
-进入项目会话后，输入框上方显示固定生产阶段。点击阶段仅激活当前 Session。继续使用原生聊天框进行讨论与迭代，打开 **阶段产物** 查看文档、媒体和历史版本。生成交接预览并确认后，Workspace 保存所选版本，当前 Session 启动下一阶段。视频生成由用户在 Canvas 中独立确认。
+新 Workspace 首次打开工作流时可选择 **短剧生产** 或 **短视频生产**，已有 Workspace 保留七阶段流程。点击阶段仅激活当前 Session。继续使用原生聊天框进行讨论与迭代，打开 **阶段产物** 查看文档、媒体和历史版本。生成交接预览并确认后，Workspace 保存所选版本，当前 Session 启动下一阶段。视频生成由用户在 Canvas 中独立确认。
 
-插件包在 `resources/` 内置七个阶段的 Skill 和 Harness。DSH Host 加载插件时会自动把缺失文件装填到当前 `DSH_HOME`。该 Home 下的 Workspace 共用这些文件。打开 Workflow Panel 可查看 **Workflow Capabilities Ready** 或展开问题详情。
+插件包在 `resources/` 内置生产模式定义，以及八个阶段的 Skill 和 Harness。DSH Host 将官方 Skill 和 Harness 装填到当前 `DSH_HOME`，同一 Home 内的 Workspace 共用全局能力。
 
-可以编辑全局 Skill 或 Harness，也可在 `DSH_HOME/skills/` 添加自定义 Skill，通过全局 `stage-skills.json` 指定使用它的阶段。升级只更新与上次安装内容一致的受管文件，已有的自定义内容和修改过的文件会保留。新版本在下次阶段激活时读取，已经激活的 Session 继续使用快照。 [装填路径、自定义映射与交接规则](docs/WORKFLOW.md)
+在 DSH 全局 Settings 的 **Skills Library** 查看、导入、打开或复制 Skill，在 **Workflow Skill Bindings** 为不同模式的阶段更换 Skill 或恢复官方默认。全局修改在下次激活时生效，已激活的 Session 继续使用快照。 [装填路径、自定义绑定与交接规则](docs/WORKFLOW.md)
 
 ## 卸载
 

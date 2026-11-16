@@ -1,0 +1,106 @@
+.drama-skill-settings {
+  min-width: 0;
+  color: var(--dsw-alias-label-primary);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.drama-skill-settings p { margin: 4px 0; }
+.drama-skill-settings h2 {
+  margin: 0 0 8px;
+  font-size: 16px;
+  font-weight: 600;
+}
+.drama-skill-settings small,
+.drama-skill-path,
+.drama-skill-hash { color: var(--dsw-alias-label-secondary); }
+.drama-skill-settings small { font-size: 12px; }
+.drama-skill-settings .drama-skill-error { color: var(--dsw-alias-state-error-primary); }
+.drama-skill-toolbar,
+.drama-skill-location,
+.drama-skill-row,
+.drama-skill-actions,
+.drama-skill-tags,
+.drama-skill-stage-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  min-width: 0;
+  gap: 6px;
+}
+.drama-skill-toolbar,
+.drama-skill-location { margin-block-end: 10px; }
+.drama-skill-toolbar { align-items: end; }
+.drama-skill-location .drama-skill-path,
+.drama-skill-row > strong { margin-inline-end: auto; }
+.drama-skill-row { align-items: baseline; }
+.drama-skill-search {
+  display: grid;
+  flex: 1 1 220px;
+  gap: 4px;
+  min-width: 0;
+}
+.drama-skill-form {
+  display: grid;
+  gap: 6px;
+  margin-block: 8px;
+  padding: 10px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: var(--dsw-radius-md);
+}
+.drama-skill-form .drama-skill-actions > :is(input, select) { flex: 1 1 200px; }
+.drama-skill-select {
+  min-width: 0;
+  max-width: 100%;
+  min-height: 32px;
+  padding: 3px 8px;
+  border: 1px solid var(--dsw-alias-border-l3);
+  border-radius: var(--dsw-radius-md);
+  color: inherit;
+  background: var(--dsw-alias-bg-layer-1);
+  font: inherit;
+}
+.drama-skill-select:focus-visible {
+  outline: 1px solid var(--dsw-alias-state-business-primary);
+}
+.drama-skill-path,
+.drama-skill-usage { display: block; }
+.drama-skill-list,
+.drama-skill-resources { list-style: none; margin: 6px 0 0; padding: 0; }
+.drama-skill-list > li {
+  display: grid;
+  gap: 3px;
+  padding-block: 10px;
+  border-block-start: 1px solid var(--dsw-alias-border-l2);
+}
+.drama-skill-resources > li {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 4px 8px;
+  padding-block: 5px;
+  border-block-start: 1px solid var(--dsw-alias-border-l2);
+}
+.drama-skill-dialog[role="dialog"] {
+  width: min(700px, 100%);
+  max-height: 100%;
+}
+.drama-skill-dialog-scroll { min-height: 0; overflow: auto; }
+.drama-skill-dialog .drama-skill-actions { margin-block-start: 8px; }
+.drama-skill-dialog h3 {
+  margin: 12px 0 4px;
+  font-size: inherit;
+  font-weight: 600;
+}
+.drama-skill-source {
+  max-height: 20rem;
+  overflow: auto;
+  padding: 8px;
+  margin: 4px 0;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-alias-bg-layer-1);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

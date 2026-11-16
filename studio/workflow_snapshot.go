@@ -8,46 +8,50 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"regexp"
 	"strings"
 )
 
 type workflowSnapshot struct {
 	workflowFileVersions
-	StageID           string `json:"stageId"`
-	SkillPath         string `json:"skillPath"`
-	HarnessPath       string `json:"harnessPath"`
-	SkillSourceSHA256 string `json:"skillSourceSha256"`
-	SkillBody         string `json:"skillBody"`
-	HarnessBody       string `json:"harnessBody"`
+	WorkflowProfileID         string `json:"workflowProfileId,omitempty"`
+	WorkflowDefinitionVersion int64  `json:"workflowDefinitionVersion,omitempty"`
+	StageID                   string `json:"stageId"`
+	SkillID                   string `json:"skillId,omitempty"`
+	SkillPath                 string `json:"skillPath"`
+	HarnessPath               string `json:"harnessPath"`
+	SkillSourceSHA256         string `json:"skillSourceSha256"`
+	SkillBody                 string `json:"skillBody"`
+	HarnessBody               string `json:"harnessBody"`
 }
 
 var workflowLegacyActivation = &requestError{http.StatusConflict, "当前阶段没有可恢复的能力快照，请退出后重新激活。"}
-var workflowSkillPath = regexp.MustCompile(`^skills/[a-z0-9]+(?:-[a-z0-9]+)*/SKILL\.md$`)
 
 func workflowDigest(data []byte) string {
 	digest := sha256.Sum256(data)
 	return hex.EncodeToString(digest[:])
 }
 
-func persistWorkflowSnapshot(ctx context.Context, tx *sql.Tx, stageID string, snapshot *workflowSnapshot) (string, error) {
+func persistWorkflowSnapshot(ctx context.Context, tx *sql.Tx, profile *workflowProfile, stageID string, snapshot *workflowSnapshot) (string, error) {
 	if stageID == "" {
 		if snapshot != nil {
 			return "", invalid("普通聊天不能指定阶段能力快照")
 		}
 		return "", nil
 	}
-	index := workflowStageIndex(stageID)
+	index := profile.stageIndex(stageID)
 	if index < 0 || snapshot == nil || snapshot.StageID != stageID {
 		return "", invalid("激活或交接需要当前目标阶段的能力快照")
 	}
-	stage := dramaWorkflowStages[index]
-	if !workflowSkillPath.MatchString(snapshot.SkillPath) ||
-		snapshot.HarnessPath != "drama-studio/workflows/"+dramaWorkflowID+"/"+stage.Harness ||
+	stage := profile.stage(index)
+	if !snapshot.matchesProfile(profile) {
+		return "", invalid("阶段能力快照的生产模式、版本或 Skill ID 无效")
+	}
+	if snapshot.HarnessPath != "drama-studio/workflows/"+dramaWorkflowID+"/"+stage.Harness ||
 		!snapshot.workflowFileVersions.valid() || !validWorkflowSHA256(snapshot.SkillSourceSHA256) ||
 		strings.TrimSpace(snapshot.SkillBody) == "" || strings.TrimSpace(snapshot.HarnessBody) == "" ||
 		len(snapshot.SkillBody) > 520<<10 || len(snapshot.HarnessBody) > 64<<10 ||
-		snapshot.SkillSHA256 != workflowDigest([]byte(snapshot.SkillBody)) {
+		snapshot.SkillSHA256 != workflowDigest([]byte(snapshot.SkillBody)) ||
+		snapshot.HarnessSHA256 != workflowDigest([]byte(snapshot.HarnessBody)) {
 		return "", invalid("阶段能力快照路径、正文或 SHA-256 无效")
 	}
 	record, err := json.Marshal(snapshot)
@@ -59,33 +63,57 @@ func persistWorkflowSnapshot(ctx context.Context, tx *sql.Tx, stageID string, sn
 	return id, err
 }
 
+func (s workflowSnapshot) matchesProfile(profile *workflowProfile) bool {
+	return profile != nil && s.WorkflowProfileID == profile.ID && s.WorkflowDefinitionVersion == profile.Version &&
+		workflowIdentifier.MatchString(s.SkillID) && s.SkillPath == "skills/"+s.SkillID+"/SKILL.md"
+}
+
 func (p *project) workflowSession(ctx context.Context, sessionID string, stateOnly bool) (workflowSessionResult, error) {
-	session, err := readWorkflowSession(ctx, p.db, sessionID)
-	result := sessionResult(session)
+	tx, err := p.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return workflowSessionResult{}, err
+	}
+	defer tx.Rollback()
+	profile, err := readWorkflowProfile(ctx, tx)
+	if err != nil {
+		return workflowSessionResult{}, err
+	}
+	session, err := readWorkflowSession(ctx, tx, sessionID)
+	result := sessionResult(profile, session)
 	if err != nil || stateOnly || session.SnapshotID == "" {
 		return result, err
 	}
+	result.Snapshot, err = readWorkflowSnapshot(ctx, tx, profile, session)
+	return result, err
+}
+
+func readWorkflowSnapshot(ctx context.Context, query rowQuery, profile *workflowProfile, session workflowSession) (*workflowSnapshot, error) {
 	var record string
-	err = p.db.QueryRowContext(ctx, `SELECT record FROM workflow_capability_snapshots WHERE id=?`, session.SnapshotID).Scan(&record)
+	err := query.QueryRowContext(ctx, `SELECT record FROM workflow_capability_snapshots WHERE id=?`, session.SnapshotID).Scan(&record)
 	if errors.Is(err, sql.ErrNoRows) || err == nil && workflowDigest([]byte(record)) != session.SnapshotID {
-		return result, &requestError{http.StatusConflict, "当前阶段能力快照不可用，请退出后重新激活。"}
+		return nil, &requestError{http.StatusConflict, "当前阶段能力快照不可用，请退出后重新激活。"}
 	}
 	if err != nil {
-		return result, err
+		return nil, err
 	}
 	var snapshot workflowSnapshot
 	if err := json.Unmarshal([]byte(record), &snapshot); err != nil {
-		return result, err
+		return nil, &requestError{http.StatusConflict, "当前阶段能力快照不可读取，请退出后重新激活。"}
 	}
-	if snapshot.StageID != session.ActiveStageID || snapshot.workflowFileVersions != session.workflowFileVersions {
-		return result, &requestError{http.StatusConflict, "当前阶段能力快照与激活信息不一致，请退出后重新激活。"}
+	if profile == legacyWorkflowProfile && snapshot.WorkflowProfileID == "" && snapshot.WorkflowDefinitionVersion == 0 && snapshot.SkillID == "" {
+		// Keep the stored record and its hash intact. Supply the fields old readers inferred from the path.
+		snapshot.WorkflowProfileID, snapshot.WorkflowDefinitionVersion = profile.ID, profile.Version
+		snapshot.SkillID = strings.TrimSuffix(strings.TrimPrefix(snapshot.SkillPath, "skills/"), "/SKILL.md")
 	}
-	result.Snapshot = &snapshot
-	return result, nil
+	if !snapshot.matchesProfile(profile) || snapshot.StageID != session.ActiveStageID ||
+		profile.stageIndex(snapshot.StageID) < 0 || snapshot.workflowFileVersions != session.workflowFileVersions {
+		return nil, &requestError{http.StatusConflict, "当前阶段能力快照与激活信息不一致，请退出后重新激活。"}
+	}
+	return &snapshot, nil
 }
 
-func advanceWorkflowActivation(ctx context.Context, tx *sql.Tx, sessionID, stageID, handoffID string, snapshot *workflowSnapshot) error {
-	snapshotID, err := persistWorkflowSnapshot(ctx, tx, stageID, snapshot)
+func advanceWorkflowActivation(ctx context.Context, tx *sql.Tx, profile *workflowProfile, sessionID, stageID, handoffID string, snapshot *workflowSnapshot) error {
+	snapshotID, err := persistWorkflowSnapshot(ctx, tx, profile, stageID, snapshot)
 	if err != nil {
 		return err
 	}
@@ -127,7 +155,6 @@ func (p *project) completeWorkflowTransition(ctx context.Context, r Request, arg
 				return nil, err
 			}
 		}
-		session, err := readWorkflowSession(ctx, tx, r.SessionID)
-		return sessionResult(session), err
+		return readWorkflowSessionResult(ctx, tx, r.SessionID)
 	})
 }

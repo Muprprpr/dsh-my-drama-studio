@@ -101,6 +101,19 @@
 .drama-workflow-feedback p {
   color: var(--dsw-alias-label-secondary);
 }
+.drama-workflow-skill { overflow-wrap: anywhere; }
+.drama-workflow-profile-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  min-width: 0;
+  margin: 0 auto 0 0;
+  padding: 0;
+  border: 0;
+}
+.drama-workflow-profile-options legend { padding: 0 0 2px; font-weight: 600; }
+.drama-workflow-profile-options label { display: inline-flex; align-items: center; gap: 4px; }
+.drama-workflow-profile-options label span { color: var(--dsw-alias-label-secondary); }
 .drama-workflow-feedback p {
   overflow-wrap: anywhere;
 }

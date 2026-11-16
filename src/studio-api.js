@@ -28,6 +28,10 @@ export async function providerRequest(action, data = {}, signal) {
   return json(await post('providers', { action, data }, signal))
 }
 
+export async function skillRequest(action, data = {}, signal) {
+  return json(await post('skills', { action, data }, signal))
+}
+
 export async function uploadMedia(ticket, type, file, signal) {
   const query = new URLSearchParams({ ticket, type, name: file.name })
   const uploaded = await json(await fetch(`/api/drama/upload?${query}`, {

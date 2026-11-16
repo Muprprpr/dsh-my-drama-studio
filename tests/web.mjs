@@ -16,10 +16,12 @@ import { chromium } from 'playwright-core'
 const root = fileURLToPath(new URL('..', import.meta.url))
 const runtime = join(root, '.runtime')
 const fixtureSource = `
+import { randomUUID } from 'node:crypto'
 import { watch } from 'node:fs'
 import { createRequire } from 'node:module'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { pathToFileURL } from 'node:url'
 
 export const name = 'drama-web-fixture'
@@ -214,6 +216,17 @@ export async function apply(ctx) {
   for (const workspaceName of ['Studio Shared', 'Studio Other']) {
     const path = join(process.env.DSH_HOME, workspaceName)
     await mkdir(path, { recursive: true })
+    if (process.env.DRAMA_TEST_NEW_WORKSPACES !== '1') {
+      const studio = join(path, '.drama-studio')
+      await mkdir(studio)
+      const db = new DatabaseSync(join(studio, 'studio.db'))
+      try {
+        db.exec('CREATE TABLE canvas_meta (singleton INTEGER PRIMARY KEY CHECK(singleton=1), id TEXT NOT NULL)')
+        db.prepare('INSERT INTO canvas_meta VALUES(1, ?)').run(randomUUID())
+      } finally {
+        db.close()
+      }
+    }
     const workspace = await ctx.workspaceRegistry.create(path)
     for (const suffix of workspaceName === 'Studio Shared' ? ['A', 'B', 'C'] : ['Other']) {
       const name = 'Studio Session ' + suffix
@@ -302,7 +315,7 @@ async function screenshot(page, file) {
   await page.screenshot({ path: join(evidence, file), animations: 'disabled' })
 }
 
-async function withWeb(run, { providerFixture = false, realWorkflow = false, workflowFixture = false, afterRestart } = {}) {
+async function withWeb(run, { providerFixture = false, realWorkflow = false, workflowFixture = false, newWorkspaces = false, afterRestart } = {}) {
   assert.ok(chrome, 'Install Chrome or Edge for native DSH Web verification')
   await mkdir(runtime, { recursive: true })
   const homeRoot = workflowFixture ? tmpdir() : runtime
@@ -321,6 +334,7 @@ async function withWeb(run, { providerFixture = false, realWorkflow = false, wor
   const port = await freePort()
   const env = { ...process.env, DSH_HOME: home, DSH_AGENTS_HOME: join(home, 'agents'), DSH_TELEMETRY_DISABLED: '1',
     DRAMA_DSH_CLI: dshCLI, DRAMA_REAL_WORKFLOW: realWorkflow ? '1' : '',
+    DRAMA_TEST_NEW_WORKSPACES: newWorkspaces ? '1' : '',
     DEEPSEEK_API_KEY: realWorkflow ? process.env.DEEPSEEK_API_KEY : '' }
   if (realWorkflow) {
     assert.ok(env.DEEPSEEK_API_KEY, 'Set DEEPSEEK_API_KEY for the real Workflow acceptance run')
@@ -577,6 +591,14 @@ async function openWorkflow(page, record) {
   return pane
 }
 
+async function openSettingsSection(page, name) {
+  await page.getByRole('button', { name: 'Account menu', exact: true }).click()
+  await page.getByRole('menuitem', { name: 'Settings', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: 'Settings', exact: true })
+  await dialog.getByRole('button', { name, exact: true }).click()
+  return dialog
+}
+
 const fixedWorkflowIds = ['content-analysis', 'shooting-script', 'storyboard', 'asset-binding', 'video-deployment', 'video-generation', 'final-review']
 const fixedWorkflowNames = ['内容分析', '拍摄脚本制作', '分镜制作', '素材抽卡与绑定', '视频节点部署', '视频生成', '成片验收']
 
@@ -621,6 +643,152 @@ async function installTestStages(home) {
       'STUDIO-SKILL-' + id + '\n处理' + fixedWorkflowNames[index] + '，保留用户指定的创作决策。')
   }
 }
+
+test('Native Settings manages Skills and profile bindings for new Workspaces', { timeout: 120_000 }, async () => {
+  const customName = 'test-custom-shooting-script'
+  await withWeb(async ({ page, records, home }) => {
+    const [a, b, , other] = records
+    const customDir = join(home, 'import source', customName)
+    const sentinel = join(home, 'skill-script-executed.txt')
+    for (const directory of ['references', 'templates', 'scripts']) {
+      await mkdir(join(customDir, directory), { recursive: true })
+    }
+    const method = ['---', 'name: ' + customName, 'description: Isolated script preparation fixture',
+      '---', '', '# Isolated script preparation', '', 'Use drama_save_artifact to record the agreed shooting script.'].join('\n')
+    await writeFile(join(customDir, 'SKILL.md'), method)
+    await writeFile(join(customDir, 'references/test.md'), 'Isolated reference')
+    await writeFile(join(customDir, 'templates/template.md'), 'Isolated template')
+    await writeFile(join(customDir, 'scripts/test.js'), 'require("node:fs").writeFileSync(' + JSON.stringify(sentinel) + ', "executed")')
+    const managed = join(home, 'skills', 'test-managed-skill')
+    await mkdir(managed, { recursive: true })
+    await writeFile(join(managed, 'SKILL.md'), '---\nname: test-managed-skill\ndescription: Manual fixture\n---\n\n# Manual fixture\n')
+
+    let dock = await openWorkflow(page, a)
+    const profilePicker = dock.getByTestId('drama-workflow-profile-picker')
+    await profilePicker.waitFor()
+    assert.equal(await profilePicker.locator('input[value="short-drama"]').isChecked(), true)
+    await screenshot(page, 'workspace-profile-choice.png')
+    await profilePicker.getByRole('button', { name: '确认生产模式', exact: true }).click()
+    await dock.locator('ol li').nth(5).waitFor()
+    const aTicket = await ticketFor(page, a.sessionId)
+    const get = ticket => operate(page, ticket, 'workflow_get', {})
+    const aView = await get(aTicket)
+    assert.equal(aView.workflowProfileId, 'short-drama')
+    assert.deepEqual(aView.stages.map(stage => stage.id), fixedWorkflowIds.slice(1))
+    await dock.getByRole('button', { name: '拍摄脚本制作', exact: true }).click()
+    await dock.getByTestId('drama-active-skill').filter({ hasText: 'Skill · drama-shooting-script' }).waitFor()
+    const original = await get(aTicket)
+    assert.match(original.session.skillSha256, /^[0-9a-f]{64}$/u)
+    assert.match(original.session.harnessSha256, /^[0-9a-f]{64}$/u)
+
+    dock = await openWorkflow(page, other)
+    await dock.getByTestId('drama-workflow-profile-picker').locator('input[value="short-video"]').check()
+    await dock.getByRole('button', { name: '确认生产模式', exact: true }).click()
+    await dock.locator('ol li').nth(7).waitFor()
+    const otherTicket = await ticketFor(page, other.sessionId)
+    const otherView = await get(otherTicket)
+    assert.equal(otherView.workflowProfileId, 'short-video')
+    assert.deepEqual(otherView.stages.map(stage => stage.id), ['topic-selection', ...fixedWorkflowIds])
+    assert.equal(otherView.session.status, 'normal')
+    await dock.getByRole('button', { name: '选题策划', exact: true }).click()
+    await dock.getByTestId('drama-active-skill').filter({ hasText: 'Skill · drama-topic-selection' }).waitFor()
+
+    const settings = await openSettingsSection(page, 'Skills Library')
+    const library = settings.getByTestId('drama-skill-library')
+    const rows = library.getByTestId('drama-skill-row')
+    await rows.filter({ hasText: 'drama-topic-selection' }).waitFor()
+    assert.equal(await rows.filter({ hasText: 'Built-in' }).count(), 8)
+    await rows.filter({ hasText: 'drama-topic-selection' }).getByText('短视频生产 / 选题策划', { exact: true }).waitFor()
+    const search = library.getByLabel('搜索 Skill', { exact: true })
+    await search.fill('Manual fixture')
+    await rows.filter({ hasText: 'test-managed-skill' }).getByText('User Managed', { exact: true }).waitFor()
+    assert.equal(await rows.count(), 1)
+    await search.clear()
+    await rows.filter({ hasText: 'drama-topic-selection' }).waitFor()
+    await screenshot(page, 'skills-library.png')
+
+    await library.getByRole('button', { name: '导入 Skill', exact: true }).click()
+    await library.getByLabel('包含 SKILL.md 的文件夹路径').fill(customDir)
+    await library.getByRole('button', { name: '导入文件夹', exact: true }).click()
+    let detail = page.getByRole('dialog', { name: customName, exact: true })
+    await detail.getByText('User Imported', { exact: true }).waitFor()
+    await detail.getByText('references/test.md', { exact: true }).waitFor()
+    assert.equal(await detail.getByText('templates/template.md', { exact: true }).count(), 1)
+    assert.equal(await detail.getByText('scripts/test.js', { exact: true }).count(), 1)
+    assert.equal(existsSync(sentinel), false)
+    const installed = join(home, 'skills', customName, 'SKILL.md')
+    assert.equal(await readFile(installed, 'utf8'), method)
+    await screenshot(page, 'skills-library-detail.png')
+    await writeFile(installed, method + '\n\nRefreshed local version.')
+    await detail.getByRole('button', { name: '刷新 Skill', exact: true }).click()
+    await detail.locator('pre').filter({ hasText: 'Refreshed local version.' }).waitFor()
+    if (process.env.DRAMA_TEST_NATIVE_SKILL_OPEN === '1') {
+      await detail.getByRole('button', { name: '打开文件夹', exact: true }).click()
+      await detail.getByText('已打开 Skill 文件夹', { exact: true }).waitFor()
+    }
+    await detail.getByRole('button', { name: '关闭 Skill 详情', exact: true }).click()
+    await library.getByRole('button', { name: '查看 drama-storyboard', exact: true }).click()
+    detail = page.getByRole('dialog', { name: 'drama-storyboard', exact: true })
+    await detail.getByRole('button', { name: '复制为自定义 Skill', exact: true }).click()
+    await detail.getByLabel('新的 Skill 名称').fill('test-storyboard-copy')
+    await detail.getByRole('button', { name: '复制 Skill', exact: true }).click()
+    detail = page.getByRole('dialog', { name: 'test-storyboard-copy', exact: true })
+    await detail.getByText('User Imported', { exact: true }).waitFor()
+    await detail.getByRole('button', { name: '关闭 Skill 详情', exact: true }).click()
+
+    await settings.getByRole('button', { name: 'Workflow Skill Bindings', exact: true }).click()
+    const bindings = settings.getByTestId('drama-skill-bindings')
+    const row = bindings.locator('[data-stage-id="shooting-script"]')
+    await row.getByRole('button', { name: '更换 Skill', exact: true }).click()
+    await row.getByLabel('搜索可绑定 Skill').fill(customName)
+    await row.getByLabel('拍摄脚本制作的 Skill').selectOption(customName)
+    await row.getByRole('button', { name: '保存绑定', exact: true }).click()
+    await row.getByText('自定义覆盖', { exact: true }).waitFor()
+    await screenshot(page, 'workflow-skill-bindings.png')
+    await bindings.getByLabel('生产模式', { exact: true }).selectOption('short-video')
+    await row.getByText('官方默认', { exact: true }).waitFor()
+    assert.equal(await row.getByText(customName, { exact: true }).count(), 0)
+    assert.equal((await get(aTicket)).activeSkillId, 'drama-shooting-script')
+    assert.equal((await get(aTicket)).session.snapshotId, original.session.snapshotId)
+
+    await page.keyboard.press('Escape')
+    await settings.waitFor({ state: 'hidden' })
+    dock = await openWorkflow(page, b)
+    assert.equal(await dock.getByTestId('drama-workflow-profile-picker').count(), 0)
+    await dock.getByRole('button', { name: '拍摄脚本制作', exact: true }).click()
+    await dock.getByTestId('drama-active-skill').filter({ hasText: 'Skill · ' + customName }).waitFor()
+    const custom = await get(await ticketFor(page, b.sessionId))
+    assert.notEqual(custom.session.skillSha256, original.session.skillSha256)
+    assert.equal(custom.session.harnessSha256, original.session.harnessSha256)
+    console.info('Native profile snapshot SHA-256', JSON.stringify({
+      original: { skillId: original.activeSkillId, skill: original.session.skillSha256, harness: original.session.harnessSha256 },
+      custom: { skillId: custom.activeSkillId, skill: custom.session.skillSha256, harness: custom.session.harnessSha256 },
+    }))
+    await screenshot(page, 'workflow-active-bound-skill.png')
+    assert.equal(existsSync(sentinel), false)
+  }, {
+    newWorkspaces: true,
+    afterRestart: async ({ page, records }) => {
+      const [a, b, , other] = records
+      const get = async record => operate(page, await ticketFor(page, record.sessionId), 'workflow_get', {})
+      assert.equal((await get(a)).activeSkillId, 'drama-shooting-script')
+      assert.equal((await get(b)).activeSkillId, customName)
+      assert.equal((await get(other)).workflowProfileId, 'short-video')
+      const settings = await openSettingsSection(page, 'Workflow Skill Bindings')
+      const row = settings.getByTestId('drama-skill-bindings').locator('[data-stage-id="shooting-script"]')
+      await row.getByText(customName, { exact: true }).waitFor()
+      await row.getByRole('button', { name: '恢复官方默认', exact: true }).click()
+      await row.getByText('官方默认', { exact: true }).waitFor()
+      assert.equal((await get(b)).activeSkillId, customName)
+      // A cold DSH Session can initially appear as Untitled in the native sidebar.
+      const ticket = await ticketFor(page, b.sessionId)
+      await operate(page, ticket, 'workflow_activate', { operationId: randomUUID(), stageId: '' })
+      assert.equal((await get(b)).activeSkillId, undefined)
+      await operate(page, ticket, 'workflow_activate', { operationId: randomUUID(), stageId: 'shooting-script' })
+      assert.equal((await get(b)).activeSkillId, 'drama-shooting-script')
+    },
+  })
+})
 
 test('Workflow dock iterates, previews, and explicitly hands off in the native composer', { timeout: 100_000 }, async () => {
   await withWeb(async ({ page, records, home }) => {
@@ -1035,10 +1203,7 @@ test('U1 native composer menu and Canvas shell', { timeout: 75_000 }, async () =
     })
     assert.equal(nativeControls, 0, 'unreset user-agent buttons are still visible')
     async function openSettings() {
-      await page.getByRole('button', { name: 'Account menu', exact: true }).click()
-      await page.getByRole('menuitem', { name: 'Settings', exact: true }).click()
-      const dialog = page.getByRole('dialog', { name: 'Settings', exact: true })
-      await dialog.getByRole('button', { name: 'Drama Studio', exact: true }).click()
+      const dialog = await openSettingsSection(page, 'Drama Studio')
       const section = dialog.getByTestId('drama-settings')
       await section.getByRole('button', { name: '新增渠道', exact: true }).waitFor()
       return section
