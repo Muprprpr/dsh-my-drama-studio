@@ -186,6 +186,8 @@ func (s *Service) executeWorkflow(ctx context.Context, r Request) (any, error) {
 			return sessionResult(nil, workflowSession{Status: "normal"}), nil
 		case "workflow_get":
 			return emptyWorkflowView(nil), nil
+		case "workflow_handoff_confirm", "workflow_handoff_target":
+			return nil, workflowHandoffPermission
 		case "workflow_activate":
 			if activation.StageID != "" {
 				return nil, workflowProfileRequired
@@ -269,7 +271,7 @@ func (s *Service) executeWorkflow(ctx context.Context, r Request) (any, error) {
 		if err := decodeData(r.Data, &args); err != nil {
 			return nil, err
 		}
-		return p.workflowHandoffTarget(ctx, r.SessionID, args.HandoffID)
+		return p.workflowHandoffTarget(ctx, r, args.HandoffID)
 	default:
 		var args workflowConfirmArgs
 		if err := decodeData(r.Data, &args); err != nil {

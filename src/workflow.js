@@ -326,16 +326,27 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime, { capabiliti
     return error instanceof StudioError ? error.message : 'DSH 无法执行当前阶段，请检查会话和模型设置'
   }
 
+  function kickoffFailure(error) {
+    if (error instanceof StudioError) return error.message
+    switch (error?.code) {
+      case 'session/model-unavailable': return '当前 Session 的模型不可用，请重新选择模型后启动交接任务。'
+      case 'session/not-found': return 'DSH 无法打开当前 Session，请重新打开会话后启动交接任务。'
+      case 'session/agent-busy': return 'DSH 拒绝接收交接任务，请等待当前会话处理完成后重试。'
+      default: return 'DSH 无法启动交接任务，请检查会话和模型设置后重试。'
+    }
+  }
+
   async function recordKickoffFailure(kickoff, error) {
-    if (kickoffs.get(kickoff.sessionId) === kickoff) kickoffs.delete(kickoff.sessionId)
     try {
-      await kernel(kickoff.sessionId, kickoff.workspace, 'workflow_kickoff_failed', {
+      return await kernel(kickoff.sessionId, kickoff.workspace, 'workflow_kickoff_failed', {
         operationId: randomUUID(), handoffId: kickoff.handoffId, error,
       }, undefined, 'workflow')
     } catch (failure) {
       if (failure.status !== 409 && !lifetime.aborted) {
         console.error('[my-drama-studio] Workflow kickoff', kickoff.handoffId, failure.message)
       }
+    } finally {
+      if (kickoffs.get(kickoff.sessionId) === kickoff) kickoffs.delete(kickoff.sessionId)
     }
   }
 
@@ -644,7 +655,8 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime, { capabiliti
       }, lifetime)
       if (!admission?.accepted) throw new StudioError(409, 'DSH 未接受交接任务')
     } catch (error) {
-      await recordKickoffFailure(kickoff, publicFailure(error))
+      const failed = await recordKickoffFailure(kickoff, kickoffFailure(error))
+      if (failed) return failed
     }
     return readSession(sessionId, workspace, lifetime, true)
   }
@@ -659,19 +671,22 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime, { capabiliti
   }
 
   async function confirm(sessionId, workspace, input) {
-    const handoff = await changeStage(sessionId, async () => {
-      const currentSession = await readSession(sessionId, workspace, lifetime, true)
-      const { session } = currentSession
+    const { handoff, committed } = await changeStage(sessionId, async () => {
       const { targetStage } = await kernel(sessionId, workspace, 'workflow_handoff_target',
         { handoffId: input.handoffId }, lifetime, 'workflow')
-      if (targetStage && session.status === 'running') throw new StudioError(409, busyError)
-      const snapshot = targetStage && await loadCapabilities(await resolveAgent(sessionId), currentSession, targetStage)
+      let snapshot
+      if (targetStage) {
+        const currentSession = await readSession(sessionId, workspace, lifetime, true)
+        if (currentSession.session.status === 'running') throw new StudioError(409, busyError)
+        snapshot = await loadCapabilities(await resolveAgent(sessionId), currentSession, targetStage)
+      }
       const current = await workspaceFor(ctx, sessionId)
       if (!sameWorkspace(current, workspace)) throw new StudioError(409, 'Session 的 Workspace 已切换')
       return kernel(sessionId, workspace, 'workflow_handoff_confirm', { ...input, snapshot }, lifetime, 'human')
     })
     const { session } = await readSession(sessionId, workspace, lifetime, true)
-    if (session.pendingHandoffId !== handoff.handoffId) return { handoff, session }
+    // A replay is a receipt read. Only a new commit can enqueue the first attempt.
+    if (!committed || session.pendingHandoffId !== handoff.handoffId) return { handoff, session }
     const next = await kickoff(sessionId, workspace, handoff.handoffId)
     return { handoff, session: next.session }
   }

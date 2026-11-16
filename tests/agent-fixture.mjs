@@ -17,6 +17,8 @@ const provider = 'drama-fixture'
 const model = 'scripted'
 const sourceStage = 'content-analysis'
 const restartStage = 'shooting-script'
+const topicStage = 'topic-selection'
+const kickoffPrefix = 'drama-workflow:'
 
 export function apply(ctx) {
   const life = new AbortController()
@@ -81,6 +83,8 @@ async function verify(ctx, signal) {
   const lib = cli ? createRequire(cli).resolve('@deepseek-ai/dsh-llm')
     : join(dirname(process.execPath), 'resources', 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-llm', 'lib', 'index.js')
   const { createUserMessage, LlmAdapter, LlmError } = await import(pathToFileURL(lib).href)
+  const protocol = createRequire(lib).resolve('@deepseek-ai/dsh-typert-protocol')
+  const { RemoteError } = await import(pathToFileURL(protocol).href)
   const script = []
   let offered = []
   ctx.llm.registerAdapter([provider], new class extends LlmAdapter {
@@ -215,7 +219,56 @@ async function verify(ctx, signal) {
     await sessions.selectModel({ sessionId: state.sessionId, provider, model })
     await reject(state.sessionId, 'drama_submit', { operationId: randomUUID(), nodeId: state.videoId }, /automatic generation is disabled/i)
     assert.equal((await succeed(state.sessionId, 'drama_query', { type: 'shot' })).nodes.length, 2)
-    console.info(`[drama-agent-fixture] PASS restart: interrupted Workflow recovered, Canvas persisted, human edit restored, stale ticket and Agent submit rejected (${nativeCalls} native tool calls)`)
+
+    const { pending } = state
+    const pendingTicket = (await init(pending.sessionId)).ticket
+    const waiting = await readWorkflow(pendingTicket)
+    assert.equal(waiting.workflowProfileId, 'short-video')
+    assert.equal(waiting.session.activeStageId, sourceStage)
+    assert.equal(waiting.session.pendingHandoffId, pending.handoffId)
+    assert.equal(waiting.session.activation, pending.activation)
+    assert.equal(waiting.session.status, 'failed')
+    assert.match(waiting.session.error, /DSH 拒绝接收交接任务/u)
+    assert.equal(waiting.handoffs.length, 1)
+    const replay = await op(pendingTicket, 'workflow_handoff_confirm', { handoffId: pending.handoffId })
+    assert.equal(replay.handoff.handoffId, pending.handoffId)
+    assert.equal(replay.session.pendingHandoffId, pending.handoffId)
+
+    await sessions.selectModel({ sessionId: pending.sessionId, provider, model })
+    const { agent: pendingAgent } = await sessions.resolveAgent(pending.sessionId)
+    const kickoffMessages = () => pendingAgent.session.snapshotEvents().filter(event => event.type === 'user/message' &&
+      event.data.source?.rpcId?.startsWith(kickoffPrefix + pending.handoffId + ':'))
+    assert.equal(kickoffMessages().length, 0, 'Host restart or receipt replay started the Agent without explicit retry')
+    const callId = randomUUID()
+    script.push({ call: { id: callId, name: 'drama_workflow_artifact', args: pending.artifact } }, {})
+    const retryResults = await Promise.all([1, 2].map(() => request('operation', {
+      ticket: pendingTicket, action: 'workflow_handoff_retry', data: { handoffId: pending.handoffId },
+    })))
+    assert.ok(retryResults.some(response => response.ok))
+    assert.ok(retryResults.every(response => response.ok || response.status === 409))
+    await Promise.all(retryResults.map(response => response.json()))
+    const readResult = await until(async () => {
+      const result = pendingAgent.session.snapshotEvents().find(event => event.type === 'tool/result' &&
+        event.data.message.toolCallId === callId)
+      const view = await readWorkflow(pendingTicket)
+      return result && pendingAgent.status === 'idle' && view.session.status === 'active' && {
+        message: result.data.message, view,
+      }
+    }, signal, 'pending Short Video kickoff settlement')
+    assert.equal(readResult.message.isError ?? false, false)
+    const pinned = JSON.parse(readResult.message.content.map(block => block.text ?? '').join('\n'))
+    assert.equal(pinned.artifactId, pending.artifact.artifactId)
+    assert.equal(pinned.version, pending.artifact.version)
+    assert.equal(pinned.content, 'Short Video fixture: pinned topic plan')
+    assert.equal(pinned.handedOff, true)
+    assert.equal(readResult.view.session.pendingHandoffId ?? '', '')
+    assert.equal(readResult.view.session.activation, pending.activation)
+    assert.equal(readResult.view.handoffs.length, 1)
+    assert.equal(readResult.view.handoffs[0].handoffId, pending.handoffId)
+    assert.equal(kickoffMessages().length, 1, 'Concurrent retry created duplicate native prompt messages')
+    assert.equal(script.length, 0)
+    console.info(`[drama-agent-fixture] EVIDENCE pending receipt survived restart; explicit concurrent retry admitted one native prompt; target read ${pinned.artifactId} v${pinned.version} from ${pending.handoffId}`)
+    console.info(`[drama-agent-fixture] PASS restart: pending Short Video retry recovered once, interrupted Workflow recovered, Canvas persisted, human edit restored, stale ticket and Agent submit rejected (${nativeCalls + 1} native tool calls)`)
     return
   }
 
@@ -447,6 +500,61 @@ async function verify(ctx, signal) {
   assert.equal((await init(b)).status.aiRunning, false)
   await op(rebound.ticket, 'update_node', edit(noteId, 3, 'Editable after Agent disposal'))
 
+  await op(cBound.ticket, 'workflow_profile_select', { workflowProfileId: 'short-video' })
+  await op(cBound.ticket, 'workflow_activate', { stageId: topicStage })
+  const topic = await succeed(c, 'drama_save_artifact', {
+    operationId: randomUUID(), title: 'Topic plan', content: 'Short Video fixture: pinned topic plan',
+  })
+  const brief = await succeed(c, 'drama_save_artifact', {
+    operationId: randomUUID(), title: 'Topic handoff document',
+    content: `# Handoff\nContinue from Topic plan ${topic.artifactId} v${topic.version}.`,
+  })
+  await until(async () => (await readWorkflow(cBound.ticket)).session.status === 'active', signal, 'topic draft settled')
+  const topicPreview = await op(cBound.ticket, 'workflow_handoff_preview', { stageId: topicStage })
+  assert.equal(topicPreview.targetStageId, sourceStage)
+  assert.equal(topicPreview.artifacts.find(item => item.artifactId === brief.artifactId)?.version, brief.version)
+  const nativeController = sessions[Symbol.for('cordis.original')] ?? sessions
+  const nativePrompt = nativeController.prompt
+  let kickoffAttempts = 0
+  nativeController.prompt = function (input, abort) {
+    // Only the first automatic dispatch for this freshly committed handoff is rejected.
+    if (input.sessionId === c && input.requestId.startsWith(kickoffPrefix + topicPreview.handoffId + ':')) {
+      kickoffAttempts++
+      return Promise.reject(new RemoteError('session/agent-busy', 'Fixture refused prompt admission', { reason: 'fixture' }))
+    }
+    return nativePrompt.call(this, input, abort)
+  }
+  let pending
+  try {
+    const confirmArgs = { operationId: randomUUID(), handoffId: topicPreview.handoffId }
+    const result = await op(cBound.ticket, 'workflow_handoff_confirm', confirmArgs)
+    assert.equal(result.handoff.handoffId, topicPreview.handoffId)
+    assert.ok(result.handoff.confirmedAt)
+    assert.equal(result.session.pendingHandoffId, topicPreview.handoffId)
+    assert.equal(result.session.activeStageId, sourceStage)
+    assert.equal(result.session.status, 'failed')
+    assert.match(result.session.error, /DSH 拒绝接收交接任务/u)
+    for (const operationId of [confirmArgs.operationId, randomUUID()]) {
+      const replay = await op(cBound.ticket, 'workflow_handoff_confirm', { ...confirmArgs, operationId })
+      assert.deepEqual(replay.handoff, result.handoff)
+      assert.equal(replay.session.activation, result.session.activation)
+      assert.equal(replay.session.pendingHandoffId, topicPreview.handoffId)
+    }
+    assert.equal(kickoffAttempts, 1, 'Receipt replay resubmitted the pending native request')
+    const current = await readWorkflow(cBound.ticket)
+    assert.equal(current.handoffs.length, 1)
+    assert.equal(current.handoffs[0].handoffId, topicPreview.handoffId)
+    assert.equal(current.session.runId ?? '', '')
+    assert.equal(current.stages[0].status, 'handed_off')
+    pending = {
+      sessionId: c, handoffId: topicPreview.handoffId, activation: result.session.activation,
+      artifact: { artifactId: topic.artifactId, version: topic.version },
+    }
+    console.info(`[drama-agent-fixture] EVIDENCE Short Video pre-admission failure kept one confirmed receipt and pending ${pending.handoffId} at activation ${pending.activation}; both receipt replays kept native dispatch count ${kickoffAttempts}`)
+  } finally {
+    nativeController.prompt = nativePrompt
+  }
+
   const saved = await readWorkflow(aBound.ticket)
   assert.equal(saved.session.status, 'normal')
   await op(aBound.ticket, 'workflow_activate', { stageId: sourceStage })
@@ -480,7 +588,7 @@ async function verify(ctx, signal) {
   await locked(rebound.ticket, 'delete_node', { id: noteId, revision: 4 })
   await writeFile(statePath, JSON.stringify({
     sessionId: b, canvasId: rebound.status.canvasId, ticket: rebound.ticket, videoId: video.id, noteId,
-    workflowId: saved.id, executorSessionId: a, handoffId: preview.handoffId, artifactId: artifact.artifactId,
+    workflowId: saved.id, executorSessionId: a, handoffId: preview.handoffId, artifactId: artifact.artifactId, pending,
   }))
   console.info(`[drama-agent-fixture] PASS native Agent: canvas-wide locks, append while active, overlapping turns, other Workspace isolation, cancel/error/dispose unlock, Agent update/delete rejected, Workflow submit rejected, confirmed handoff and held target turn at restart (${nativeCalls} native tool calls)`)
 }
@@ -554,7 +662,9 @@ async function runFixture() {
           waiting.signal, expected, 45_000),
       ])
       assert.ok(logs.includes(expected), `The fixture did not reach ${expected}`)
-      console.info(logs.split(/\r?\n/).find(line => line.includes(expected)))
+      for (const line of logs.split(/\r?\n/)) {
+        if (line.includes(expected) || line.startsWith(`[${name}] EVIDENCE `)) console.info(line)
+      }
     } catch (error) {
       console.error(logs.replace(/(https?:\/\/[^\s?'"<>]+)\?[^\s'"<>]+/g, '$1?[redacted]'))
       throw error

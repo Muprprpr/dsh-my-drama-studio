@@ -6,6 +6,14 @@ import style from './workflow-panel.css'
 const finalStage = 'final-review'
 const generationStage = 'video-generation'
 const runningMessage = '当前阶段正在执行，请等待本轮完成后再切换。'
+const handoffContentChanged = '交接内容已发生变化，请重新生成交接预览后确认。'
+const handoffActivationChanged = '当前阶段已经发生变化，请重新检查当前工作流状态。'
+const handoffPermissionLost = '当前 Session 已不具备该阶段的交接权限。'
+const invalidatedReviewMessages = new Set([
+  handoffContentChanged, handoffActivationChanged, handoffPermissionLost,
+  '该阶段已经由其他 Session 完成交接，请刷新工作流进度。',
+  '当前工作流定义已更新，请重新检查阶段关系。',
+])
 const stageStatuses = {
   not_started: ['未开始', 'idle'],
   draft_available: ['有草稿', 'warning'],
@@ -140,6 +148,14 @@ function selectedRefs(groups, choices) {
   })
 }
 
+async function generateHandoffPreview(ticket, stageId, choices, refs) {
+  const result = await mutate(ticket, 'workflow_handoff_preview', {
+    stageId,
+    ...(Object.keys(choices).length ? { artifacts: refs } : {}),
+  })
+  setInteraction(ticket, { review: result, stageId, reviewStale: false, dismissedReview: undefined })
+}
+
 function CapabilityStatus({ capabilities, stages }) {
   if (!capabilities) return null
   const { ready, status, packageVersion, error } = capabilities
@@ -235,11 +251,7 @@ export function WorkflowProgress({ session, refreshSession, openArtifacts, openC
   })
 
   const preview = () => runAction(ticket, 'preview', async () => {
-    const result = await mutate(ticket, 'workflow_handoff_preview', {
-      stageId: stage.id,
-      ...(Object.keys(choices).length ? { artifacts: refs } : {}),
-    })
-    setInteraction(ticket, { review: result, stageId: stage.id })
+    await generateHandoffPreview(ticket, stage.id, choices, refs)
     openArtifacts()
   })
 
@@ -335,11 +347,19 @@ export function WorkflowArtifacts({ session, workspaceTitle, useSessions, refres
   const selectedHandoff = handoffs.find(handoff => handoff.handoffId === interaction.handoffId) ?? handoffs[0]
   const choices = interaction.choices[stageId] ?? {}
   const isActiveStage = view?.session?.activeStageId === stageId
+  const running = nativeRunning || view?.session?.status === 'running'
   const sessionTitles = useSessions(state => state.byId)
   const sessionLabel = id => id === sessionId ? '当前会话' : sessionTitles[id]?.displayTitle || id
   const stageLabel = id => stages.find(candidate => candidate.id === id)?.name ?? id
   const showReview = Boolean(review) && interaction.dismissedReview !== review?.handoffId
   const panel = showReview ? 'review' : interaction.section ?? 'artifacts'
+  const activationIssue = review && view?.session && !isActiveStage
+    ? view.session.activeStageId ? handoffActivationChanged : handoffPermissionLost : ''
+  const artifactHeads = review?.previewBaseline?.artifactHeads
+  const contentIssue = artifactHeads && latest.some(item => item.version > artifactHeads[item.artifactId])
+    ? handoffContentChanged : ''
+  const reviewStale = interaction.reviewStale || Boolean(activationIssue || contentIssue)
+  const feedback = interaction.error || (showReview && (activationIssue || contentIssue)) || loadError
 
   function chooseStage(id) {
     setInteraction(ticket, { stageId: id, selected: undefined, handoffId: undefined, section: 'artifacts' })
@@ -360,11 +380,20 @@ export function WorkflowArtifacts({ session, workspaceTitle, useSessions, refres
 
   async function confirm() {
     await runAction(ticket, 'confirm', async () => {
-      const result = await mutate(ticket, 'workflow_handoff_confirm', { handoffId: review.handoffId })
+      let result
+      try {
+        result = await mutate(ticket, 'workflow_handoff_confirm', { handoffId: review.handoffId })
+      } catch (failure) {
+        if (invalidatedReviewMessages.has(failure.message)) setInteraction(ticket, { reviewStale: true })
+        throw failure
+      }
       setInteraction(ticket, { review: null, section: 'handoffs', handoffId: result.handoff?.handoffId ?? review.handoffId })
       refreshSession()
     })
   }
+
+  const regenerate = () => runAction(ticket, 'preview', () => generateHandoffPreview(ticket, stageId, choices,
+    selectedRefs(groups.filter(group => group[0].sessionId === sessionId), choices)))
 
   function showSection(next) {
     setInteraction(ticket, { section: next, dismissedReview: review?.handoffId })
@@ -391,7 +420,7 @@ export function WorkflowArtifacts({ session, workspaceTitle, useSessions, refres
         onClick={() => setInteraction(ticket, { dismissedReview: undefined })}>交接预览</button>}
     </nav>}
     <div className="drama-artifacts-body">
-      {(interaction.error || loadError) && <p className="drama-artifacts-error" role="alert">{interaction.error || loadError}</p>}
+      {feedback && <p className="drama-artifacts-error" role="alert">{feedback}</p>}
       {!stage && !loadError && <p className="drama-artifacts-empty" role="status">正在读取阶段产物…</p>}
       {panel === 'review' && <section className="drama-handoff" data-testid="drama-workflow-preview">
         <Package packageData={review} stageLabel={stageLabel} sessionLabel={sessionLabel} ticket={ticket} openCanvas={openCanvas} />
@@ -399,9 +428,13 @@ export function WorkflowArtifacts({ session, workspaceTitle, useSessions, refres
           <Button type="button" size="sm" onClick={() => {
             setInteraction(ticket, { review: null, error: '', section: 'artifacts' })
           }} disabled={Boolean(interaction.busy)}>返回修改</Button>
-          <Button type="button" size="sm" variant="primary" data-testid="drama-workflow-confirm" onClick={confirm}
-            disabled={Boolean(interaction.busy) || !isActiveStage || nativeRunning || view?.session?.status === 'running'}>
-            {review.targetStageId ? '确认交接并启动下一阶段' : '确认最终验收'}
+          {reviewStale && isActiveStage && <Button type="button" size="sm" variant="primary" onClick={regenerate}
+            disabled={Boolean(interaction.busy) || running} aria-busy={interaction.busy === 'preview'}>
+            {interaction.busy === 'preview' ? '正在生成预览…' : '重新生成交接预览'}
+          </Button>}
+          <Button type="button" size="sm" variant={reviewStale ? undefined : 'primary'} data-testid="drama-workflow-confirm" onClick={confirm}
+            aria-busy={interaction.busy === 'confirm'} disabled={Boolean(interaction.busy) || !isActiveStage || running || reviewStale}>
+            {interaction.busy === 'confirm' ? '正在确认…' : review.targetStageId ? '确认交接并启动下一阶段' : '确认最终验收'}
           </Button>
         </div>
       </section>}
@@ -502,7 +535,7 @@ function Package({ packageData, stageLabel, sessionLabel, ticket, openCanvas }) 
     </header>
     <dl className="drama-handoff-metadata">
       <dt>来源会话</dt><dd title={sourceSessionId}>{sessionLabel(sourceSessionId)}</dd>
-      {sourceRevision !== undefined && <><dt>来源版本</dt><dd>{sourceRevision}</dd></>}
+      {confirmedAt && sourceRevision !== undefined && <><dt>正式交接版本</dt><dd>{sourceRevision}</dd></>}
       {confirmedAt && <><dt>确认时间</dt><dd>{formatDate(confirmedAt)}</dd></>}
       {packageData.stale && <><dt>状态</dt><dd>上游已更新，此交接已过期</dd></>}
     </dl>

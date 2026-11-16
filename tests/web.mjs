@@ -157,6 +157,7 @@ export async function apply(ctx) {
         if (type === 'tool/call') return [{ type, name: data.name, arguments: data.arguments }]
         if (type === 'tool/result') return [{
           type, toolCallId: data.message.toolCallId, isError: data.message.isError === true,
+          text: data.message.content.filter(item => item.type === 'text').map(item => item.text).join(String.fromCharCode(10)),
         }]
         if (type === 'turn/end') return [{ type, reason: data.reason.kind }]
         return []
@@ -790,6 +791,170 @@ test('Native Settings manages Skills and profile bindings for new Workspaces', {
   })
 })
 
+test('Short Video handoff preserves review and starts with pinned artifacts', { timeout: 120_000 }, async () => {
+  await withWeb(async ({ page, records, home }) => {
+    const [a, b, , other] = records
+    const sidebar = page.getByTestId('drama-workflow-artifacts')
+    const review = sidebar.getByTestId('drama-workflow-preview')
+    const confirm = sidebar.getByTestId('drama-workflow-confirm')
+    const regenerate = sidebar.getByRole('button', { name: '重新生成交接预览', exact: true })
+    const changed = '交接内容已发生变化，请重新生成交接预览后确认。'
+    const bTicket = await ticketFor(page, b.sessionId)
+    const workflow = (ticket, action, data) => operate(page, ticket, action, { operationId: randomUUID(), ...data })
+    const get = ticket => operate(page, ticket, 'workflow_get', {})
+    const trace = (step, record, view, result) => console.info('Short Video handoff', JSON.stringify({
+      step, sessionId: record.sessionId, definitionVersion: view.workflowDefinitionVersion,
+      formalRevision: Math.max(0, ...view.handoffs.map(item => item.sourceRevision)), activation: view.session.activation,
+      stageId: view.session.activeStageId, artifacts: view.artifacts.map(({ title, artifactId, version }) => ({ title, artifactId, version })), result,
+    }))
+
+    async function openTopic(record) {
+      const pane = await openWorkflow(page, record)
+      const picker = pane.getByTestId('drama-workflow-profile-picker')
+      await picker.locator('input[value="short-video"]').check()
+      await picker.getByRole('button', { name: '确认生产模式', exact: true }).click()
+      await pane.getByRole('button', { name: '选题策划', exact: true }).click()
+      await pane.locator('[data-active-stage-id="topic-selection"]').waitFor()
+      const ticket = await ticketFor(page, record.sessionId)
+      const view = await get(ticket)
+      assert.equal(view.workflowProfileId, 'short-video')
+      assert.equal(view.workflowDefinitionVersion, 1)
+      trace('activate', record, view)
+      return { pane, ticket }
+    }
+
+    async function save(record, ticket, title, calls, ready) {
+      await nativeActivity(home, record, 'workflow-queue', undefined, workflowCalls(...calls))
+      await sendNative(page, title)
+      const view = await poll(async () => {
+        const next = await get(ticket)
+        return next.session.status === 'active' && ready(next.artifacts) && next
+      }, title + ' did not settle')
+      trace(title, record, view)
+      return view.artifacts
+    }
+
+    async function clickOperation(button, action) {
+      const response = page.waitForResponse(result => result.url().endsWith('/api/drama/operation') &&
+        result.request().postDataJSON()?.action === action)
+      await button.click()
+      const result = await response
+      return { status: result.status(), body: await result.json() }
+    }
+
+    async function preview(button, record, ticket, expectedVersion) {
+      const result = await clickOperation(button, 'workflow_handoff_preview')
+      assert.equal(result.status, 200, result.body.error)
+      await review.getByText('选题策划 → 内容分析', { exact: true }).waitFor()
+      await review.getByText('选题交接文档 V1', { exact: true }).waitFor()
+      assert.ok(result.body.artifacts.some(item => item.title === '选题方案' && item.version === expectedVersion))
+      trace('preview', record, await get(ticket), { handoffId: result.body.handoffId, status: result.status })
+      return result.body
+    }
+
+    async function savePlan(record, ticket, linked) {
+      const plan = workflowArtifact('选题方案', '核心选题：旧物的故事。')
+      const artifacts = await save(record, ticket, '保存选题方案', [plan], items => items.some(item => item.title === '选题方案'))
+      const topic = artifacts.find(item => item.title === '选题方案')
+      const brief = workflowArtifact('选题交接文档', '选题方案 ' + topic.artifactId + ' 以交接包中固定的版本为准。', {
+        summary: '从旧物切入家庭叙事', confirmedDecisions: ['保留旧物开场'], constraints: ['现场收声'],
+      })
+      const calls = [brief]
+      if (linked) calls.push({ name: 'drama_save_artifact', args: {
+        operationId: randomUUID(), title: '共享取材引用', nodeId: linked.id,
+      } })
+      await save(record, ticket, '保存交接文档', calls,
+        items => items.some(item => item.title === '选题交接文档') && (!linked || items.some(item => item.nodeId === linked.id)))
+      return topic
+    }
+
+    async function prepareRead(record, artifactRef) {
+      const id = randomUUID()
+      await nativeActivity(home, record, 'workflow-queue', undefined, [
+        { call: { id, name: 'drama_workflow_artifact', args: artifactRef } }, {},
+      ])
+      return { id, artifactRef }
+    }
+
+    async function confirmTopic(record, ticket, draft, { id, artifactRef }) {
+      const result = await clickOperation(confirm, 'workflow_handoff_confirm')
+      assert.equal(result.status, 200, result.body.error)
+      assert.equal(result.body.handoff.handoffId, draft.handoffId)
+      assert.equal(result.body.handoff.targetStageId, 'content-analysis')
+      const next = await poll(async () => {
+        const state = await get(ticket)
+        return state.session.activeStageId === 'content-analysis' && state.session.status === 'active' &&
+          !state.session.pendingHandoffId && state
+      }, 'Confirmed Short Video handoff did not start content analysis')
+      const events = await nativeActivity(home, record, 'workflow-transcript')
+      const toolResult = events.find(event => event.type === 'tool/result' && event.toolCallId === id)
+      assert.equal(toolResult?.isError, false)
+      assert.ok(toolResult.text.includes(artifactRef.artifactId), toolResult.text)
+      assert.equal(JSON.parse(toolResult.text).version, artifactRef.version)
+      assert.equal(next.handoffs.length, 1)
+      assert.equal(next.stages[0].status, 'handed_off')
+      trace('confirm', record, next, { handoffId: result.body.handoff.handoffId, status: result.status,
+        sourceRevision: result.body.handoff.sourceRevision, pinned: artifactRef })
+    }
+
+    await workflow(bTicket, 'bind', {})
+    const first = await openTopic(a)
+    await workflow(first.ticket, 'bind', {})
+    const note = title => ({ id: randomUUID(), type: 'note', content: { title, description: title } })
+    const linked = note('已选取材提示')
+    const unrelated = note('无关节点')
+    await append(page, first.ticket, [linked, unrelated])
+    const topic = await savePlan(a, first.ticket, linked)
+    const old = await preview(first.pane.getByTestId('drama-workflow-action'), a, first.ticket, 1)
+    await save(a, first.ticket, '修改选题方案', [workflowArtifact('选题方案', 'V2 · 保留旧物，增加采访。', {
+      artifactId: topic.artifactId, expectedVersion: 1,
+    })], items => items.some(item => item.artifactId === topic.artifactId && item.version === 2))
+    await sidebar.getByText(changed, { exact: true }).waitFor()
+    assert.ok(await confirm.isDisabled())
+    const stale = await request(page, 'operation', { ticket: first.ticket, action: 'workflow_handoff_confirm',
+      data: { operationId: randomUUID(), handoffId: old.handoffId } })
+    assert.equal(stale.status, 409)
+    assert.equal(stale.body.error, changed)
+    trace('reject selected document change', a, await get(first.ticket), { handoffId: old.handoffId, ...stale })
+    const rebuilt = await preview(regenerate, a, first.ticket, 2)
+    assert.notEqual(rebuilt.handoffId, old.handoffId)
+
+    async function editNote(node, description) {
+      const current = (await query(page, bTicket, { id: node.id })).nodes[0]
+      await workflow(bTicket, 'update_node', {
+        id: current.id, revision: current.revision, content: { ...current.content, description },
+      })
+    }
+
+    await editNote(linked, 'Session B 更新已选输入')
+    const peerEdit = await clickOperation(confirm, 'workflow_handoff_confirm')
+    assert.equal(peerEdit.status, 409)
+    assert.equal(peerEdit.body.error, changed)
+    await sidebar.getByText(changed, { exact: true }).waitFor()
+    await review.getByText('选题交接文档 V1', { exact: true }).waitFor()
+    assert.ok(await confirm.isDisabled())
+    trace('reject peer edit to selected input', a, await get(first.ticket), { handoffId: rebuilt.handoffId, ...peerEdit })
+    const selected = (await get(first.ticket)).artifacts.find(item => item.nodeId === linked.id)
+    await save(a, first.ticket, '重新记录已选输入', [{ name: 'drama_save_artifact', args: {
+      operationId: randomUUID(), title: selected.title, nodeId: linked.id, artifactId: selected.artifactId, expectedVersion: 1,
+    } }], items => items.some(item => item.artifactId === selected.artifactId && item.version === 2))
+    const pinned = await prepareRead(a, { artifactId: topic.artifactId, version: 2 })
+    const fresh = await preview(regenerate, a, first.ticket, 2)
+    assert.notEqual(fresh.handoffId, rebuilt.handoffId)
+    await editNote(unrelated, 'Session B 更新无关 Canvas 元数据')
+    await confirmTopic(a, first.ticket, fresh, pinned)
+    const replay = await workflow(first.ticket, 'workflow_handoff_confirm', { handoffId: fresh.handoffId })
+    assert.equal(replay.handoff.handoffId, fresh.handoffId)
+    assert.equal((await get(first.ticket)).handoffs.length, 1)
+
+    const second = await openTopic(other)
+    const immediate = await savePlan(other, second.ticket)
+    const immediateRead = await prepareRead(other, { artifactId: immediate.artifactId, version: 1 })
+    const draft = await preview(second.pane.getByTestId('drama-workflow-action'), other, second.ticket, 1)
+    await confirmTopic(other, second.ticket, draft, immediateRead)
+  }, { newWorkspaces: true, workflowFixture: true })
+})
+
 test('Workflow dock iterates, previews, and explicitly hands off in the native composer', { timeout: 100_000 }, async () => {
   await withWeb(async ({ page, records, home }) => {
     const [a] = records
@@ -989,6 +1154,7 @@ test('Workflow dock isolates Sessions and rejects conflicting Workspace handoffs
       data: { operationId: randomUUID(), handoffId: previews[index].handoffId },
     })))
     assert.deepEqual(confirmations.map(item => item.status).sort(), [200, 409])
+    assert.equal(confirmations.find(item => item.status === 409).body.error, '该阶段已经由其他 Session 完成交接，请刷新工作流进度。')
     const winner = [a, b][confirmations.findIndex(item => item.status === 200)]
     const loser = winner === a ? b : a
     const official = await read(c)

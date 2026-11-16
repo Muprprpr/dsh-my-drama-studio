@@ -134,7 +134,7 @@ func (f *workflowTest) confirm(session string, h workflowHandoff) workflowHandof
 	return f.call(session, "human", "workflow_handoff_confirm", workflowConfirmArgs{
 		operation: workflowOp(), HandoffID: h.HandoffID,
 		Snapshot: profileTestSnapshot(workflowProfiles[f.view(session).WorkflowProfileID], h.TargetStageID, "V1"),
-	}).(workflowHandoff)
+	}).(workflowHandoffConfirmation).Handoff
 }
 
 func (f *workflowTest) reopen(providers providerRegistry) {
@@ -227,20 +227,24 @@ func TestWorkflowSessionDraftsAndExplicitHandoff(t *testing.T) {
 		t.Fatalf("missing target snapshot partially confirmed a handoff: %+v", v)
 	}
 	confirm := workflowConfirmArgs{operation: workflowOp(), HandoffID: aPreview.HandoffID, Snapshot: workflowTestSnapshot(target, "V1")}
-	a := f.call("a", "human", "workflow_handoff_confirm", confirm).(workflowHandoff)
+	confirmed := f.call("a", "human", "workflow_handoff_confirm", confirm).(workflowHandoffConfirmation)
+	a := confirmed.Handoff
+	if !confirmed.Committed {
+		t.Fatal("first confirmation did not commit")
+	}
 	if out := f.call("a", "workflow", "workflow_handoff_target", targetQuery).(workflowHandoffTarget); out.TargetStage != nil {
 		t.Fatalf("confirmed replay should not need target files: %+v", out)
 	}
 	confirm.Snapshot = nil
-	var replay workflowHandoff
-	replayed := f.call("a", "human", "workflow_handoff_confirm", confirm).(json.RawMessage)
-	if err := json.Unmarshal(replayed, &replay); err != nil || a.HandoffID != replay.HandoffID {
-		t.Fatalf("confirmation replay: %+v, %v", replay, err)
+	for _, operationID := range []operation{confirm.operation, workflowOp()} {
+		confirm.operation = operationID
+		replayed := f.call("a", "human", "workflow_handoff_confirm", confirm).(workflowHandoffConfirmation)
+		if replayed.Committed || a.HandoffID != replayed.Handoff.HandoffID || a.ConfirmedAt != replayed.Handoff.ConfirmedAt {
+			t.Fatalf("confirmation replay committed or changed the receipt: %+v", replayed)
+		}
 	}
 	f.check("b", "human", "workflow_handoff_confirm", workflowConfirmArgs{
 		operation: workflowOp(), HandoffID: bPreview.HandoffID}, http.StatusConflict)
-	f.check("a", "human", "workflow_handoff_confirm", workflowConfirmArgs{
-		operation: workflowOp(), HandoffID: aPreview.HandoffID}, http.StatusConflict)
 	if a.ConfirmedAt == "" || a.TargetStageID != target || a.SourceRevision != 1 || a.Artifacts[0].Content != a1.Content ||
 		len(a.ConfirmedDecisions) != 1 || len(a.Constraints) != 1 {
 		t.Fatalf("incorrect pinned package: %+v", a)
@@ -561,8 +565,7 @@ func TestWorkflowConcurrentConfirmation(t *testing.T) {
 	if first != nil {
 		first, second = second, first
 	}
-	var known *requestError
-	if first != nil || !errors.As(second, &known) || known.code != http.StatusConflict || len(f.view("peer").Handoffs) != 1 {
+	if first != nil || second != workflowHandoffPeerConfirmed || len(f.view("peer").Handoffs) != 1 {
 		t.Fatalf("expected one success and one version conflict across kernels: %v %v", first, second)
 	}
 }

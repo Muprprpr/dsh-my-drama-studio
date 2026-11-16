@@ -15,19 +15,28 @@ import (
 
 type workflowHandoff struct {
 	workflowFileVersions
-	HandoffID          string             `json:"handoffId"`
-	SourceStageID      string             `json:"sourceStageId"`
-	TargetStageID      string             `json:"targetStageId,omitempty"`
-	WorkspaceID        string             `json:"workspaceId"`
-	SourceSessionID    string             `json:"sourceSessionId"`
-	SourceRevision     int64              `json:"sourceRevision"`
-	Artifacts          []workflowArtifact `json:"artifacts"`
-	Summary            string             `json:"summary"`
-	ConfirmedDecisions []string           `json:"confirmedDecisions"`
-	Constraints        []string           `json:"constraints"`
-	CreatedAt          string             `json:"createdAt"`
-	ConfirmedAt        string             `json:"confirmedAt,omitempty"`
-	Stale              bool               `json:"stale,omitempty"`
+	HandoffID                 string                   `json:"handoffId"`
+	SourceStageID             string                   `json:"sourceStageId"`
+	TargetStageID             string                   `json:"targetStageId,omitempty"`
+	WorkspaceID               string                   `json:"workspaceId"`
+	SourceSessionID           string                   `json:"sourceSessionId"`
+	WorkflowProfileID         string                   `json:"workflowProfileId,omitempty"`
+	WorkflowDefinitionVersion int64                    `json:"workflowDefinitionVersion,omitempty"`
+	SourceRevision            int64                    `json:"sourceRevision,omitempty"`
+	PreviewBaseline           *workflowPreviewBaseline `json:"previewBaseline,omitempty"`
+	Artifacts                 []workflowArtifact       `json:"artifacts"`
+	Summary                   string                   `json:"summary"`
+	ConfirmedDecisions        []string                 `json:"confirmedDecisions"`
+	Constraints               []string                 `json:"constraints"`
+	CreatedAt                 string                   `json:"createdAt"`
+	ConfirmedAt               string                   `json:"confirmedAt,omitempty"`
+	Stale                     bool                     `json:"stale,omitempty"`
+}
+
+type workflowPreviewBaseline struct {
+	PriorHandoffID string           `json:"priorHandoffId,omitempty"`
+	InputKey       string           `json:"inputKey,omitempty"`
+	ArtifactHeads  map[string]int64 `json:"artifactHeads"`
 }
 
 type workflowPreviewArgs struct {
@@ -46,7 +55,20 @@ type workflowHandoffTarget struct {
 	TargetStage *workflowStage `json:"targetStage,omitempty"`
 }
 
-func (p *project) workflowHandoffTarget(ctx context.Context, sessionID, handoffID string) (workflowHandoffTarget, error) {
+type workflowHandoffConfirmation struct {
+	Handoff   workflowHandoff `json:"handoff"`
+	Committed bool            `json:"committed"`
+}
+
+var (
+	workflowHandoffContentChanged    = &requestError{http.StatusConflict, "交接内容已发生变化，请重新生成交接预览后确认。"}
+	workflowHandoffActivationChanged = &requestError{http.StatusConflict, "当前阶段已经发生变化，请重新检查当前工作流状态。"}
+	workflowHandoffPeerConfirmed     = &requestError{http.StatusConflict, "该阶段已经由其他 Session 完成交接，请刷新工作流进度。"}
+	workflowHandoffPermission        = &requestError{http.StatusConflict, "当前 Session 已不具备该阶段的交接权限。"}
+	workflowHandoffDefinitionChanged = &requestError{http.StatusConflict, "当前工作流定义已更新，请重新检查阶段关系。"}
+)
+
+func (p *project) workflowHandoffTarget(ctx context.Context, r Request, handoffID string) (workflowHandoffTarget, error) {
 	var out workflowHandoffTarget
 	if handoffID == "" {
 		return out, invalid("请先生成交接预览")
@@ -56,47 +78,84 @@ func (p *project) workflowHandoffTarget(ctx context.Context, sessionID, handoffI
 		return out, err
 	}
 	defer tx.Rollback()
-	var record string
-	var confirmed bool
-	var activation int64
-	err = tx.QueryRowContext(ctx, `SELECT record,revision IS NOT NULL,activation FROM workflow_handoffs WHERE id=? AND session_id=?`,
-		handoffID, sessionID).Scan(&record, &confirmed, &activation)
-	if errors.Is(err, sql.ErrNoRows) {
-		return out, workflowChanged
-	}
+	handoff, activation, confirmed, err := readOwnedWorkflowHandoff(ctx, tx, r, handoffID)
 	if err != nil || confirmed {
 		// Confirmation can replay its stored result without reading today's files.
 		return out, err
 	}
-	var handoff workflowHandoff
-	if err := json.Unmarshal([]byte(record), &handoff); err != nil {
-		return out, err
-	}
-	session, err := readWorkflowSession(ctx, tx, sessionID)
+	profile, index, err := verifyHandoffStage(ctx, tx, r, handoff, activation)
 	if err != nil {
 		return out, err
 	}
-	if session.RunID != "" {
-		return out, workflowTurnRunning
-	}
-	if session.Activation != activation || session.ActiveStageID != handoff.SourceStageID {
-		return out, workflowChanged
-	}
 	if handoff.TargetStageID != "" {
-		profile, err := readWorkflowProfile(ctx, tx)
-		if err != nil {
-			return out, err
-		}
-		index := profile.stageIndex(handoff.TargetStageID)
-		if index < 0 {
-			return out, workflowChanged
-		}
-		stage := profile.stage(index)
+		stage := profile.stage(index + 1)
 		out.TargetStage = &stage
 	}
 	return out, nil
 }
 
+func readOwnedWorkflowHandoff(ctx context.Context, tx *sql.Tx, r Request, handoffID string) (workflowHandoff, int64, bool, error) {
+	var handoff workflowHandoff
+	var activation int64
+	var confirmed, stale bool
+	var record string
+	err := tx.QueryRowContext(ctx, `SELECT record,activation,revision IS NOT NULL,stale FROM workflow_handoffs WHERE id=? AND session_id=?`,
+		handoffID, r.SessionID).Scan(&record, &activation, &confirmed, &stale)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = workflowHandoffPermission
+	}
+	if err != nil {
+		return handoff, 0, false, err
+	}
+	if err := json.Unmarshal([]byte(record), &handoff); err != nil {
+		return handoff, 0, false, err
+	}
+	if handoff.WorkspaceID != r.WorkspaceID || handoff.SourceSessionID != r.SessionID {
+		return handoff, 0, false, workflowHandoffPermission
+	}
+	handoff.Stale = stale
+	return handoff, activation, confirmed, nil
+}
+
+func verifyHandoffStage(ctx context.Context, tx *sql.Tx, r Request, handoff workflowHandoff, activation int64) (*workflowProfile, int, error) {
+	if handoff.PreviewBaseline == nil {
+		return nil, 0, workflowHandoffContentChanged
+	}
+	profile, err := readWorkflowProfile(ctx, tx)
+	var known *requestError
+	if errors.As(err, &known) && known.code == http.StatusConflict {
+		return nil, 0, workflowHandoffDefinitionChanged
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	index := profile.stageIndex(handoff.SourceStageID)
+	if index < 0 || handoff.WorkflowProfileID != profile.ID || handoff.WorkflowDefinitionVersion != profile.Version ||
+		handoff.TargetStageID != profile.nextStage(index) {
+		return nil, 0, workflowHandoffDefinitionChanged
+	}
+	session, err := readWorkflowSession(ctx, tx, r.SessionID)
+	if err != nil {
+		return nil, 0, err
+	}
+	if session.Activation != activation || session.ActiveStageID != handoff.SourceStageID ||
+		session.workflowFileVersions != handoff.workflowFileVersions {
+		return nil, 0, workflowHandoffActivationChanged
+	}
+	if session.SnapshotID == "" {
+		return nil, 0, workflowHandoffPermission
+	}
+	if session.RunID != "" {
+		return nil, 0, workflowTurnRunning
+	}
+	if _, err := readWorkflowSnapshot(ctx, tx, profile, session); err != nil {
+		if errors.As(err, &known) && known.code == http.StatusConflict {
+			return nil, 0, workflowHandoffPermission
+		}
+		return nil, 0, err
+	}
+	return profile, index, nil
+}
 func readWorkflowHandoffs(ctx context.Context, tx *sql.Tx) ([]workflowHandoff, error) {
 	return queryConfirmedWorkflowHandoffs(ctx, tx, false)
 }
@@ -184,11 +243,16 @@ func workflowRevision(ctx context.Context, tx *sql.Tx) (int64, error) {
 	return revision, err
 }
 
-func workflowDraftWatermark(ctx context.Context, tx *sql.Tx, sessionID, stageID string) (int64, error) {
-	var watermark int64
-	err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(rowid),0) FROM workflow_artifacts WHERE session_id=? AND stage_id=?`,
-		sessionID, stageID).Scan(&watermark)
-	return watermark, err
+func workflowArtifactHead(ctx context.Context, tx *sql.Tx, artifact workflowArtifact) (int64, error) {
+	var head int64
+	var hasVersion bool
+	err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0), COUNT(CASE WHEN version=? THEN 1 END)>0
+		FROM workflow_artifacts WHERE id=? AND session_id=? AND stage_id=?`,
+		artifact.Version, artifact.ArtifactID, artifact.SessionID, artifact.StageID).Scan(&head, &hasVersion)
+	if err == nil && !hasVersion {
+		err = workflowHandoffContentChanged
+	}
+	return head, err
 }
 
 func (p *project) previewWorkflowHandoff(ctx context.Context, r Request, args workflowPreviewArgs) (any, error) {
@@ -208,6 +272,9 @@ func (p *project) previewWorkflowHandoff(ctx context.Context, r Request, args wo
 		if index < 0 || session.RunID != "" || args.StageID != "" && args.StageID != session.ActiveStageID {
 			return nil, &requestError{http.StatusConflict, "请在当前阶段回合结束后生成交接预览"}
 		}
+		if session.SnapshotID == "" {
+			return nil, workflowHandoffPermission
+		}
 		latest, err := readLatestWorkflowHandoffs(ctx, tx)
 		if err != nil {
 			return nil, err
@@ -220,6 +287,20 @@ func (p *project) previewWorkflowHandoff(ctx context.Context, r Request, args wo
 			return nil, err
 		}
 		inputKey := workflowInputKey(profile.inputs(latest, index))
+		baseline := workflowPreviewBaseline{
+			PriorHandoffID: latest[session.ActiveStageID].HandoffID,
+			InputKey:       inputKey,
+			ArtifactHeads:  make(map[string]int64, len(artifacts)),
+		}
+		// Record the contemporaneous head separately from the version deliberately selected by the user.
+		// Auto-attached generated/inherited media are checked against live Canvas references instead.
+		for _, artifact := range artifacts {
+			head, err := workflowArtifactHead(ctx, tx, artifact)
+			if err != nil {
+				return nil, err
+			}
+			baseline.ArtifactHeads[artifact.ArtifactID] = head
+		}
 		if session.ActiveStageID == workflowGeneration {
 			artifacts, err = p.addWorkflowVideoResults(ctx, tx, latest, r.SessionID, session, inputKey, artifacts)
 			if err != nil {
@@ -250,18 +331,11 @@ func (p *project) previewWorkflowHandoff(ctx context.Context, r Request, args wo
 		if previous, ok := latest[session.ActiveStageID]; ok && !previous.Stale && sameWorkflowArtifacts(previous.Artifacts, artifacts) {
 			return nil, &requestError{http.StatusConflict, "这些版本已正式交接，请选择更新的产物"}
 		}
-		revision, err := workflowRevision(ctx, tx)
-		if err != nil {
-			return nil, err
-		}
-		watermark, err := workflowDraftWatermark(ctx, tx, r.SessionID, session.ActiveStageID)
-		if err != nil {
-			return nil, err
-		}
 		handoff := workflowHandoff{
 			workflowFileVersions: session.workflowFileVersions,
 			HandoffID:            uuid.NewString(), SourceStageID: session.ActiveStageID, TargetStageID: profile.nextStage(index),
-			WorkspaceID: status.WorkspaceID, SourceSessionID: r.SessionID, SourceRevision: revision + 1,
+			WorkspaceID: status.WorkspaceID, SourceSessionID: r.SessionID,
+			WorkflowProfileID: profile.ID, WorkflowDefinitionVersion: profile.Version, PreviewBaseline: &baseline,
 			Artifacts: artifacts, CreatedAt: workflowNow(), ConfirmedDecisions: []string{}, Constraints: []string{},
 		}
 		fillWorkflowHandoffSummary(&handoff)
@@ -269,8 +343,9 @@ func (p *project) previewWorkflowHandoff(ctx context.Context, r Request, args wo
 		if err != nil {
 			return nil, err
 		}
+		// Older databases require a value in draft_watermark; the scoped proof is in record.
 		_, err = tx.ExecContext(ctx, `INSERT INTO workflow_handoffs(id,stage_id,session_id,activation,draft_watermark,record)
-			VALUES(?,?,?,?,?,?)`, handoff.HandoffID, handoff.SourceStageID, r.SessionID, session.Activation, watermark, string(body))
+			VALUES(?,?,?,?,0,?)`, handoff.HandoffID, handoff.SourceStageID, r.SessionID, session.Activation, string(body))
 		return handoff, err
 	})
 }
@@ -418,58 +493,53 @@ func (p *project) confirmWorkflowHandoff(ctx context.Context, r Request, args wo
 	if args.HandoffID == "" {
 		return nil, invalid("请先生成交接预览")
 	}
-	return p.write(ctx, r, args.operation.ID, func(tx *sql.Tx, _ Status) (any, error) {
-		var record string
-		var activation, watermark int64
-		err := tx.QueryRowContext(ctx, `SELECT activation,draft_watermark,record FROM workflow_handoffs
-			WHERE id=? AND session_id=? AND revision IS NULL`, args.HandoffID, r.SessionID).Scan(&activation, &watermark, &record)
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, workflowChanged
-		}
+	committed := false
+	result, err := p.write(ctx, r, args.operation.ID, func(tx *sql.Tx, _ Status) (any, error) {
+		handoff, activation, confirmed, err := readOwnedWorkflowHandoff(ctx, tx, r, args.HandoffID)
 		if err != nil {
 			return nil, err
 		}
-		var handoff workflowHandoff
-		if err := json.Unmarshal([]byte(record), &handoff); err != nil {
-			return nil, err
+		if confirmed {
+			return handoff, nil
 		}
-		session, err := readWorkflowSession(ctx, tx, r.SessionID)
+		profile, index, err := verifyHandoffStage(ctx, tx, r, handoff, activation)
 		if err != nil {
 			return nil, err
-		}
-		if session.RunID != "" {
-			return nil, workflowTurnRunning
-		}
-		if session.ActiveStageID != handoff.SourceStageID || session.Activation != activation {
-			return nil, workflowChanged
-		}
-		revision, err := workflowRevision(ctx, tx)
-		if err != nil {
-			return nil, err
-		}
-		draftWatermark, err := workflowDraftWatermark(ctx, tx, r.SessionID, session.ActiveStageID)
-		if err != nil {
-			return nil, err
-		}
-		if handoff.SourceRevision != revision+1 || watermark != draftWatermark {
-			return nil, workflowChanged
-		}
-		profile, err := readWorkflowProfile(ctx, tx)
-		if err != nil {
-			return nil, err
-		}
-		index := profile.stageIndex(handoff.SourceStageID)
-		if index < 0 || handoff.TargetStageID != profile.nextStage(index) {
-			return nil, workflowChanged
 		}
 		latest, err := readLatestWorkflowHandoffs(ctx, tx)
 		if err != nil {
 			return nil, err
 		}
-		if err := profile.requireWorkflowInputs(latest, index); err != nil {
-			return nil, err
+		baseline := handoff.PreviewBaseline
+		if prior := latest[handoff.SourceStageID]; prior.HandoffID != baseline.PriorHandoffID {
+			if prior.HandoffID != "" && prior.SourceSessionID != r.SessionID {
+				return nil, workflowHandoffPeerConfirmed
+			}
+			return nil, workflowHandoffContentChanged
+		}
+		if profile.requireWorkflowInputs(latest, index) != nil || workflowInputKey(profile.inputs(latest, index)) != baseline.InputKey {
+			return nil, workflowHandoffContentChanged
+		}
+		for _, artifact := range handoff.Artifacts {
+			if version, selected := baseline.ArtifactHeads[artifact.ArtifactID]; selected {
+				head, err := workflowArtifactHead(ctx, tx, artifact)
+				if err != nil {
+					return nil, err
+				}
+				if head != version {
+					return nil, workflowHandoffContentChanged
+				}
+			}
 		}
 		if err := p.checkWorkflowHandoffArtifacts(ctx, tx, latest, handoff.SourceStageID, handoff.Artifacts); err != nil {
+			var known *requestError
+			if errors.As(err, &known) && known.code == http.StatusConflict {
+				return nil, workflowHandoffContentChanged
+			}
+			return nil, err
+		}
+		revision, err := workflowRevision(ctx, tx)
+		if err != nil {
 			return nil, err
 		}
 		if handoff.TargetStageID != "" {
@@ -486,6 +556,7 @@ func (p *project) confirmWorkflowHandoff(ctx context.Context, r Request, args wo
 			}
 		}
 		handoff.ConfirmedAt = workflowNow()
+		handoff.SourceRevision = revision + 1
 		for i := range handoff.Artifacts {
 			handoff.Artifacts[i].HandedOff = true
 		}
@@ -506,6 +577,22 @@ func (p *project) confirmWorkflowHandoff(ctx context.Context, r Request, args wo
 		if _, err := addEvent(ctx, tx, "workflow", []string{handoff.SourceStageID}); err != nil {
 			return nil, err
 		}
+		committed = true
 		return handoff, nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	if handoff, ok := result.(workflowHandoff); ok {
+		return workflowHandoffConfirmation{Handoff: handoff, Committed: committed}, nil
+	}
+	// A replayed operation stores only the durable Handoff receipt, never permission to dispatch again.
+	var handoff workflowHandoff
+	if err := json.Unmarshal(result.(json.RawMessage), &handoff); err != nil {
+		return nil, err
+	}
+	if handoff.HandoffID != args.HandoffID || handoff.WorkspaceID != r.WorkspaceID {
+		return nil, workflowHandoffPermission
+	}
+	return workflowHandoffConfirmation{Handoff: handoff}, nil
 }
