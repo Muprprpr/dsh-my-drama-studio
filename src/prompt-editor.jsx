@@ -397,6 +397,23 @@ export const PromptEditor = forwardRef(function PromptEditor({
     editable: !disabled,
     coreExtensionOptions: { clipboardTextSerializer: { blockSeparator: '\n' } },
     editorProps: {
+      handleKeyDown(view, event) {
+        if (event.key !== 'Backspace' || event.isComposing || !view.hasFocus()) return false
+        const dom = view.dom.ownerDocument.getSelection()
+        const selection = view.state.selection
+        if (!(selection instanceof TextSelection) || !dom ||
+            !view.dom.contains(dom.anchorNode) || !view.dom.contains(dom.focusNode)) return false
+        // Chromium can deliver Backspace before selectionchange from the previous key.
+        // ProseMirror's delete handlers must see the caret already painted by the browser.
+        const anchor = view.posAtDOM(dom.anchorNode, dom.anchorOffset)
+        const head = view.posAtDOM(dom.focusNode, dom.focusOffset)
+        if (anchor !== selection.anchor || head !== selection.head) {
+          const { doc } = view.state
+          const current = TextSelection.between(doc.resolve(anchor), doc.resolve(head))
+          view.dispatch(view.state.tr.setSelection(current).setMeta('addToHistory', false))
+        }
+        return false
+      },
       handleDOMEvents: {
         keydown(view, event) {
           const state = bridge.current

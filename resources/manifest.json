@@ -1,0 +1,124 @@
+{
+  "schemaVersion": 1,
+  "assets": [
+    {
+      "id": "skill:drama-content-analysis",
+      "type": "skill",
+      "stageId": "content-analysis",
+      "source": "skills/drama-content-analysis/SKILL.md",
+      "target": "skills/drama-content-analysis/SKILL.md"
+    },
+    {
+      "id": "harness:content-analysis",
+      "type": "harness",
+      "stageId": "content-analysis",
+      "source": "workflows/drama-production/stages/content-analysis/harness.md",
+      "target": "drama-studio/workflows/drama-production/stages/content-analysis/harness.md"
+    },
+    {
+      "id": "skill:drama-shooting-script",
+      "type": "skill",
+      "stageId": "shooting-script",
+      "source": "skills/drama-shooting-script/SKILL.md",
+      "target": "skills/drama-shooting-script/SKILL.md"
+    },
+    {
+      "id": "harness:shooting-script",
+      "type": "harness",
+      "stageId": "shooting-script",
+      "source": "workflows/drama-production/stages/shooting-script/harness.md",
+      "target": "drama-studio/workflows/drama-production/stages/shooting-script/harness.md"
+    },
+    {
+      "id": "skill:drama-storyboard",
+      "type": "skill",
+      "stageId": "storyboard",
+      "source": "skills/drama-storyboard/SKILL.md",
+      "target": "skills/drama-storyboard/SKILL.md"
+    },
+    {
+      "id": "skill-resource:drama-storyboard/references/shot-sizes.md",
+      "type": "skill-resource",
+      "stageId": "storyboard",
+      "source": "skills/drama-storyboard/references/shot-sizes.md",
+      "target": "skills/drama-storyboard/references/shot-sizes.md"
+    },
+    {
+      "id": "skill-resource:drama-storyboard/templates/storyboard.md",
+      "type": "skill-resource",
+      "stageId": "storyboard",
+      "source": "skills/drama-storyboard/templates/storyboard.md",
+      "target": "skills/drama-storyboard/templates/storyboard.md"
+    },
+    {
+      "id": "skill-resource:drama-storyboard/scripts/check.js",
+      "type": "skill-resource",
+      "stageId": "storyboard",
+      "source": "skills/drama-storyboard/scripts/check.js",
+      "target": "skills/drama-storyboard/scripts/check.js"
+    },
+    {
+      "id": "harness:storyboard",
+      "type": "harness",
+      "stageId": "storyboard",
+      "source": "workflows/drama-production/stages/storyboard/harness.md",
+      "target": "drama-studio/workflows/drama-production/stages/storyboard/harness.md"
+    },
+    {
+      "id": "skill:drama-asset-binding",
+      "type": "skill",
+      "stageId": "asset-binding",
+      "source": "skills/drama-asset-binding/SKILL.md",
+      "target": "skills/drama-asset-binding/SKILL.md"
+    },
+    {
+      "id": "harness:asset-binding",
+      "type": "harness",
+      "stageId": "asset-binding",
+      "source": "workflows/drama-production/stages/asset-binding/harness.md",
+      "target": "drama-studio/workflows/drama-production/stages/asset-binding/harness.md"
+    },
+    {
+      "id": "skill:drama-video-deployment",
+      "type": "skill",
+      "stageId": "video-deployment",
+      "source": "skills/drama-video-deployment/SKILL.md",
+      "target": "skills/drama-video-deployment/SKILL.md"
+    },
+    {
+      "id": "harness:video-deployment",
+      "type": "harness",
+      "stageId": "video-deployment",
+      "source": "workflows/drama-production/stages/video-deployment/harness.md",
+      "target": "drama-studio/workflows/drama-production/stages/video-deployment/harness.md"
+    },
+    {
+      "id": "skill:drama-video-generation",
+      "type": "skill",
+      "stageId": "video-generation",
+      "source": "skills/drama-video-generation/SKILL.md",
+      "target": "skills/drama-video-generation/SKILL.md"
+    },
+    {
+      "id": "harness:video-generation",
+      "type": "harness",
+      "stageId": "video-generation",
+      "source": "workflows/drama-production/stages/video-generation/harness.md",
+      "target": "drama-studio/workflows/drama-production/stages/video-generation/harness.md"
+    },
+    {
+      "id": "skill:drama-final-review",
+      "type": "skill",
+      "stageId": "final-review",
+      "source": "skills/drama-final-review/SKILL.md",
+      "target": "skills/drama-final-review/SKILL.md"
+    },
+    {
+      "id": "harness:final-review",
+      "type": "harness",
+      "stageId": "final-review",
+      "source": "workflows/drama-production/stages/final-review/harness.md",
+      "target": "drama-studio/workflows/drama-production/stages/final-review/harness.md"
+    }
+  ]
+}

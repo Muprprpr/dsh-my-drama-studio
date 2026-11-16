@@ -5,6 +5,7 @@ import { importedMediaURL, importMedia, streamImportedMedia, streamMedia } from 
 import { registerTools } from './tools.js'
 import { openProfileSettings } from './profile-settings.js'
 import { workflowBridge } from './workflow.js'
+import { ensureBuiltInAssets } from './capability-assets.js'
 
 export const name = 'my-drama-studio'
 export const inject = ['agents', 'connection', 'webServer', 'workspaceRegistry', 'tools', 'settings', 'credentials', 'profileContext']
@@ -94,11 +95,15 @@ export async function apply(ctx, config) {
     return Boolean(members?.includes(sessionId)) && !workspaceActivity(members, connected).aiRunning
   }
 
+  const capabilities = await ensureBuiltInAssets(ctx)
+  for (const issue of [capabilities.failure, ...capabilities.errors.values()]) {
+    if (issue) console.warn('[my-drama-studio] Workflow capability:', issue.error)
+  }
   const kernel = await startKernel(ctx, checkHumanWrite)
   const providers = await openProfileSettings(ctx, config, kernel, () => activity.emit('provider-change'))
   const signingKey = randomBytes(32)
   const lifetime = new AbortController()
-  const workflow = workflowBridge(ctx, kernel, workspaceFor, lifetime.signal)
+  const workflow = workflowBridge(ctx, kernel, workspaceFor, lifetime.signal, capabilities)
   ctx.effect(() => () => lifetime.abort())
   ctx.on('agent/status', ({ agent }) => activity.emit('change', agent.id))
   ctx.on('agent/disposed', ({ agent }) => activity.emit('change', agent.id))

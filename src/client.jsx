@@ -14,6 +14,7 @@ const canvasTabId = 'dsh-my-drama-studio.canvas'
 const artifactsKind = 'drama-workflow-artifacts'
 const artifactsTabId = 'dsh-my-drama-studio.artifacts'
 const statusChanges = new EventTarget()
+const canvasDrafts = new WeakMap()
 const videoGeneration = { t2v: generateT2V, i2v: generateI2V, r2v: generateR2V, v2v: generateV2V }
 
 export const inject = ['slots', 'sidebarRight', 'sidebarRightTabs', 'locale']
@@ -183,8 +184,16 @@ function SessionCanvasControl({ sessionId, sidebar, useWorkspaces }) {
 
 function DramaCanvasTab({ sessionId, useTabInfo, useWorkspaces, t }) {
   const { tab } = useTabInfo()
-  return <SessionPanel key={sessionId} sessionId={sessionId} visible={tab.visible}
+  return <SessionPanel key={sessionId} sessionId={sessionId} visible={tab.visible} tabSignal={tab.signal}
     useWorkspaces={useWorkspaces} title={t('name')} />
+}
+
+function textDraftsFor(signal, canvasId, sessionId) {
+  const existing = canvasDrafts.get(signal)
+  if (existing?.canvasId === canvasId && existing.sessionId === sessionId) return existing.drafts
+  const drafts = new Map()
+  canvasDrafts.set(signal, { canvasId, sessionId, drafts })
+  return drafts
 }
 
 function DramaArtifactsTab({ sessionId, useTabInfo, useWorkspaces, useSessions, useSessionStatus, sidebar }) {
@@ -224,7 +233,7 @@ function SessionWorkflowDock({ sessionId, useSessionStatus, sidebar }) {
     openArtifacts={() => openStudioTab(sidebar, sessionId, artifactsKind)} />
 }
 
-function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
+function SessionPanel({ sessionId, visible, tabSignal, title, useWorkspaces }) {
   const { session, error: sessionError } = useStudioSession(sessionId, visible)
   const [view, setView] = useState(null)
   const [activity, setActivity] = useState(null)
@@ -362,6 +371,7 @@ function SessionPanel({ sessionId, visible, title, useWorkspaces }) {
     <div className="drama-shell-body">
       {connected && snapshot ? <CanvasViewport key={status.canvasId + ':' + sessionId} snapshot={snapshot} filters={filters}
         setFilters={setFilters} append={append} mutate={mutate} aiRunning={aiRunning}
+        textDrafts={textDraftsFor(tabSignal, status.canvasId, sessionId)}
         uploadFile={(type, file) => uploadMedia(ticket, type, file)}
         mediaURL={node => mediaURL(ticket, node)}
         generationProfiles={generationProfiles} generationDefaults={providerData?.generation}

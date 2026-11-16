@@ -10,7 +10,8 @@
     "dist/client.js",
     "dist/host.js",
     "dist/studio.exe",
-    "dsh.bundle.patch"
+    "dsh.bundle.patch",
+    "resources"
   ],
   "dsh": {
     "bundle": {

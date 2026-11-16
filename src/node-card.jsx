@@ -548,7 +548,7 @@ function NodeEditor({
   draft, append, mutate, mutationReason, media = [], queryCanvas, finish, close, mediaURL, index,
   generationProfiles, generationDefaults, providerVersion, providerSettingsReady, node, actions, latest, resolvedMedia,
   mentionedAssets, rename, referenceFocus, uploadReference,
-  importFile, attachAsset, reportSaveError, isFocused,
+  importFile, attachAsset, reportSaveError, isFocused, textDrafts,
 }) {
   const { base, preset, seed, duplicate, edit, group } = draft
   const type = node.type
@@ -556,10 +556,12 @@ function NodeEditor({
   const sameKind = base?.type === type
   const content = sameKind ? base.content : {}
   const savedMode = preset?.mode ?? (sameKind && type === 'video' ? videoMode(base) : 't2v')
+  const draftStore = edit && (type === 'note' || type === 'script') ? textDrafts : undefined
+  const [retainedDraft] = useState(() => draftStore?.get(node.id))
   const [mode, setMode] = useState(savedMode)
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
-  const [dirty, setDirty] = useState(false)
+  const [dirty, setDirty] = useState(Boolean(retainedDraft))
   const [changeVersion, setChangeVersion] = useState(0)
   const promptField = type === 'prompt'
     ? ['text', 'description', 'prompt'].find(field => textValue(content, field)) ?? 'prompt'
@@ -567,6 +569,9 @@ function NodeEditor({
   const storedPrompt = typeof content[promptField] === 'string' ? content[promptField] : ''
   const storedPromptDoc = content.promptDoc ?? null
   const storedProfileId = textValue(content, 'profileId')
+  const textField = textValue(content, 'text') || ('text' in content && !('description' in content)) ? 'text' : 'description'
+  const storedDescription = String(content[textField] ?? '')
+  const [description, setDescription] = useState(() => retainedDraft?.values.get('description') ?? storedDescription)
   const [plainPrompt, setPlainPrompt] = useState(storedPrompt)
   const [promptDoc, setPromptDoc] = useState(storedPromptDoc)
   const prompt = promptDoc ? promptDocumentText(promptDoc) : plainPrompt
@@ -601,7 +606,7 @@ function NodeEditor({
   const titleInput = useRef(null)
   const referenceArea = useRef(null)
   const formRef = useRef(null)
-  const revision = useRef(base?.revision)
+  const revision = useRef(retainedDraft?.revision ?? base?.revision)
   const committed = useRef(base)
   const mounted = useRef(false)
   const queue = useRef({ pending: null, saving: false, savedVersion: 0, timer: 0, error: '' })
@@ -627,6 +632,7 @@ function NodeEditor({
 
   useEffect(() => {
     if (!edit || dirty || composingPrompt.current || base.revision < revision.current) return
+    if (!compact && base.revision === revision.current) return
     revision.current = base.revision
     committed.current = base
     setPlainPrompt(storedPrompt)
@@ -635,7 +641,14 @@ function NodeEditor({
     setOverrides(parameterValues(content))
     setAsset(null)
     if (compact) setMetadata(nodeMetadata(base))
-    formRef.current?.reset()
+    else setDescription(storedDescription)
+    const form = formRef.current
+    const input = form?.elements.namedItem('description')
+    // A Canvas refresh can land between selecting the body and entering text.
+    const selection = input instanceof HTMLTextAreaElement && input === document.activeElement
+      ? [input.selectionStart, input.selectionEnd, input.selectionDirection] : null
+    form?.reset()
+    if (selection) input.setSelectionRange(...selection)
   }, [base?.revision, dirty, edit, promptComposing])
 
   useEffect(() => {
@@ -696,7 +709,6 @@ function NodeEditor({
     return () => cancelAnimationFrame(frame)
   }, [referenceFocus])
 
-  const textField = textValue(content, 'text') || ('text' in content && !('description' in content)) ? 'text' : 'description'
   const referenceMode = type === 'image' ? 't2i' : type === 'video' ? mode : ''
   const currentProfiles = profileCandidates(generationProfiles, referenceMode)
   const activeProfile = resolveProfile(currentProfiles, profileId)
@@ -897,6 +909,7 @@ function NodeEditor({
     event.preventDefault()
     if (saving || blocked || compact) return
     const form = new FormData(event.currentTarget)
+    const submittedDraft = draftStore?.get(node.id)
     setSaving(true)
     setError('')
     try {
@@ -914,6 +927,7 @@ function NodeEditor({
         await append({ nodes: [{ id, type, basedOn: base?.id, content: next, ...fields }],
           edges: [...edges].map(source => ({ source, target: id })) })
       }
+      if (draftStore?.get(node.id) === submittedDraft) draftStore?.delete(node.id)
       setDirty(false)
       finish(id)
     } catch (failure) {
@@ -1141,11 +1155,21 @@ function NodeEditor({
 
   const showReferences = supportsRefs && (type !== 'video' ||
     Boolean(referenceMode && referenceMode !== 't2v') || references.length > 0 || mentionReferences.length > 0)
+  function updateDraft(event) {
+    setDirty(true)
+    if (draftStore) draftStore.set(node.id, { values: new FormData(event.currentTarget), revision: revision.current })
+  }
+
+  function discardDraft() {
+    draftStore?.delete(node.id)
+    close()
+  }
+
   return <form ref={formRef} className={'drama-node-editor ' + interactions} onSubmit={save} aria-label={formLabel}
-    onChange={() => setDirty(true)} onKeyDown={event => {
+    onChange={updateDraft} onKeyDown={event => {
       if (event.key === 'Escape' && !event.nativeEvent.isComposing && event.keyCode !== 229) {
         if (isFocused) return
-        close()
+        discardDraft()
       }
       stopCanvasKeys(event)
     }} onDoubleClick={preventCanvasDoubleClick}>
@@ -1162,7 +1186,7 @@ function NodeEditor({
           <PromptEditor ref={promptInput} {...promptProps} ariaLabel={type === 'video' ? '完整视频提示词' : '提示词'} disabled={blocked || saving} />
         </div>}
         {!hasPrompt && <label className="drama-node-field">正文
-          <textarea name="description" rows={3} defaultValue={content[textField] ?? ''} />
+          <textarea name="description" rows={3} value={description} onChange={event => setDescription(event.target.value)} />
         </label>}
         {supportsRefs && <div ref={referenceArea}>
           {showReferences ? <MediaReferences mode={referenceMode} profile={activeProfile} media={available} mediaURL={mediaURL}
@@ -1198,11 +1222,12 @@ function NodeEditor({
         <details className="drama-node-editor-optional" open={!edit ? true : undefined}>
           <summary>名称与镜头</summary>
           {edit && <label className="drama-node-field">节点名称
-            <Input ref={titleInput} name="title" defaultValue={nodeTitle(base ?? { content })} placeholder={nodeLabels[type]} />
+            <Input ref={titleInput} name="title" defaultValue={retainedDraft?.values.get('title') ?? nodeTitle(base ?? { content })}
+              placeholder={nodeLabels[type]} />
           </label>}
           <div className="drama-node-group-fields">{groupFields.map(([field, label]) =>
             <label className="drama-node-field" key={field}>{label}
-              <Input name={field} defaultValue={base?.[field] ?? group?.[field] ?? ''} />
+              <Input name={field} defaultValue={retainedDraft?.values.get(field) ?? base?.[field] ?? group?.[field] ?? ''} />
             </label>)}</div>
         </details>
       </fieldset>
@@ -1213,7 +1238,7 @@ function NodeEditor({
       <p className="drama-node-editor-hint" role="status">{unavailable}</p>}
     {error && <p className="drama-node-form-error" role="alert">{error}</p>}
     <div className="drama-node-editor-footer">
-      <Button size="sm" disabled={saving} onClick={close}>取消</Button>
+      <Button size="sm" disabled={saving} onClick={discardDraft}>取消</Button>
       <Button size="sm" type="submit" variant={edit && !dirty ? 'outline' : 'primary'} disabled={saving || blocked}>
         {saving ? '正在保存' : edit ? '保存修改' : duplicate ? '保存副本' : base ? '保存新版本' : '创建节点'}
       </Button>

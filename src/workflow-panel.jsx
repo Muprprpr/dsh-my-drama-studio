@@ -18,6 +18,11 @@ const sessionStatuses = {
   running: '本会话 Agent 执行中',
   failed: '本会话执行失败',
 }
+const capabilityLabels = {
+  ready: 'Ready', missing: 'Missing', 'user-modified': 'User Modified',
+  'update-available': 'Update Available', 'user-owned': 'User Owned',
+  conflict: 'Conflict', invalid: 'Invalid', blocked: 'Blocked', custom: 'Custom',
+}
 const markdownLabels = {
   code: {
     copyLabel: '复制', copiedLabel: '已复制',
@@ -135,6 +140,39 @@ function selectedRefs(groups, choices) {
   })
 }
 
+function CapabilityStatus({ capabilities, stages }) {
+  if (!capabilities) return null
+  const { ready, status, packageVersion, error } = capabilities
+  const heading = 'Workflow Capabilities ' + capabilityLabels[status]
+  const details = !ready || stages.some(({ files }) =>
+    [files.skillAsset, files.harnessAsset, ...files.resourceAssets].some(asset => asset.status !== 'ready'))
+  if (!details) return <p className="drama-workflow-capabilities" data-testid="drama-workflow-capabilities">{heading}</p>
+  return <details className="drama-workflow-capabilities" data-testid="drama-workflow-capabilities">
+    <summary>{heading}</summary>
+    {error && <p role="alert">{error}</p>}
+    {packageVersion && <p>内置资源 v{packageVersion}</p>}
+    <ul>
+      {stages.map(({ id, name, files }) => <li key={id}>
+        <strong>{name}</strong>
+        <p>Skill {files.skillName}{files.skillSource && ' · ' + files.skillSource} · {capabilityLabels[files.skillAsset.status]}</p>
+        <CapabilityFile file={files.skillAsset} />
+        {files.resourceAssets.map(resource => <React.Fragment key={resource.path}>
+          <p>Skill 附属文件 · {capabilityLabels[resource.status]}</p>
+          <CapabilityFile file={resource} />
+        </React.Fragment>)}
+        <p>Harness · {capabilityLabels[files.harnessAsset.status]}</p>
+        <CapabilityFile file={files.harnessAsset} />
+      </li>)}
+    </ul>
+  </details>
+}
+
+function CapabilityFile({ file }) {
+  return <p>{file.path}{file.hash && <> · <code title={file.hash}>{file.hash}</code></>}
+    {(file.error || file.note) && <><br />{file.error || file.note}</>}
+  </p>
+}
+
 export function WorkflowProgress({ session, refreshSession, openArtifacts, openCanvas, nativeRunning }) {
   const { ticket, status: { sessionId, workspaceId } } = session
   const { view, error: loadError } = useWorkflowView(session, refreshSession)
@@ -229,6 +267,7 @@ export function WorkflowProgress({ session, refreshSession, openArtifacts, openC
             {stage.id === finalStage ? '生成成片验收包' : '生成交接预览'}
           </Button>}
       </div>
+      <CapabilityStatus capabilities={view.capabilities} stages={stages} />
       {running && feedback !== runningMessage && <div className="drama-workflow-feedback">
         <p role="status">{runningMessage}</p>
       </div>}
@@ -388,14 +427,6 @@ export function WorkflowArtifacts({ session, workspaceTitle, useSessions, refres
             </div>}
           </div>
         </> : <p className="drama-artifacts-empty">此阶段还没有可预览的产物。</p>}
-        {stage.files && (!stage.files.skillReady || !stage.files.harnessReady) && <details className="drama-artifact-versions">
-          <summary>全局能力文件</summary>
-          <dl className="drama-handoff-metadata">
-            <dt>Skill</dt><dd>{stage.files.skillPath}</dd>
-            <dt>Harness</dt><dd>{stage.files.harnessPath}</dd>
-          </dl>
-          {stage.files.issues?.map(issue => <p key={issue}>{issue}</p>)}
-        </details>}
       </>}
     </div>
   </section>

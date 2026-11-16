@@ -80,7 +80,7 @@ function usePositions(key) {
 export function CanvasViewport({
   snapshot, filters, setFilters, append, mutate, aiRunning, mediaURL, uploadFile,
   submitGeneration, changeTask, queryCanvas, generationProfiles = [], generationDefaults,
-  providerVersion, providerSettingsReady,
+  providerVersion, providerSettingsReady, textDrafts,
 }) {
   const { nodes, edges, hasMore, status, tasks = [], referenceNodes = [], lockedNodeIds = [] } = snapshot
   const [positions, setPositions] = usePositions(`drama-layout:${status.canvasId}:${status.sessionId}`)
@@ -197,6 +197,7 @@ export function CanvasViewport({
       uploadReference: file => createMedia(file, undefined, false),
       attachAsset: asset => asset.deleted || asset.id === draft.id ? createAssetNode(asset) : asset,
       reportSaveError: setEdgeError,
+      textDrafts,
       finish: id => finishEdit(draft.id, id),
       close: () => draft.edit ? setSelected([]) : closeDraft(draft.id),
     }

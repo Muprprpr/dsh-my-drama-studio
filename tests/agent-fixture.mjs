@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
-import { access, copyFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { access, copyFile, cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
@@ -490,7 +490,8 @@ async function until(check, signal, label, timeout = 15_000) {
 async function runFixture() {
   assert.equal(process.platform, 'win32', 'Requires Windows x64 and the native DSH runtime')
   const file = fileURLToPath(import.meta.url)
-  const build = resolve(dirname(file), '..', 'dist')
+  const repo = resolve(dirname(file), '..')
+  const build = join(repo, 'dist')
   const sourceHost = join(build, 'host.js')
   const sourceKernel = process.env.DRAMA_UIUX_STUDIO_EXE ?? join(build, 'studio.exe')
   await access(sourceHost)
@@ -508,13 +509,17 @@ async function runFixture() {
     const schema = createRequire(npmCLI).resolve('@deepseek-ai/schemastery/package.json')
     await symlink(dirname(dirname(dirname(schema))), join(root, 'node_modules'), 'junction')
   }
-  const host = join(root, 'host.js')
+  const output = join(root, 'dist')
+  await mkdir(output)
+  const host = join(output, 'host.js')
   await copyFile(sourceHost, host)
-  await copyFile(sourceKernel, join(root, 'studio.exe'))
+  await copyFile(join(build, 'client.js'), join(output, 'client.js'))
+  await copyFile(sourceKernel, join(output, 'studio.exe'))
+  await cp(join(repo, 'resources'), join(root, 'resources'), { recursive: true })
   const overlay = join(root, 'fixture.yml')
   const fixture = join(root, 'agent-fixture.mjs')
   await copyFile(file, fixture)
-  await writeFile(join(root, 'package.json'), JSON.stringify({ name, type: 'module' }))
+  await copyFile(join(repo, 'package.json'), join(root, 'package.json'))
   const yaml = path => JSON.stringify(path.replaceAll('\\', '/'))
   await writeFile(overlay, `- insert:\n    - id: my-drama-studio\n      name: ${yaml(host)}\n    - id: ${name}\n      name: ${yaml(fixture)}\n`)
 

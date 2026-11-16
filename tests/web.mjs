@@ -2,11 +2,12 @@ import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { copyFile, mkdir, mkdtemp, readFile, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
+import { copyFile, cp, mkdir, mkdtemp, readFile, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { createServer as createHTTPServer } from 'node:http'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
@@ -201,6 +202,14 @@ export async function apply(ctx) {
       for (const gate of workflowHolds.values()) gate.resolve()
     }
   })
+  const resumed = await readFile(join(process.env.DSH_HOME, 'fixture-sessions.json'), 'utf8').catch(error => {
+    if (error.code !== 'ENOENT') throw error
+    return ''
+  })
+  if (resumed) {
+    console.info('[drama-web-fixture] sessions ' + resumed)
+    return
+  }
   const records = []
   for (const workspaceName of ['Studio Shared', 'Studio Other']) {
     const path = join(process.env.DSH_HOME, workspaceName)
@@ -293,7 +302,7 @@ async function screenshot(page, file) {
   await page.screenshot({ path: join(evidence, file), animations: 'disabled' })
 }
 
-async function withWeb(run, { providerFixture = false, realWorkflow = false, workflowFixture = false } = {}) {
+async function withWeb(run, { providerFixture = false, realWorkflow = false, workflowFixture = false, afterRestart } = {}) {
   assert.ok(chrome, 'Install Chrome or Edge for native DSH Web verification')
   await mkdir(runtime, { recursive: true })
   const homeRoot = workflowFixture ? tmpdir() : runtime
@@ -323,6 +332,7 @@ async function withWeb(run, { providerFixture = false, realWorkflow = false, wor
     for (const file of ['package.json', 'dsh.bundle.patch', 'dist/host.js', 'dist/client.js']) {
       await copyFile(join(root, file), join(entryRoot, file))
     }
+    await cp(join(root, 'resources'), join(entryRoot, 'resources'), { recursive: true })
     const executable = join(entryRoot, 'dist', 'studio.exe')
     if (providerFixture) {
       const compile = spawnSync('go.exe', ['test', '-c', '-o', executable, './studio'], {
@@ -347,9 +357,29 @@ exit $LASTEXITCODE`
     : isolatedPlugin ? ['pwsh.exe', ['-NoProfile', '-Command', launch]]
     : ['powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', join(root, 'scripts', 'dev.ps1'),
       '-Port', String(port), '-NoOpen']]
-  const dsh = spawn(shell, args, {
-    cwd: workflowFixture ? home : root, windowsHide: true, env,
-  })
+  const launchOptions = { cwd: workflowFixture ? home : root, env, home, shell, args, realWorkflow }
+  let passed = false
+  try {
+    const records = await withWebHost(run, launchOptions)
+    if (afterRestart) {
+      await writeFile(join(home, 'fixture-sessions.json'), JSON.stringify(records))
+      await rm(join(home, 'test-stop'), { force: true })
+      await withWebHost(afterRestart, { ...launchOptions, resumed: true })
+    }
+    passed = true
+  } finally {
+    if (!isolatedPlugin) await unlink(entryRoot)
+    if (passed) {
+      const target = resolve(home)
+      assert.equal(dirname(target), resolve(homeRoot))
+      assert.ok(basename(target).startsWith(homePrefix))
+      await rm(target, { recursive: true, maxRetries: 4, retryDelay: 120 })
+    }
+  }
+}
+
+async function withWebHost(run, { cwd, env, home, shell, args, realWorkflow, resumed }) {
+  const dsh = spawn(shell, args, { cwd, windowsHide: true, env })
   let output = ''
   let launchError
   dsh.on('error', error => { launchError = error })
@@ -358,7 +388,6 @@ exit $LASTEXITCODE`
   let browser, page
   const pageErrors = []
   const consoleErrors = []
-  let passed = false
   try {
     let url, records
     const deadline = Date.now() + 30_000
@@ -379,10 +408,10 @@ exit $LASTEXITCODE`
     page.on('console', message => {
       if (message.type() === 'error') consoleErrors.push(message.text())
     })
-    await initialize(page, url)
+    await initialize(page, url, resumed)
     await run({ page, context, url, records, home })
     assert.deepEqual(pageErrors, [])
-    passed = true
+    return records
   } catch (error) {
     await page?.screenshot({ path: join(home, 'failure.png'), animations: 'disabled' }).catch(() => {})
     const diagnostics = `${error.stack}\nTest profile: ${home}\nBrowser errors:\n${[...pageErrors, ...consoleErrors].join('\n')}\nDSH output:\n${output.split(/\r?\n/u).slice(0, 25).join('\n')}`
@@ -402,21 +431,14 @@ exit $LASTEXITCODE`
     dsh.stderr.destroy()
     dsh.unref()
     await closingBrowser
-    if (!isolatedPlugin) await unlink(entryRoot)
-    if (passed) {
-      const target = resolve(home)
-      assert.equal(dirname(target), resolve(homeRoot))
-      assert.ok(basename(target).startsWith(homePrefix))
-      await rm(target, { recursive: true, maxRetries: 4, retryDelay: 120 })
-    }
   }
 }
 
-async function initialize(page, url) {
+async function initialize(page, url, resumed = false) {
   page.setDefaultTimeout(10_000)
   await page.goto(url, { waitUntil: 'domcontentloaded' })
   const onboarding = page.getByRole('button', { name: 'Continue', exact: true })
-  if (new URL(url).search) await onboarding.click()
+  if (new URL(url).search && !resumed) await onboarding.click()
   else {
     await page.getByLabel('Sessions', { exact: true }).getByText('Studio Shared', { exact: true }).waitFor()
     if (await onboarding.isVisible()) await onboarding.click()
@@ -611,7 +633,8 @@ test('Workflow dock iterates, previews, and explicitly hands off in the native c
     assert.equal(initial.id, 'drama-production')
     assert.equal(initial.session.status, 'normal')
     assert.deepEqual(initial.stages.map(stage => stage.id), fixedWorkflowIds)
-    assert.ok(initial.stages.every(stage => stage.status === 'not_started' && !stage.files.skillReady))
+    assert.ok(initial.stages.every(stage => stage.status === 'not_started' && stage.files.skillReady && stage.files.harnessReady))
+    await page.getByTestId('drama-workflow-capabilities').getByText('Workflow Capabilities Ready', { exact: true }).waitFor()
     await page.setViewportSize({ width: 815, height: 850 })
     assert.ok(await pane.evaluate(element => element.scrollWidth <= element.clientWidth + 1), 'narrow workflow overflowed')
     await page.setViewportSize({ width: 1600, height: 1000 })
@@ -706,6 +729,12 @@ test('Workflow dock iterates, previews, and explicitly hands off in the native c
 
     await page.reload({ waitUntil: 'domcontentloaded' })
     const reloaded = await openWorkflow(page, a)
+    const capabilities = page.getByTestId('drama-workflow-capabilities')
+    await capabilities.locator('summary').click()
+    const storyboardFiles = capabilities.getByRole('listitem').filter({ hasText: '分镜制作' })
+    await storyboardFiles.getByText('Skill drama-storyboard · user-dsh · User Modified', { exact: true }).waitFor()
+    await storyboardFiles.getByText('Harness · User Modified', { exact: true }).waitFor()
+    await capabilities.locator('summary').click()
     assert.equal((await get()).session.activeStageId, 'asset-binding')
     assert.equal((await get()).handoffs[0].handoffId, handoff.handoffId)
     assert.equal((await get()).artifacts.filter(item => item.artifactId === artifactId).length, 3)
@@ -1839,6 +1868,133 @@ test('U3 shot filter, group and node collapse preserve saved contents', { timeou
   })
 })
 
+test('Native Session editors keep independent drafts through refresh, activity and Host restart', { timeout: 95_000 }, async () => {
+  const drafts = ['SESSION_A_UNSAVED_MARKER', 'SESSION_B_UNSAVED_MARKER']
+  const notes = drafts.map((_, index) => ({
+    id: randomUUID(), type: 'note', content: { title: 'Draft note ' + index, description: 'Original body ' + index },
+  }))
+  const savedOperations = []
+  const busy = page => page.getByRole('status').getByText('AI 工作中', { exact: true })
+  async function show(page, record) {
+    await select(page, record)
+    const active = panel(page).and(page.locator(`[data-session-id="${record.sessionId}"][data-canvas-id]:visible`))
+    if (!(await active.isVisible())) await drama(page).click()
+    await active.waitFor()
+    await active.locator('.drama-flow').waitFor()
+  }
+  async function edit(page, index) {
+    const note = card(page, notes[index].id)
+    const form = note.getByRole('form', { name: '编辑节点', exact: true })
+    if (!(await form.isVisible())) {
+      await fit(page)
+      await note.locator('.drama-node-titlebar').click()
+    }
+    await form.waitFor()
+    return {
+      body: form.getByRole('textbox', { name: '正文', exact: true }),
+      save: form.getByRole('button', { name: '保存修改', exact: true }),
+      form,
+    }
+  }
+  async function assertSaved(page, records, home, readCards) {
+    const db = new DatabaseSync(join(home, records[0].workspaceName, '.drama-studio', 'studio.db'), { readOnly: true })
+    try {
+      for (const [index, note] of notes.entries()) {
+        const record = records[index]
+        if (readCards) await show(page, record)
+        const ticket = await ticketFor(page, record.sessionId)
+        assert.equal((await query(page, ticket, { id: note.id })).nodes[0].content.description, drafts[index])
+        if (readCards) await card(page, note.id).getByText(drafts[index], { exact: true }).waitFor()
+        const row = db.prepare('SELECT created_by, content FROM nodes WHERE id = ?').get(note.id)
+        assert.equal(row.created_by, record.sessionId)
+        assert.equal(JSON.parse(row.content).description, drafts[index])
+        const operation = db.prepare('SELECT session_id, action FROM operations WHERE id = ?').get(savedOperations[index])
+        assert.equal(operation.session_id, record.sessionId)
+        assert.equal(operation.action, 'update_node')
+      }
+    } finally {
+      db.close()
+    }
+  }
+  await withWeb(async ({ page, url, records, home }) => {
+    const [a, b] = records
+    const tickets = []
+    for (const [index, record] of [a, b].entries()) {
+      await show(page, record)
+      tickets[index] = await ticketFor(page, record.sessionId)
+      await append(page, tickets[index], [notes[index]])
+    }
+    const updates = []
+    page.on('request', entry => {
+      if (!entry.url().endsWith('/api/drama/operation') || entry.method() !== 'POST') return
+      const { action, ticket, data } = entry.postDataJSON()
+      if (action === 'update_node' && notes.some(note => note.id === data.id)) {
+        updates.push({ owner: tickets.indexOf(ticket), id: data.id, description: data.content.description, operationId: data.operationId })
+      }
+    })
+
+    await show(page, a)
+    const editorA = await edit(page, 0)
+    await editorA.body.selectText()
+    const savedA = (await query(page, tickets[0], { id: notes[0].id })).nodes[0]
+    // A real shared-Canvas metadata update forces a clean form refresh between select-all and insertText.
+    const title = 'Metadata saved from Session B'
+    await operate(page, tickets[1], 'update_node', {
+      operationId: randomUUID(), id: savedA.id, revision: savedA.revision, episodeId: savedA.episodeId,
+      sceneId: savedA.sceneId, shotId: savedA.shotId, content: { ...savedA.content, title },
+    })
+    await poll(() => editorA.body.evaluate(input => input.form.elements.namedItem('title').value === 'Metadata saved from Session B'),
+      'note editor did not reflect the newer revision')
+    assert.deepEqual(await editorA.body.evaluate(input => [input === document.activeElement, input.selectionStart, input.selectionEnd]),
+      [true, 0, savedA.content.description.length])
+    await page.keyboard.insertText(drafts[0])
+    assert.equal(await editorA.body.inputValue(), drafts[0])
+
+    await show(page, b)
+    const editorB = await edit(page, 1)
+    assert.equal(await editorB.body.inputValue(), notes[1].content.description)
+    await editorB.body.fill(drafts[1])
+    assert.equal(await editorB.body.inputValue(), drafts[1])
+    assert.equal(await nativeActivity(home, a, 'start'), 'running')
+    await busy(page).waitFor()
+    await poll(() => editorB.save.isDisabled(), 'B draft did not lock while A was running')
+    assert.equal(await editorB.body.inputValue(), drafts[1])
+    await show(page, a)
+    await busy(page).waitFor()
+    const returnedA = await edit(page, 0)
+    assert.equal(await returnedA.body.inputValue(), drafts[0])
+    assert.ok(await returnedA.save.isDisabled())
+    assert.equal(await nativeActivity(home, b, 'start'), 'running')
+    await nativeActivity(home, a, 'finish')
+    await poll(async () => (await nativeActivity(home, a, 'status')) === 'idle', 'A did not finish')
+    assert.equal(await nativeActivity(home, b, 'status'), 'running')
+    assert.ok(await returnedA.save.isDisabled())
+    await nativeActivity(home, b, 'cancel')
+    await busy(page).waitFor({ state: 'hidden' })
+
+    assert.deepEqual(updates.map(update => update.description), [notes[0].content.description])
+    for (const [index, record] of [a, b].entries()) {
+      assert.equal((await query(page, tickets[index], { id: notes[index].id })).nodes[0].content.description,
+        notes[index].content.description)
+      await show(page, record)
+      const editor = await edit(page, index)
+      assert.equal(await editor.body.inputValue(), drafts[index])
+      await editor.save.click()
+      await editor.form.waitFor({ state: 'hidden' })
+      const saved = updates.at(-1)
+      assert.deepEqual({ owner: saved.owner, id: saved.id, description: saved.description },
+        { owner: index, id: notes[index].id, description: drafts[index] })
+      savedOperations[index] = saved.operationId
+    }
+    await page.reload({ waitUntil: 'domcontentloaded' })
+    await initialize(page, new URL(url).origin)
+    await assertSaved(page, records, home, true)
+  }, { afterRestart: async ({ page, records, home }) => {
+    await assertSaved(page, records, home)
+    console.info('Session drafts PASS: retained selection after Canvas refresh, isolated DOM and requests, Agent activity, SQLite, page reload and Host restart')
+  } })
+})
+
 test('Native human CRUD follows live Workspace Agent activity', { timeout: 100_000 }, async () => {
   await withWeb(async ({ page, context, url, records, home }) => {
     const [a, b, unbound, other] = records
@@ -1937,6 +2093,7 @@ test('Native human CRUD follows live Workspace Agent activity', { timeout: 100_0
     const unsaved = await edit(peer, original.id)
     const draftText = 'AI 在保存前启动，这段未保存正文仍须保留。'
     await body(unsaved).fill(draftText)
+    assert.equal(await body(unsaved).inputValue(), draftText)
 
     let linkTarget = await current(peer, bTicket, linked.id)
     assert.equal((await mutation(peer, bTicket, 'update_edge', {
@@ -2798,7 +2955,11 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
         'closing the full prompt dialog lost the long edit')
       assert.deepEqual(await nodeGeometry(first), zoomedGeometry, 'the prompt dialog moved the node or its handles')
       await editor.getByRole('button', { name: '展开提示词', exact: true }).click()
-      await expandedPrompt.fill(prompt)
+      await expandedPrompt.fill(prompt + '甲乙')
+      await expandedPrompt.press('Control+End')
+      await expandedPrompt.press('Backspace')
+      await expandedPrompt.press('Backspace')
+      await poll(async () => (await expandedPrompt.innerText()) === prompt, 'Backspace did not edit the expanded prompt')
       await poll(async () => (await query(page, ticket, { id: first.id })).nodes[0].content.prompt === prompt,
         'changing the expanded prompt did not autosave')
       await expandedPrompt.press('Control+End')
@@ -2842,11 +3003,46 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
         throw new Error(`${error.message}. Before ${JSON.stringify(beforeBackspace)}. After ${JSON.stringify(await promptSelection())}`)
       }
       assert.ok(!(await query(page, ticket, { id: first.id })).nodes[0].deleted)
+      const savedInlinePrompt = async () => (await query(page, ticket, { id: first.id })).nodes[0].content.prompt
+      await poll(async () => (await savedInlinePrompt()) === prompt, 'the Backspace edit did not autosave')
+      await promptBox.fill(prompt + '甲乙')
+      await poll(async () => (await savedInlinePrompt()) === prompt + '甲乙', 'the Backspace race fixture did not save')
+      await promptBox.press('Control+Home')
+      await poll(() => promptBox.evaluate(input => input.editor.state.selection.$head.parentOffset === 0),
+        'ProseMirror did not receive the start caret')
+      await promptBox.evaluate(input => {
+        // Hold Chromium's asynchronous notification through the next Backspace.
+        input.holdSelectionChange = event => {
+          if (document.activeElement === input) event.stopImmediatePropagation()
+        }
+        document.addEventListener('selectionchange', input.holdSelectionChange, true)
+      })
+      try {
+        await page.keyboard.press('Control+End')
+        assert.deepEqual(await promptSelection(), {
+          focused: true, collapsed: true, untilCaret: prompt + '甲乙', value: prompt + '甲乙',
+        })
+        assert.equal(await promptBox.evaluate(input => input.editor.state.selection.$head.parentOffset), 0,
+          'the ProseMirror selection should still be at the start before Backspace')
+        await page.keyboard.press('Backspace')
+        await poll(async () => (await promptBox.innerText()) === prompt + '甲', 'Backspace ignored the visible end caret')
+        await page.keyboard.press('Backspace')
+        await poll(async () => (await promptBox.innerText()) === prompt, 'consecutive Backspace did not remove the suffix')
+        assert.equal(await promptBox.evaluate(input => input.editor.getText()), prompt)
+      } finally {
+        await promptBox.evaluate(input => {
+          document.removeEventListener('selectionchange', input.holdSelectionChange, true)
+          delete input.holdSelectionChange
+        })
+      }
+      await poll(async () => (await savedInlinePrompt()) === prompt, 'consecutive Backspace did not autosave')
+      await card(page, second.id).locator('.drama-node-titlebar').click()
+      await formFor(second).waitFor()
+      await firstBox.click()
+      assert.equal(await promptBox.innerText(), prompt, 'switching nodes lost the saved Backspace edit')
       const inlineBase = prompt.replace('固定中景', '固定远景')
       const insertAt = inlineBase.indexOf('固定远景')
       const withCandidate = text => inlineBase.slice(0, insertAt) + text + inlineBase.slice(insertAt)
-      const savedInlinePrompt = async () => (await query(page, ticket, { id: first.id })).nodes[0].content.prompt
-      await poll(async () => (await savedInlinePrompt()) === prompt, 'preparing the inline IME fixture did not save')
       const canvasOperation = '**/api/drama/operation'
       const saveGate = Promise.withResolvers()
       let savePending = false
@@ -2929,6 +3125,12 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       await poll(async () => (await readViewport()) !== originalViewport, 'focus mode did not center the selected node')
       const focusedGeometry = await nodeGeometry(first)
       assert.deepEqual(focusedGeometry, beforeFocus, 'focus mode moved the node or its handles')
+      await promptBox.fill(prompt + '尾')
+      await poll(async () => (await savedInlinePrompt()) === prompt + '尾', 'the focused prompt suffix did not autosave')
+      await promptBox.press('Control+End')
+      await promptBox.press('Backspace')
+      await poll(async () => (await promptBox.innerText()) === prompt && (await savedInlinePrompt()) === prompt,
+        'Backspace did not edit and save the focused prompt')
       const duration = editor.getByRole('button', { name: '时长（秒）', exact: true })
       await duration.click()
       const parameterPopover = page.getByRole('dialog', { name: '时长（秒）', exact: true })
@@ -3250,7 +3452,7 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
       await page.keyboard.press('Escape')
       await narrowDurationPopover.waitFor({ state: 'hidden' })
       await screenshot(page, 'compact-editor-narrow.png')
-      console.info(`Node editor PASS: ${editorGeometry.width}×${editorGeometry.height} CSS px, prompt/IME autosave, focus/viewport, parameter popover and real PNG request`)
+      console.info(`Node editor PASS: ${editorGeometry.width}×${editorGeometry.height} CSS px, Backspace caret race, prompt/IME autosave, focus/viewport, parameter popover and real PNG request`)
     })
   } finally {
     await new Promise(resolve => endpoint.close(resolve))

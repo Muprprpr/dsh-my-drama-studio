@@ -2,7 +2,8 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
-import { copyFile, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { copyFile, cp, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
@@ -327,8 +328,8 @@ async function verify(ctx, signal) {
     const invalidStage = 'shooting-script'
     const testSkill = join(home, 'skills', 'drama-' + invalidStage, 'SKILL.md')
     const testHarness = join(home, 'drama-studio', 'workflows', 'drama-production', 'stages', invalidStage, 'harness.md')
-    async function rejectsInvalidStage(expected, status) {
-      const before = await read(a2)
+    async function rejectsInvalidStage(expected, status, before) {
+      before ??= await read(a2)
       const rejected = await op(a2, 'workflow_activate', { stageId: invalidStage })
       assert.equal(rejected.ok, false)
       if (status) assert.equal(rejected.status, status)
@@ -374,14 +375,18 @@ async function verify(ctx, signal) {
     await writeFile(testSkill, '---\nname: invalid/name\ndescription: Fixture invalid Skill\n---\nBroken metadata.\n')
     await rejectsInvalidStage(/Skill/u, 409)
     await installStage(home, invalidStage, 'V1')
+    const beforeRace = await read(a2)
     const target = beforeActivation.agent
     const registry = ctx.agentPresets.serviceFor(target, 'skills') ?? ctx.get('skills')
     const original = registry?.[Symbol.for('cordis.original')] ?? registry
     const get = original.get
+    const targetName = 'drama-' + invalidStage
+    await until(async () => (await get.call(original, targetName, { scope: target, signal }))?.name === targetName,
+      signal, 'restored Skill in native registry')
     let replaced = false
     original.get = async function (skillName, options) {
       const definition = await get.call(this, skillName, options)
-      if (!replaced && options?.scope === target && skillName === 'drama-' + invalidStage) {
+      if (!replaced && options?.scope === target && skillName === targetName) {
         assert.equal(definition?.name, skillName)
         replaced = true
         const replacement = testSkill + '.replacement'
@@ -391,7 +396,7 @@ async function verify(ctx, signal) {
       return definition
     }
     try {
-      await rejectsInvalidStage(/Skill 文件在激活时发生变化/u, 409)
+      await rejectsInvalidStage(/Skill 文件在激活时发生变化/u, 409, beforeRace)
       assert.equal(replaced, true)
     } finally {
       original.get = get
@@ -537,18 +542,28 @@ async function runFixture() {
   assert.equal(process.arch, 'x64')
   const entry = fileURLToPath(import.meta.url)
   const repo = resolve(dirname(entry), '..')
-  const cli = resolve(process.env.DRAMA_DSH_CLI ?? join(repo, '.runtime', 'dsh-rc3', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'))
+  const localCLI = join(repo, '.runtime', 'dsh-rc3', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+  const npmCLI = process.env.DRAMA_DSH_CLI ?? (existsSync(localCLI) ? localCLI : undefined)
+  const installation = join(process.env.LOCALAPPDATA, 'Programs', 'DeepSeek Harness')
+  const executable = npmCLI ? process.execPath : join(installation, 'DeepSeek Harness.exe')
+  const cli = npmCLI ? resolve(npmCLI) : join(installation, 'resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/cli.js')
+  const args = npmCLI ? [cli] : ['--expose-internals', cli]
   const root = await mkdtemp(join(tmpdir(), 'drama-workflow-lifecycle-'))
   try {
-    const { resolve: resolvePackage } = createRequire(cli)
-    const schema = resolvePackage('@deepseek-ai/schemastery/package.json')
-    await symlink(dirname(dirname(dirname(schema))), join(root, 'node_modules'), 'junction')
-    const host = join(root, 'host.js')
+    if (npmCLI) {
+      const schema = createRequire(cli).resolve('@deepseek-ai/schemastery/package.json')
+      await symlink(dirname(dirname(dirname(schema))), join(root, 'node_modules'), 'junction')
+    }
+    const output = join(root, 'dist')
+    await mkdir(output)
+    const host = join(output, 'host.js')
     const fixture = join(root, 'workflow-lifecycle.mjs')
     await copyFile(join(repo, 'dist', 'host.js'), host)
-    await copyFile(process.env.DRAMA_UIUX_STUDIO_EXE ?? join(repo, 'dist', 'studio.exe'), join(root, 'studio.exe'))
+    await copyFile(join(repo, 'dist', 'client.js'), join(output, 'client.js'))
+    await copyFile(process.env.DRAMA_UIUX_STUDIO_EXE ?? join(repo, 'dist', 'studio.exe'), join(output, 'studio.exe'))
+    await cp(join(repo, 'resources'), join(root, 'resources'), { recursive: true })
     await copyFile(entry, fixture)
-    await writeFile(join(root, 'package.json'), '{"type":"module"}\n')
+    await copyFile(join(repo, 'package.json'), join(root, 'package.json'))
     const overlay = join(root, 'fixture.yml')
     const pathYAML = path => JSON.stringify(path.replaceAll('\\', '/'))
     await writeFile(overlay, [
@@ -559,10 +574,11 @@ async function runFixture() {
       '      name: ' + pathYAML(fixture),
     ].join('\n') + '\n')
     for (const milestone of ['wire', 'restart']) {
-      const child = spawn(process.execPath, [cli, 'web', '--patch', overlay, '--host', '127.0.0.1', '--port', '0', '--no-open'], {
+      const child = spawn(executable, [...args, 'web', '--patch', overlay, '--host', '127.0.0.1', '--port', '0', '--no-open'], {
         windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
         env: {
           ...process.env, DRAMA_DSH_CLI: cli, DSH_HOME: join(root, 'home'), DSH_AGENTS_HOME: join(root, 'agents'),
+          ...(!npmCLI && { ELECTRON_RUN_AS_NODE: '1' }),
           DSH_TELEMETRY_DISABLED: '1', DSH_TOOLS_MODE: 'native', DEEPSEEK_API_KEY: '', DRAMA_REAL_WORKFLOW: '',
         },
       })

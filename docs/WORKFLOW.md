@@ -4,34 +4,53 @@
 
 项目会话在原生聊天输入框上方显示固定流程。点击阶段时，Studio 读取对应的全局 Harness 和 Skill，并在当前 Session 的新激活记录中固定版本。随后使用原生聊天框讨论、修改和生成草稿。阶段回合执行期间，当前 Session 可以查看产物，切换和退出返回 409。回合结算后恢复操作，其他 Session 仍可独立工作。
 
-| 阶段 ID | 名称 |
-| --- | --- |
-| `content-analysis` | 内容分析 |
-| `shooting-script` | 拍摄脚本制作 |
-| `storyboard` | 分镜制作 |
-| `asset-binding` | 素材抽卡与绑定 |
-| `video-deployment` | 视频节点部署 |
-| `video-generation` | 视频生成 |
-| `final-review` | 成片验收 |
+| 阶段 ID | 名称 | 默认 Skill | Harness 相对工作流目录 |
+| --- | --- | --- | --- |
+| `content-analysis` | 内容分析 | `drama-content-analysis` | `stages/content-analysis/harness.md` |
+| `shooting-script` | 拍摄脚本制作 | `drama-shooting-script` | `stages/shooting-script/harness.md` |
+| `storyboard` | 分镜制作 | `drama-storyboard` | `stages/storyboard/harness.md` |
+| `asset-binding` | 素材抽卡与绑定 | `drama-asset-binding` | `stages/asset-binding/harness.md` |
+| `video-deployment` | 视频节点部署 | `drama-video-deployment` | `stages/video-deployment/harness.md` |
+| `video-generation` | 视频生成 | `drama-video-generation` | `stages/video-generation/harness.md` |
+| `final-review` | 成片验收 | `drama-final-review` | `stages/final-review/harness.md` |
 
 ### 全局装填
 
-在启动 Studio 的 DSH Host 所使用的 `DSH_HOME` 下装填一次。将 `<stage-id>` 替换为上表 ID。
+仓库和 npm 包用 `resources/manifest.json` 分发 `resources/skills/` 及 `resources/workflows/` 中的官方文件。Host 加载插件时，使用原生 Profile 上下文解析出的 Home 装填。全局文件按 Home 共享，Workspace 记录各自的进度、产物、交接和会话。
 
 ```text
 DSH_HOME/skills/drama-<stage-id>/SKILL.md
 DSH_HOME/drama-studio/workflows/drama-production/stages/<stage-id>/harness.md
 ```
 
-`SKILL.md` 使用 DSH 原生 frontmatter，`name` 为 `drama-<stage-id>`，并填写 `description`。正文描述专业工作方法。快照接受最大 512 KiB 的 UTF-8 Skill 源文件。Harness 写阶段目标、允许的输入和交付约束，使用非空 UTF-8 文本，大小上限为 64 KiB。Studio 沿用当前预设下的原生 Skill 目录，使用 DSH 用户目录的 Skill。Agent 可以使用已确认输入、查询素材和保存当前阶段的独立草稿。创作决策和制作约束随所选产物进入交接包。
+`DSH_HOME/drama-studio/managed-assets.json` 保存插件版本和文件 SHA-256。每次 Host 加载时检查缺失文件并恢复官方内容。与包内内容一致的现有文件可直接登记。仍与上一次安装 Hash 一致的受管文件可随插件升级，用户编辑过的受管文件和初次装填前已有的异版文件均会保留。Workflow Panel 显示当前 Skill、原生来源、Harness、Hash 和具体文件问题。装填失败时，普通 DSH 聊天仍可使用。
 
-激活快照保存渲染后的完整 Skill、Harness 正文、相对路径、原始文件和渲染后 Skill 的 SHA-256。激活代数、时间及快照引用由 Workspace SQLite 保存。重复点击当前阶段继续用原来的快照。全局文件更新后，新激活采用新版本。Skill 指向的 references、templates、脚本和其他外部文件仍按各自路径读取，阶段规则和关键模板内容应写进已快照的两个正文。发布方应一起更新同一阶段的两个文件。读取过程中发现文件变化时，激活失败并可重试。
+清单中的 `skill-resource` 使用同一本账本。比如 `drama-storyboard` 的 `references/`、`templates/` 和 `scripts/` 按原有目录结构装填，从 Skill 的原生 `resourceBase` 读取。已存在的同路径异版文件以 User Owned 显示，现有文件继续可用。更新后的目标已经与当前包逐字节一致、但账本仍记录旧 Hash 时，下次启动只补记账本。差异无法以旧 Hash 或当前包确认时，保留当前文件。
+
+`SKILL.md` 使用 DSH 原生 frontmatter。内置文件设置 `user-invocable: true`，让 Studio 通过原生目录读取正文，并用 `disable-model-invocation: true` 从模型的普通 Skill 目录和工具中排除。Studio 查询当前预设下的原生 Skill 目录，要求来源是 `user-dsh`，且真实路径匹配全局 `skills/<name>/SKILL.md`。查询省略 Workspace 路径，因此项目同名 Skill 不会改变阶段绑定。快照支持最大 512 KiB 的 UTF-8 Skill 源文件。Harness 需为非空 UTF-8 文本，大小上限为 64 KiB。
+
+### 自定义阶段 Skill
+
+可直接编辑上表 Skill 对应的全局 `SKILL.md` 或 Harness。也可以在 `DSH_HOME/skills/<name>/SKILL.md` 下创建自己的 Skill，填写匹配目录的 `name` 和非空 `description`。建议使用与内置 Skill 相同的两个调用权限字段。自定义映射保存在 `DSH_HOME/drama-studio/workflows/drama-production/stage-skills.json`，可按下面的格式填写。
+
+```json
+{
+  "content-analysis": "my-custom-analysis",
+  "storyboard": "my-storyboard-rules"
+}
+```
+
+键使用上表的固定阶段 ID，值使用 DSH 的小写字母、数字和单短横线分隔的 Skill 名称。未列出的阶段使用默认映射。配置错误或映射 Skill 无法通过全局来源及权限检查时，Workflow 会展示问题并阻止相应的新激活。插件装填会保留该映射文件。
+
+### 激活快照
+
+激活快照保存渲染后的完整 Skill、Harness 正文、相对路径、原始文件和渲染后 Skill 的 SHA-256。激活代数、时间及快照引用由 Workspace SQLite 保存。重复点击当前阶段继续用原来的快照。全局文件更新后，新激活采用新版本。DSH 对 references、templates、脚本和其他附属文件执行实际读取时，使用当时的磁盘内容。激活期间修改 reference，后续回合可以读到更新内容，快照 ID、Skill 正文和 Harness 保持固定。对版本一致性有要求的阶段规则或模板内容应写进 Skill 或 Harness 正文。读取正文过程中发现文件变化时，激活失败并可重试。
 
 Host 用 DSH 的 `system-prompt/assemble` 装填当前激活，`agent/pre-step` 请求新序列以替换活动系统指令。每轮落盘其激活代数、快照 ID 与 Hash。锁定完整提示词的预设会在激活时返回错误。
 
 进入、切换或退出阶段时，SQLite 设置本次激活的过渡保护。首个新序列的实际模型回合成功后，Host 才能清除同一代数的保护。失败、取消或进程中断时保留待处理状态。等待期间，系统暂停自动压缩，并在用户执行 `/compact` 时提示先发送一条新阶段消息。原生追加日志、已有用户消息、回复、工具结果和旧摘要仍可保留。
 
-Studio 管理的阶段 Skill 通过阶段激活进入模型请求。项目会话的原生斜杠和 `skill` 工具会拒绝直接加载这些阶段名，并提示通过阶段按钮使用。其他 DSH Skills 继续按原生方式使用。
+Studio 管理的阶段 Skill 通过阶段激活进入模型请求。项目会话的原生斜杠和 `skill` 工具会拒绝直接加载这些阶段 Skill，并提示通过阶段按钮使用。其他 DSH Skills 继续按原生方式使用。Agent 可以使用已确认输入、查询素材和保存当前阶段的独立草稿。创作决策和制作约束随所选产物进入交接包。
 
 ## 草稿与正式交接
 

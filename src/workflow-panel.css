@@ -104,6 +104,23 @@
 .drama-workflow-feedback p {
   overflow-wrap: anywhere;
 }
+.drama-workflow-progress .drama-workflow-capabilities {
+  margin-block-start: 4px;
+  color: var(--dsw-alias-label-secondary);
+  overflow-wrap: anywhere;
+}
+.drama-workflow-capabilities summary {
+  cursor: pointer;
+}
+.drama-workflow-capabilities ul {
+  max-height: 12rem;
+  overflow: auto;
+  margin: 4px 0 0;
+  padding-inline-start: 20px;
+}
+.drama-workflow-capabilities li + li {
+  margin-block-start: 4px;
+}
 .drama-workflow-progress [role="alert"],
 .drama-artifacts-error,
 .drama-workflow-current[data-status="failed"] span {

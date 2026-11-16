@@ -1,10 +1,11 @@
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { open, realpath, stat } from 'node:fs/promises'
 import { createRequire } from 'node:module'
-import { relative, resolve } from 'node:path'
+import { resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { pathToFileURL } from 'node:url'
 import { StudioError } from './kernel.js'
+import { assetStatus, readStageSkills, sha256, skillResourceStatuses, skillTarget, stageIds, workflowTarget } from './capability-assets.js'
 
 const requestPrefix = 'drama-workflow:'
 const artifactTools = new Set(['drama_save_artifact', 'drama_workflow_artifact'])
@@ -14,10 +15,7 @@ const stageMarker = '[Drama Studio Workflow Stage]'
 const probeKey = Symbol('verify workflow system prompt support')
 const maxFileBytes = { Skill: 512 * 1024, Harness: 64 * 1024 }
 const generationStage = 'video-generation'
-const managedSkills = new Set([
-  'drama-content-analysis', 'drama-shooting-script', 'drama-storyboard', 'drama-asset-binding',
-  'drama-video-deployment', 'drama-video-generation', 'drama-final-review',
-])
+const managedSkills = new Set(stageIds.map(id => 'drama-' + id))
 const stageSkillError = '该 Skill 属于 Workflow 管理的阶段能力，请先切换到对应阶段。'
 const busyError = '当前阶段正在执行，请等待本轮完成后再切换。'
 const compactError = '阶段切换尚未完成，请先发送一条新阶段消息，再执行压缩。'
@@ -26,29 +24,29 @@ function samePath(left, right) {
   return typeof left === 'string' && resolve(left).toLowerCase() === resolve(right).toLowerCase()
 }
 
-function sha256(content) {
-  return createHash('sha256').update(content).digest('hex')
+function fileError(httpStatus, assetStatus, message) {
+  return Object.assign(new StudioError(httpStatus, message), { assetStatus })
 }
 
-function filePaths(root, workflowId, stage) {
+function fileTargets(workflowId, stage, skill) {
   return {
-    skillPath: resolve(root, 'skills', stage.skill, 'SKILL.md'),
-    harnessPath: resolve(root, 'drama-studio', 'workflows', workflowId, stage.harness),
+    skill: skillTarget(skill),
+    harness: workflowTarget(workflowId, stage.harness),
   }
 }
 
-async function localFile(path, kind, read) {
+async function localFile(path, kind) {
   try {
-    if (!samePath(await realpath(path), path)) throw new StudioError(409, `全局 ${kind} 必须位于规定路径：${path}`)
+    if (!samePath(await realpath(path), path)) throw fileError(409, 'conflict', `全局 ${kind} 必须位于规定路径：${path}`)
     const info = await stat(path, { bigint: true })
-    if (!info.isFile() || !info.size) throw new StudioError(400, `${kind} 必须是非空普通文件：${path}`)
-    if (!read) return
-    if (info.size > maxFileBytes[kind]) throw new StudioError(400, `${kind} 文件不能超过 ${maxFileBytes[kind] / 1024} KiB：${path}`)
+    if (!info.isFile()) throw fileError(409, 'conflict', `${kind} 必须是普通文件：${path}`)
+    if (!info.size) throw fileError(400, 'invalid', `${kind} 文件没有指令：${path}`)
+    if (info.size > maxFileBytes[kind]) throw fileError(400, 'invalid', `${kind} 文件不能超过 ${maxFileBytes[kind] / 1024} KiB：${path}`)
     const file = await open(path, 'r')
     try {
       const opened = await file.stat({ bigint: true })
       if (!sameFile(info, opened) || !samePath(await realpath(path), path)) {
-        throw new StudioError(409, `${kind} 路径已变更：${path}`)
+        throw fileError(409, 'conflict', `${kind} 路径已变更：${path}`)
       }
       const size = Number(info.size)
       const buffer = Buffer.alloc(size + 1)
@@ -60,20 +58,21 @@ async function localFile(path, kind, read) {
       }
       const finished = await file.stat({ bigint: true })
       if (length !== size || !sameFile(finished, opened)) {
-        throw new StudioError(409, `${kind} 文件在读取时发生变化，请重试：${path}`)
+        throw fileError(409, 'conflict', `${kind} 文件在读取时发生变化，请重试：${path}`)
       }
       const bytes = buffer.subarray(0, length)
       const body = new TextDecoder('utf-8', { fatal: true }).decode(bytes).trim()
-      if (!body) throw new StudioError(400, `${kind} 文件没有指令：${path}`)
+      if (!body) throw fileError(400, 'invalid', `${kind} 文件没有指令：${path}`)
       return { body, sha256: sha256(bytes), info: finished }
     } finally {
       await file.close()
     }
   } catch (error) {
     if (error instanceof StudioError) throw error
-    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') throw new StudioError(404, `${kind} 文件缺失：${path}`)
-    if (error.code === 'ERR_ENCODING_INVALID_ENCODED_DATA') throw new StudioError(400, `${kind} 文件须为 UTF-8：${path}`)
-    throw new StudioError(409, `无法读取${kind} 文件：${path}`)
+    if (error.code === 'ENOENT') throw fileError(404, 'missing', `${kind} 文件缺失：${path}`)
+    if (error.code === 'ENOTDIR') throw fileError(409, 'conflict', `${kind} 目录冲突：${path}`)
+    if (error.code === 'ERR_ENCODING_INVALID_ENCODED_DATA') throw fileError(400, 'invalid', `${kind} 文件须为 UTF-8：${path}`)
+    throw fileError(409, 'blocked', `无法读取 ${kind} 文件：${path}`)
   }
 }
 
@@ -154,15 +153,15 @@ function activeStagePrompts(session) {
   })
 }
 
-function invokesStageSkill(message) {
+function invokesStageSkill(message, names) {
   if (message.source?.kind !== 'user') return false
   // Match the native rc.3 skill gesture at any whitespace boundary.
   return message.content.some(block => block.type === 'text' &&
     [...block.text.matchAll(/(^|\s)\/([a-z0-9]+(?:-[a-z0-9]+)*)(?=\s|$)/g)]
-      .some(match => managedSkills.has(match[2])))
+      .some(match => names.has(match[2])))
 }
 
-export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
+export function workflowBridge(ctx, kernel, workspaceFor, lifetime, capabilities) {
   const turns = new Map()
   const kickoffs = new Map()
   const phaseWork = new Map()
@@ -171,6 +170,36 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
   const verifiedScopes = new WeakMap()
   const runtimeRequire = createRequire(ctx.profileContext.installAnchor)
   let nativeSkill
+
+  function stageSkills() {
+    return capabilities.root ? readStageSkills(capabilities.root) : { names: {} }
+  }
+
+  function reservedSkills(turn) {
+    const activeName = turn?.snapshot?.skillPath.split('/')[1]
+    return new Set([...managedSkills, ...Object.values(stageSkills().names ?? {}), activeName])
+  }
+
+  function capabilityFailure(issue) {
+    return fileError({ missing: 404, conflict: 409, invalid: 409, blocked: 503 }[issue.status], issue.status, issue.error)
+  }
+
+  function stageFiles(workflowId, stage, mapping) {
+    const skillName = mapping.names?.[stage.id] ?? stage.skill
+    const targets = fileTargets(workflowId, stage, skillName)
+    const root = capabilities.root ?? ctx.profileContext.home
+    return {
+      skillName,
+      targets,
+      skillPath: root && resolve(root, targets.skill),
+      harnessPath: root && resolve(root, targets.harness),
+    }
+  }
+
+  function checkBootstrap(target) {
+    const issue = capabilities.failure ?? capabilities.errors.get(target)
+    if (issue) throw capabilityFailure(issue)
+  }
 
   function nativeSkillAPI() {
     return nativeSkill ??= import(pathToFileURL(runtimeRequire.resolve('@deepseek-ai/dsh-skill')).href)
@@ -206,10 +235,15 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
     }
   }
 
-  async function checkNativeSkill(skill, stage, path) {
-    if (skill?.name === stage.skill && skill.source === 'user-dsh' && skill.invocation?.userInvocable &&
-        typeof skill.path === 'string' && samePath(await realpath(skill.path).catch(() => undefined), path)) return skill
-    throw new StudioError(409, `DSH 原生全局目录未加载 ${stage.skill}。请核对 Skill 名称和用户调用权限：${path}`)
+  async function checkNativeSkill(skill, name, path) {
+    if (!skill || skill.name !== name || !skill.invocation?.userInvocable || !skill.content?.trim()) {
+      throw fileError(409, 'invalid', `DSH 原生全局目录未加载 ${name}。请核对 Skill 名称、用户调用权限和正文：${path}`)
+    }
+    if (skill.source !== 'user-dsh' || typeof skill.path !== 'string' ||
+        !samePath(await realpath(skill.path).catch(() => undefined), path)) {
+      throw fileError(409, 'conflict', `Skill ${name} 来自 ${skill.source}（${skill.path ?? '无文件路径'}），需要 user-dsh：${path}`)
+    }
+    return skill
   }
 
   async function checkPromptScope(agent) {
@@ -232,26 +266,31 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
   }
 
   async function loadCapabilities(agent, workflowId, stage) {
+    const mapping = stageSkills()
+    const { skillName, skillPath, harnessPath, targets } = stageFiles(workflowId, stage, mapping)
+    checkBootstrap(targets.skill)
+    checkBootstrap(targets.harness)
+    if (mapping.failure) throw capabilityFailure(mapping.failure)
+    const resourceIssue = skillResourceStatuses(capabilities, skillName).find(resource => resource.error)
+    if (resourceIssue) throw capabilityFailure(resourceIssue)
     await checkStageSupport(agent)
-    const root = await realpath(ctx.profileContext.home)
-    const paths = filePaths(root, workflowId, stage)
     const [source, harness] = await Promise.all([
-      localFile(paths.skillPath, 'Skill', true),
-      localFile(paths.harnessPath, 'Harness', true),
+      localFile(skillPath, 'Skill'),
+      localFile(harnessPath, 'Harness'),
     ])
     const [skill, { renderSkillContent }] = await Promise.all([
-      globalSkills(agent.id, (registry, options) => registry.get(stage.skill, options), agent),
+      globalSkills(agent.id, (registry, options) => registry.get(skillName, options), agent),
       nativeSkillAPI(),
     ])
-    const skillBody = renderSkillContent(await checkNativeSkill(skill, stage, paths.skillPath))
+    const skillBody = renderSkillContent(await checkNativeSkill(skill, skillName, skillPath))
     await Promise.all([
-      verifyUnchanged(paths.skillPath, 'Skill', source.info),
-      verifyUnchanged(paths.harnessPath, 'Harness', harness.info),
+      verifyUnchanged(skillPath, 'Skill', source.info),
+      verifyUnchanged(harnessPath, 'Harness', harness.info),
     ])
     return {
       stageId: stage.id,
-      skillPath: relative(root, paths.skillPath).replaceAll('\\', '/'),
-      harnessPath: relative(root, paths.harnessPath).replaceAll('\\', '/'),
+      skillPath: targets.skill,
+      harnessPath: targets.harness,
       skillSourceSha256: source.sha256,
       skillSha256: sha256(skillBody),
       harnessSha256: harness.sha256,
@@ -325,32 +364,54 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
 
   async function get(sessionId, workspace, input) {
     const view = await kernel(sessionId, workspace, 'workflow_get', input, lifetime, 'human')
-    const root = await realpath(ctx.profileContext.home)
-    let nativeCatalog
-    return {
-      ...view,
-      stages: await Promise.all(view.stages.map(async stage => {
-        const paths = filePaths(root, view.id, stage)
-        const results = await Promise.allSettled([
-          (async () => {
-            await localFile(paths.skillPath, 'Skill')
-            const skills = await (nativeCatalog ??= globalSkills(sessionId,
-              (registry, options) => registry.list(options))).catch(() => {
-              throw new StudioError(503, `DSH 原生全局 Skill 目录无法读取：${paths.skillPath}`)
-            })
-            await checkNativeSkill(skills.find(skill => skill.name === stage.skill), stage, paths.skillPath)
-          })(),
-          localFile(paths.harnessPath, 'Harness', true),
-        ])
-        const [skill, harness] = results
-        return { ...stage, files: {
-          ...paths,
-          skillReady: skill.status === 'fulfilled',
-          harnessReady: harness.status === 'fulfilled',
-          issues: results.flatMap(result => result.status === 'rejected' ? [result.reason.message] : []),
-        } }
-      })),
+    const mapping = stageSkills()
+    const stagePaths = view.stages.map(stage => stageFiles(view.id, stage, mapping))
+    const globalFailure = capabilities.failure ?? mapping.failure
+    let skills
+    if (!globalFailure) {
+      const names = [...new Set(stagePaths.map(files => files.skillName))]
+      skills = await globalSkills(sessionId, async (registry, options) =>
+        Promise.allSettled(names.map(name => registry.get(name, options)))).then(
+        results => new Map(names.map((name, index) => [name, results[index]])),
+        () => new Map(),
+      )
     }
+    async function inspect(target, path, kind, name) {
+      const issue = capabilities.failure ?? capabilities.errors.get(target) ?? (name && mapping.failure)
+      if (issue) return { ...issue, path: path ?? issue.path }
+      try {
+        const { sha256: hash } = await localFile(path, kind)
+        const status = assetStatus(capabilities, target, hash)
+        if (!name) return status
+        const found = skills?.get(name)
+        if (found?.status !== 'fulfilled') throw fileError(503, 'blocked', `DSH 原生全局 Skill 目录无法读取：${path}`)
+        const skill = await checkNativeSkill(found.value, name, path)
+        return { ...status, source: skill.source }
+      } catch (error) {
+        return { status: error.assetStatus ?? 'blocked', path, error: error.message }
+      }
+    }
+    const stages = await Promise.all(view.stages.map(async (stage, index) => {
+      const { skillName, skillPath, harnessPath, targets } = stagePaths[index]
+      const [skillAsset, harnessAsset] = await Promise.all([
+        inspect(targets.skill, skillPath, 'Skill', skillName),
+        inspect(targets.harness, harnessPath, 'Harness'),
+      ])
+      const resourceAssets = globalFailure ? [] : skillResourceStatuses(capabilities, skillName)
+      const resourceError = resourceAssets.find(resource => resource.error)
+      return { ...stage, files: {
+        skillName, skillPath, harnessPath, skillSource: skillAsset.source,
+        skillReady: !skillAsset.error && !resourceError, harnessReady: !harnessAsset.error,
+        skillAsset, harnessAsset, resourceAssets,
+        issues: [skillAsset, harnessAsset, ...resourceAssets].flatMap(asset => asset.error ? [asset.error] : []),
+      } }
+    }))
+    const failure = globalFailure ?? stages.flatMap(({ files }) =>
+      [files.skillAsset, files.harnessAsset, ...files.resourceAssets]).find(asset => asset.error)
+    return { ...view, stages, capabilities: {
+      ready: !failure, status: failure?.status ?? 'ready', packageVersion: capabilities.packageVersion,
+      error: globalFailure?.error,
+    } }
   }
 
   async function resolveAgent(sessionId) {
@@ -550,7 +611,8 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
     const turn = turns.get(agent.id)
     const ownTurn = turn?.agent === agent && turn.number === number
     if (ownTurn && (turn.failure || turn.staleKickoff && !turn.hasChat)) return { kind: 'reject' }
-    if (ownTurn && turn.workspace && claimed.some(invokesStageSkill)) {
+    const forbiddenSkills = ownTurn && turn.workspace && reservedSkills(turn)
+    if (forbiddenSkills && claimed.some(message => invokesStageSkill(message, forbiddenSkills))) {
       turn.failure = stageSkillError
       throw new StudioError(409, stageSkillError)
     }
@@ -562,7 +624,7 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
     if (decision.kind === 'reject') return decision
     const messages = ownTurn ? decision.messages.filter(message => {
       if (isKickoffMessage(message)) return requestId(message) === turn.kickoff?.requestId
-      return !turn.workspace || message.source?.kind !== 'skill-invocation' || !managedSkills.has(message.source.name)
+      return !forbiddenSkills || message.source?.kind !== 'skill-invocation' || !forbiddenSkills.has(message.source.name)
     }) : decision.messages
     // DeepSeek can retain old system messages in its request series. A new
     // series makes the native loop replace them when switching, exiting or
@@ -599,8 +661,9 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime) {
   })
 
   ctx.effect(() => ctx.tools.guard(exec => {
-    if (exec.name === 'skill' && exec.agent && managedSkills.has(exec.arguments?.name) &&
-        ctx.workspaceRegistry.list().some(workspace => workspace.sessionIds.includes(exec.agent.id))) {
+    if (exec.name === 'skill' && exec.agent &&
+        ctx.workspaceRegistry.list().some(workspace => workspace.sessionIds.includes(exec.agent.id)) &&
+        reservedSkills(turns.get(exec.agent.id)).has(exec.arguments?.name)) {
       return stageSkillError
     }
   }))

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"regexp"
 	"strings"
 )
 
@@ -22,6 +23,7 @@ type workflowSnapshot struct {
 }
 
 var workflowLegacyActivation = &requestError{http.StatusConflict, "当前阶段没有可恢复的能力快照，请退出后重新激活。"}
+var workflowSkillPath = regexp.MustCompile(`^skills/[a-z0-9]+(?:-[a-z0-9]+)*/SKILL\.md$`)
 
 func workflowDigest(data []byte) string {
 	digest := sha256.Sum256(data)
@@ -40,7 +42,7 @@ func persistWorkflowSnapshot(ctx context.Context, tx *sql.Tx, stageID string, sn
 		return "", invalid("激活或交接需要当前目标阶段的能力快照")
 	}
 	stage := dramaWorkflowStages[index]
-	if snapshot.SkillPath != "skills/"+stage.Skill+"/SKILL.md" ||
+	if !workflowSkillPath.MatchString(snapshot.SkillPath) ||
 		snapshot.HarnessPath != "drama-studio/workflows/"+dramaWorkflowID+"/"+stage.Harness ||
 		!snapshot.workflowFileVersions.valid() || !validWorkflowSHA256(snapshot.SkillSourceSHA256) ||
 		strings.TrimSpace(snapshot.SkillBody) == "" || strings.TrimSpace(snapshot.HarnessBody) == "" ||

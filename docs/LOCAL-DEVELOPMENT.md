@@ -69,6 +69,43 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\.runtime\dev-local.ps1
 
 已安装 DeepSeek Harness Desktop **0.2.1-rc.3** 时，可从安装目录内的 `resources\runtime\cli\bin\dsh.cmd` 启动。`dev.ps1` 在省略 `-Launcher` 时先查找 `dsh`，再检查 `%LOCALAPPDATA%\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd`。自定义安装目录可传入绝对路径，并先用 `& $dsh --version` 确认版本。Desktop 的 `dsh.cmd` 要从完整安装目录中使用。未设置 `DSH_HOME` 时，启动脚本使用 `~/.dsh`。 [DSH 契约](DSH-CONTRACT.md)
 
+## 开发内置工作流能力
+
+修改仓库 `resources/skills/` 或 `resources/workflows/` 下的官方文件。同一阶段的 Skill 写制作方法，Harness 写要交付的内容和允许的操作。文件位于包根目录的 `resources/`，Host 从当前插件包根目录读取，源码链接和 npm 包使用同样的目录结构。已有资源路径保持稳定，内容修改由 SHA-256 检出，版本跟随 `package.json`。
+
+需要随 Skill 发布的普通文件逐一登记为 `skill-resource`，例如分镜阶段的 `references/shot-sizes.md`。在清单中指定阶段，同一条目的 `source` 与 `target` 都写成 `skills/drama-<stage-id>/<相对文件路径>`，`id` 使用 `skill-resource:drama-<stage-id>/<相对文件路径>`。每个附属文件上限为 1 MiB，按原始字节装填，脚本在装填期间只作为文件复制。
+
+在构建完成并设置本地运行时 PATH 后，可以用新的隔离 Home 验证首次装填。以下命令在仓库根目录运行，使用前文设置的 `$dsh`。
+
+```powershell
+$capabilityTest = Join-Path $PWD.Path ('.runtime\capabilities-' + [Guid]::NewGuid().ToString('N'))
+$env:DSH_HOME = Join-Path $capabilityTest 'home'
+$env:DSH_AGENTS_HOME = Join-Path $capabilityTest 'agents'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev.ps1 -Launcher $dsh -Port 0 -NoOpen
+```
+
+启动后检查 `$env:DSH_HOME\drama-studio\managed-assets.json` 和 Workflow Panel。用同一个临时 Home 重启可验证幂等。再修改其中一个受管文件后重启，可检查用户改动的保留行为。测试时始终使用本次隔离 Home，日常开发切回原来的终端环境。 [全局路径与升级行为](WORKFLOW.md)
+
+`node --test tests/built-in-assets.mjs` 验证文件装填和升级。`node tests/built-in-assets-host.mjs` 使用已安装的 Desktop 启动器和已构建的工件，验证原生 Skill 发现及阶段快照。两个脚本会自行创建隔离目录。
+
+Host 在装填期间使用按 DSH Home 区分的 Windows 命名管道锁。Windows 会在进程终止时释放该锁。仍在写入的 Host 会继续持有锁，其他 Host 等待或返回明确的阻塞状态。升级时先退出同一 Home 的旧版 Studio Host。如果提示旧版 `drama-studio/managed-assets.json.lock`，确认使用该 Home 的旧版 Host 均已退出后，删除提示中的旧锁文件再启动。
+
+### 检查 npm 包
+
+完成构建后，从仓库根目录预览和实际打包。检查清单中有 `resources/manifest.json`、七个 `SKILL.md`、七个 `harness.md` 及清单声明的所有附属文件。
+
+```powershell
+npm.cmd pack --dry-run
+$packDir = New-Item -ItemType Directory -Path (Join-Path $env:TEMP ('drama-studio-pack-' + [Guid]::NewGuid().ToString('N')))
+npm.cmd pack --pack-destination $packDir.FullName
+$tarball = Get-ChildItem -LiteralPath $packDir.FullName -Filter '*.tgz'
+tar.exe -tf $tarball.FullName | Select-String '^package/resources/'
+```
+
+用另一个空的 `DSH_HOME` 和 `DSH_AGENTS_HOME` 测包。将插件 tarball 装入测试 Profile，并从仓库外的当前目录启动 Host。检查实际安装位置、全局落盘和 Workflow Panel，以覆盖 npm 包的资源定位。
+
+可以运行 `node tests/built-in-assets-host.mjs --pack <TARBALL>`，由夹具创建隔离 Profile、解包、启动真实 DSH Host 并通过原生 `read` 工具读取相对资源。
+
 ## 排查启动问题
 
 | 提示或现象 | 处理方法 |
