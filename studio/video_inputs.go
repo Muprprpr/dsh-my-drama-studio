@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"slices"
 	"strings"
@@ -42,7 +44,7 @@ func videoGenerationInput(ctx context.Context, tx *sql.Tx, workspace, id, snapsh
 	}
 	input := GenerationInput{Type: "video", Mode: content.Mode, Prompt: content.Prompt, Params: params,
 		WorkspacePath: workspace, productionAspectRatio: content.ProductionAspectRatio}
-	refs, err := videoEdgeReferences(ctx, tx, workspace, id, content.Order)
+	refs, err := videoEdgeReferences(ctx, tx, id, content.Order)
 	if err != nil {
 		return GenerationInput{}, "", nil, err
 	}
@@ -80,20 +82,8 @@ func videoGenerationInput(ctx context.Context, tx *sql.Tx, workspace, id, snapsh
 	if err := validateVideoInputs(input.Mode, kinds); err != nil {
 		return GenerationInput{}, "", nil, err
 	}
-	digests := make(map[string]string)
 	for i := range input.References {
 		ref := &input.References[i]
-		if ref.Path != "" {
-			digest := digests[ref.Path]
-			if digest == "" {
-				digest, err = freezeMediaFile(workspace, ref.Path)
-				if err != nil {
-					return GenerationInput{}, "", nil, invalid("视频节点 %s 的素材 %s：%s", id, ref.SourceNodeID, err)
-				}
-				digests[ref.Path] = digest
-			}
-			ref.LocalSHA256 = digest
-		}
 		switch input.Mode {
 		case "i2v":
 			ref.Role = "first_frame"
@@ -109,21 +99,116 @@ func videoGenerationInput(ctx context.Context, tx *sql.Tx, workspace, id, snapsh
 	return input, content.ProfileID, sourceIDs, nil
 }
 
-func freezeMediaFile(workspace, path string) (string, error) {
-	file, err := openLocalReference(workspace, path, true)
-	if err != nil {
-		return "", err
+func (p *project) prepareVideoMedia(ctx context.Context, nodeID string, input *GenerationInput) error {
+	type localMedia struct {
+		file   *os.File
+		size   int64
+		mime   string
+		digest string
 	}
-	defer file.Close()
-	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
-		return "", fmt.Errorf("项目文件 %q 已失效，请重新连接可用的素材", path)
+	opened := make(map[string]*localMedia)
+	protocol := input.Profile.Provider
+	inline := protocol == "openai-video" || protocol == "new-api" || protocol == "custom-rest"
+	ark := protocol == "ark" || protocol == "byteplus"
+	remaining := videoInlineMediaLimit(protocol)
+	var arkRemaining int64
+	if ark {
+		prompt, err := arkRequestPrompt(input.Profile, *input)
+		if err != nil {
+			return err
+		}
+		arkRemaining = int64(arkMaxBodyBytes - len(prompt))
 	}
-	digest, err := localMediaSHA256(file)
-	if err != nil {
-		return "", fmt.Errorf("无法读取素材 %q，请确认项目文件可用后重新生成", path)
+	for _, ref := range input.References {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if ref.Path == "" && ark {
+			arkRemaining -= int64(len(ref.URL))
+		}
+		if ref.Path != "" {
+			media := opened[ref.Path]
+			if media == nil {
+				file, mime, err := openVideoInputMedia(*input, ref, remaining)
+				if err != nil {
+					return invalid("视频节点 %s 的素材 %s：%s", nodeID, ref.SourceNodeID, err)
+				}
+				defer file.Close()
+				info, err := file.Stat()
+				if err != nil {
+					return invalid("视频节点 %s 的素材 %s：无法读取项目文件大小", nodeID, ref.SourceNodeID)
+				}
+				media = &localMedia{file: file, mime: mime, size: info.Size()}
+				opened[ref.Path] = media
+			}
+			if inline {
+				remaining -= media.size
+				if remaining < 0 {
+					return invalid("视频节点 %s 的本地素材合计超过所选渠道大小限制", nodeID)
+				}
+			}
+			if ark {
+				arkRemaining -= int64(len("data:") + len(media.mime) + len(";base64,") +
+					base64.StdEncoding.EncodedLen(int(media.size)))
+			}
+		}
+		if ark && arkRemaining <= 0 {
+			return invalid("视频节点 %s 的素材超过方舟请求大小限制", nodeID)
+		}
 	}
-	return digest, nil
+	if ratio := input.productionAspectRatio; ratio != "" && input.Params.AspectRatio == "" &&
+		videoInheritsFirstFrameRatio(input.Mode, input.Profile) {
+		first := opened[input.References[0].Path]
+		if first == nil {
+			return invalid("该模型从首帧继承画幅，请使用可核对画幅的项目内 PNG 或 JPEG 首帧")
+		}
+		if err := checkProductionFirstFrame(first.file, ratio); err != nil {
+			return err
+		}
+		if _, err := first.file.Seek(0, io.SeekStart); err != nil {
+			return invalid("无法重新读取首帧图片")
+		}
+	}
+	hash := localMediaSHA256
+	if p.hashVideoMedia != nil {
+		hash = p.hashVideoMedia
+	}
+	for i := range input.References {
+		ref := &input.References[i]
+		media := opened[ref.Path]
+		if media == nil {
+			continue
+		}
+		if media.digest == "" {
+			digest, err := hash(ctx, media.file)
+			if err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return invalid("视频节点 %s 的素材 %s：无法读取项目文件 %q，请核对后重新生成", nodeID, ref.SourceNodeID, ref.Path)
+			}
+			media.digest = digest
+		}
+		ref.LocalSHA256 = media.digest
+	}
+	return nil
+}
+
+func openVideoInputMedia(input GenerationInput, ref GenerationReference, inlineRemaining int64) (*os.File, string, error) {
+	switch input.Profile.Provider {
+	case "ark", "byteplus":
+		return openImageReference(input, ref, arkMaxImageBytes-1, true)
+	case "replicate":
+		return openReplicateImage(input.Profile, input, ref, true)
+	case minimaxH3Protocol:
+		media, err := openMinimaxMedia(input, ref, true)
+		return media.file, "", err
+	case "openai-video", "new-api", "custom-rest":
+		return readVideoMedia(input, ref, inlineRemaining, true)
+	default:
+		file, err := openProviderReference(input, ref, math.MaxInt64, true)
+		return file, "", err
+	}
 }
 
 func openLocalReference(workspace, path string, stable bool) (*os.File, error) {
@@ -134,7 +219,7 @@ func openLocalReference(workspace, path string, stable bool) (*os.File, error) {
 	defer root.Close()
 	file, err := root.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("无法打开项目素材 %q，请重新连接可用的素材", path)
+		return nil, fmt.Errorf("无法打开项目文件 %q，请重新连接可用的素材", path)
 	}
 	if !stable {
 		return file, nil
@@ -147,10 +232,21 @@ func openLocalReference(workspace, path string, stable bool) (*os.File, error) {
 	return readonly, nil
 }
 
-func localMediaSHA256(file *os.File) (string, error) {
+func localMediaSHA256(ctx context.Context, file *os.File) (string, error) {
 	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return "", err
+	buffer := make([]byte, 64<<10)
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		n, err := file.Read(buffer)
+		_, _ = hash.Write(buffer[:n])
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
 	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return "", err
@@ -158,8 +254,8 @@ func localMediaSHA256(file *os.File) (string, error) {
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-func openProviderReference(input GenerationInput, ref GenerationReference, limit int64) (*os.File, error) {
-	file, err := openLocalReference(input.WorkspacePath, ref.Path, ref.LocalSHA256 != "")
+func openProviderReference(input GenerationInput, ref GenerationReference, limit int64, stable bool) (*os.File, error) {
+	file, err := openLocalReference(input.WorkspacePath, ref.Path, stable || ref.LocalSHA256 != "")
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +265,7 @@ func openProviderReference(input GenerationInput, ref GenerationReference, limit
 		return nil, fmt.Errorf("项目素材 %q 超出渠道大小限制或不可读取", ref.Path)
 	}
 	if ref.LocalSHA256 != "" {
-		digest, err := localMediaSHA256(file)
+		digest, err := localMediaSHA256(context.Background(), file)
 		if err != nil || digest != ref.LocalSHA256 {
 			file.Close()
 			return nil, fmt.Errorf("项目素材 %q 无法匹配冻结的文件内容，请从当前 Canvas 节点重新生成", ref.Path)
@@ -183,7 +279,7 @@ type videoEdgeReference struct {
 	assetID string
 }
 
-func videoEdgeReferences(ctx context.Context, tx *sql.Tx, workspace, target string, order []string) ([]videoEdgeReference, error) {
+func videoEdgeReferences(ctx context.Context, tx *sql.Tx, target string, order []string) ([]videoEdgeReference, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT source,nodes.type,nodes.content,nodes.revision,nodes.deleted
 		FROM edges LEFT JOIN nodes ON nodes.id=source WHERE target=? ORDER BY edges.rowid`, target)
 	if err != nil {
@@ -228,7 +324,7 @@ func videoEdgeReferences(ctx context.Context, tx *sql.Tx, workspace, target stri
 			continue
 		}
 		delete(byID, id)
-		resolved, ref, err := resolveVideoEdgeMedia(ctx, tx, workspace, node)
+		resolved, ref, err := readVideoEdgeMedia(ctx, tx, node)
 		var invalidMedia *requestError
 		if errors.As(err, &invalidMedia) {
 			return nil, invalid("视频节点 %s 的素材 %s：%s", target, id, invalidMedia.Error())
@@ -248,6 +344,25 @@ func videoEdgeReferences(ctx context.Context, tx *sql.Tx, workspace, target stri
 }
 
 func resolveVideoEdgeMedia(ctx context.Context, tx *sql.Tx, workspace string, source Node) (Node, GenerationReference, error) {
+	resolved, ref, err := readVideoEdgeMedia(ctx, tx, source)
+	if err != nil {
+		return Node{}, GenerationReference{}, err
+	}
+	if ref.Path != "" {
+		root, err := os.OpenRoot(workspace)
+		if err != nil {
+			return Node{}, GenerationReference{}, err
+		}
+		defer root.Close()
+		info, err := root.Stat(ref.Path)
+		if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+			return Node{}, GenerationReference{}, invalid("项目文件 %q 已失效，请重新连接可用的素材", ref.Path)
+		}
+	}
+	return resolved, ref, nil
+}
+
+func readVideoEdgeMedia(ctx context.Context, tx *sql.Tx, source Node) (Node, GenerationReference, error) {
 	if source.Deleted {
 		return Node{}, GenerationReference{}, invalid("来源卡片已删除，请重新连接可用的素材")
 	}
@@ -265,15 +380,6 @@ func resolveVideoEdgeMedia(ctx context.Context, tx *sql.Tx, workspace string, so
 	if ref.Path != "" {
 		if err := validateNode(resolved.NodeInput); err != nil {
 			return Node{}, GenerationReference{}, err
-		}
-		root, err := os.OpenRoot(workspace)
-		if err != nil {
-			return Node{}, GenerationReference{}, err
-		}
-		defer root.Close()
-		info, err := root.Stat(ref.Path)
-		if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
-			return Node{}, GenerationReference{}, invalid("项目文件 %q 已失效，请重新连接可用的素材", ref.Path)
 		}
 	}
 	return resolved, ref, nil

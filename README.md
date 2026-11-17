@@ -4,21 +4,18 @@
 
 ## 安装与启动
 
-Windows x64。本文使用 DeepSeek Harness **0.2.1-rc.3**。本地开发可使用仓库内的 npm 版 DSH，或使用已安装的 Desktop。按[本地开发指南](docs/LOCAL-DEVELOPMENT.md)首次准备运行时、构建插件并链接共享依赖。
-
-使用 npm 版 DSH 时，在仓库根目录的同一个 PowerShell 窗口中运行下列命令。
+支持 Windows 10/11 x64。已验证的宿主为 DeepSeek Harness Desktop **0.2.1-rc.3**。获取候选包或 GitHub Releases 提供的 `.tgz` 后，在 PowerShell 运行以下命令。将示例路径替换为实际包路径。
 
 ```powershell
-$runtimeBin = (Resolve-Path -LiteralPath '.\.runtime\dsh-rc3\node_modules\.bin').Path
-$env:Path = "$runtimeBin;$env:Path"
-$env:pnpm_config_store_dir = Join-Path $PWD.Path '.runtime\pnpm-store'
-$env:DSH_HOME = Join-Path $PWD.Path '.runtime\dev-home'
-$env:DSH_AGENTS_HOME = Join-Path $PWD.Path '.runtime\dev-agents'
-$dsh = Join-Path $runtimeBin 'dsh.cmd'
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev.ps1 -Launcher $dsh
+$dsh = Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd'
+$package = (Resolve-Path -LiteralPath 'C:\Downloads\dsh-my-drama-studio-0.1.0.tgz').Path
+& $dsh --version
+& $dsh plugin --profile web add $package
+if ($LASTEXITCODE -ne 0) { throw '插件安装失败' }
+& $dsh web --host 127.0.0.1 --port 3080
 ```
 
-首次启动会把当前 checkout 链接到开发环境的 `web` Profile。DSH 默认打开浏览器。使用 `-NoOpen` 时，将终端输出的完整启动地址复制到浏览器。进入 Workspace 下的 Session 后，可在输入栏使用 **Drama**。默认端口为 3080，端口被占用时可在启动命令末尾加 `-Port 3081`。
+进入 Workspace 下的 Session 后，在输入栏打开 **Drama**。端口被占用时可将 `--port` 改为 3081。更新时先正常结束同一 Profile 的 Web 进程，再对新 `.tgz` 执行相同的安装命令，然后重新启动。现有项目文件和 Profile 设置可继续使用。源码开发及隔离验收参见[本地开发指南](docs/LOCAL-DEVELOPMENT.md)。
 
 ## 原生 Settings → Drama Studio
 
@@ -59,11 +56,13 @@ I2V 映射首帧和可选尾帧，R2V 将参考素材按连接顺序传为 `[{ty
 ## 手工搭建镜头画布
 
 1. 点击 **新增**、在空白处右键或按 **Shift+A** 选择节点类型，节点会立即保存到项目并进入编辑状态。也可将本地媒体拖入画布、粘贴剪贴板图片，或从 **项目资产** 复用已有文件。
-2. 新建时选择 **视频生成**，在节点编辑器里再选生成方式和模型。接入素材时会建议并填入兼容的方式，可在节点里切换。视频节点填写完整内联提示词，I2V 使用首帧与模型支持的尾帧，R2V 使用模型支持的有序媒体，V2V 使用一个源视频。
+2. 第一条任务可新建 **视频生成**，选择已配置的模型与生成方式。视频节点填写完整内联提示词，T2V 使用零条媒体连线，I2V 使用首帧与模型支持的尾帧，R2V 使用模型支持的有序媒体，V2V 使用一个源视频。
 3. 从来源的输出端口拖至目标输入端口，即可保存引用。编辑区也可按用途选择画布节点、项目资产或本地文件。图片生成可读取文本上下文和模型支持的参考图。视频节点只连接实际所需的图、视频和音频，生成要求完整写在节点自己的提示词中。
 4. 在画布焦点下用 **Ctrl+C / Ctrl+V** 复制粘贴，**Ctrl+D** 复制实例，**Ctrl+A** 全选，**Delete / Backspace** 删除节点或引用，**Ctrl+Z / Ctrl+Shift+Z** 撤销或重做。按住空格拖拽平移画布。
 5. 保存后点击 **生成…**，检查模式和预设并确认。**任务** 显示进度、失败和已下载的历史结果。可继续查询超时任务或取消尚未提交的排队任务。
 6. 从输入栏 **制作设置** 控制当前 Session 的自动生成许可，连接 Canvas 前也可预设。开启后仍须满足 Canvas 和授权条件。关闭后停止自动创建新任务，已入队任务照常处理，可在任务列表取消。断开 Canvas 或重启 Host 会清除该许可。
+
+任务显示「提交状态未知」时，先用提交时间、模型及日志中的本地任务 ID 与渠道核对。若日志已有渠道任务 ID，按该 ID 查询渠道记录。确认渠道未接单后再提交，避免重复计费。任务已有渠道 ID 且显示「查询暂停」时，可使用「继续查询」。
 
 画布交互参考 ComfyUI 和 InvokeAI 的节点库、端口和工作流检查器。 [ComfyUI Nodes](https://docs.comfy.org/basic-concepts/nodes) · [InvokeAI Workflow Editor](https://invoke.ai/features/workflows/adding-nodes/)
 

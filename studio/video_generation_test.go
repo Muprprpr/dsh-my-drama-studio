@@ -268,22 +268,29 @@ func TestProjectVideoAspectFromFirstFrame(t *testing.T) {
 	}
 	input := GenerationInput{Mode: "i2v", WorkspacePath: dir, productionAspectRatio: "9:16",
 		References: []GenerationReference{{Type: "image", Path: frame}}}
-	if err := prepareVideoGeneration(&input, &profile, VideoParams{AspectRatio: "16:9"}); err != nil || input.Params.AspectRatio != "" {
+	prepare := func(profile ProviderProfile, global VideoParams) error {
+		if err := prepareVideoGeneration(&input, &profile, global); err != nil {
+			return err
+		}
+		input.Profile, input.References[0].LocalSHA256 = profile, ""
+		return (&project{}).prepareVideoMedia(context.Background(), "draft", &input)
+	}
+	if err := prepare(profile, VideoParams{AspectRatio: "16:9"}); err != nil || input.Params.AspectRatio != "" {
 		t.Fatalf("adapter should inherit the verified project ratio from its frame: %+v, %v", input.Params, err)
 	}
 	input.productionAspectRatio = "16:9"
-	if err := prepareVideoGeneration(&input, &profile, VideoParams{}); err == nil || !strings.Contains(err.Error(), "16:9") {
+	if err := prepare(profile, VideoParams{}); err == nil || !strings.Contains(err.Error(), "16:9") {
 		t.Fatalf("landscape target with portrait frame must be rejected: %v", err)
 	}
 	ark := ProviderProfile{Provider: "ark", Model: "doubao-seedance-2-5-260628",
 		Limits: VideoLimits{AspectRatios: []string{"16:9", "9:16", "adaptive"}}}
 	input.productionAspectRatio = "9:16"
 	input.Params = VideoParams{}
-	if err := prepareVideoGeneration(&input, &ark, VideoParams{AspectRatio: "16:9"}); err != nil || input.Params.AspectRatio != "" {
+	if err := prepare(ark, VideoParams{AspectRatio: "16:9"}); err != nil || input.Params.AspectRatio != "" {
 		t.Fatalf("Seedance 2.5 I2V should omit unrelated global ratio: %+v, %v", input.Params, err)
 	}
 	input.Params.AspectRatio = "adaptive"
-	if err := prepareVideoGeneration(&input, &ark, VideoParams{}); err != nil || input.Params.AspectRatio != "adaptive" {
+	if err := prepare(ark, VideoParams{}); err != nil || input.Params.AspectRatio != "adaptive" {
 		t.Fatalf("explicit adaptive should retain the existing override: %+v, %v", input.Params, err)
 	}
 }

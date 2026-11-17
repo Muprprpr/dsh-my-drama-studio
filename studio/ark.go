@@ -194,7 +194,7 @@ func arkImageURL(input GenerationInput, ref GenerationReference) (string, error)
 	if ref.URL != "" {
 		return ref.URL, nil
 	}
-	file, mime, err := openImageReference(input, ref, arkMaxImageBytes-1)
+	file, mime, err := openImageReference(input, ref, arkMaxImageBytes-1, false)
 	if err != nil {
 		return "", err
 	}
@@ -215,17 +215,11 @@ func (p *arkProvider) payload(input GenerationInput) ([]byte, error) {
 	if err := p.Validate(input); err != nil {
 		return nil, err
 	}
-	prompt := input.Prompt
-	family := arkContractFor(p.profile).family
-	if p.profile.Mode == "r2v" && (family == arkSeedance20 || family == arkSeedance25) {
-		var err error
-		prompt, err = videoRequestPrompt(input, func(mention GenerationPromptMention) string {
-			return fmt.Sprintf("@%s%d", assetMentionLabels[mention.Type], mention.Ordinal)
-		})
-		if err != nil {
-			return nil, err
-		}
+	prompt, err := arkRequestPrompt(p.profile, input)
+	if err != nil {
+		return nil, err
 	}
+	family := arkContractFor(p.profile).family
 	content := []map[string]any{{"type": "text", "text": prompt}}
 	size := len(prompt)
 	role := "reference_image"
@@ -264,6 +258,16 @@ func (p *arkProvider) payload(input GenerationInput) ([]byte, error) {
 		return nil, errors.New("Ark request exceeds the 64 MB limit")
 	}
 	return wire, err
+}
+
+func arkRequestPrompt(profile ProviderProfile, input GenerationInput) (string, error) {
+	family := arkContractFor(profile).family
+	if profile.Mode == "r2v" && (family == arkSeedance20 || family == arkSeedance25) {
+		return videoRequestPrompt(input, func(mention GenerationPromptMention) string {
+			return fmt.Sprintf("@%s%d", assetMentionLabels[mention.Type], mention.Ordinal)
+		})
+	}
+	return input.Prompt, nil
 }
 
 func (p *arkProvider) request(ctx context.Context, method, resource string, payload []byte) (*http.Response, error) {

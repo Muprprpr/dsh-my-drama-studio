@@ -90,21 +90,45 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev.ps1 -Launc
 
 Host 在装填期间使用按 DSH Home 区分的 Windows 命名管道锁。Windows 会在进程终止时释放该锁。仍在写入的 Host 会继续持有锁，其他 Host 等待或返回明确的阻塞状态。升级时先退出同一 Home 的旧版 Studio Host。如果提示旧版 `drama-studio/managed-assets.json.lock`，确认使用该 Home 的旧版 Host 均已退出后，删除提示中的旧锁文件再启动。
 
-### 检查 npm 包
+### 构建候选安装包
 
-完成构建后，从仓库根目录预览和实际打包。检查清单中有 `resources/manifest.json`、三个生产模式 JSON、八个 `SKILL.md`、八个 `harness.md` 及清单声明的所有附属文件。
+`npm run build` 用于前端迭代，生成 Host 和 Browser 文件。候选安装包在干净的 Windows x64 checkout 使用完整入口，从同一提交生成三个核心产物并执行实际打包。构建会校验包内资源和核心文件 SHA-256。主工作树有待保存的改动时，使用单独的 checkout。
 
 ```powershell
-npm.cmd pack --dry-run
-$packDir = New-Item -ItemType Directory -Path (Join-Path $env:TEMP ('drama-studio-pack-' + [Guid]::NewGuid().ToString('N')))
-npm.cmd pack --pack-destination $packDir.FullName
-$tarball = Get-ChildItem -LiteralPath $packDir.FullName -Filter '*.tgz'
-tar.exe -tf $tarball.FullName | Select-String '^package/resources/'
+pwsh -NoProfile -File .\scripts\build.ps1 -Candidate
+if ($LASTEXITCODE -ne 0) { throw '候选构建失败' }
+$commit = git rev-parse HEAD
+$report = Get-Content -Raw -LiteralPath (Join-Path $PWD.Path ".runtime\release-candidate\$commit\candidate.json") | ConvertFrom-Json
+$report
+go version -m .\dist\studio.exe
 ```
 
-用另一个空的 `DSH_HOME` 和 `DSH_AGENTS_HOME` 测包。将插件 tarball 装入测试 Profile，并从仓库外的当前目录启动 Host。检查实际安装位置、全局落盘和 Workflow Panel，以覆盖 npm 包的资源定位。
+用构建报告中的 `.tgz` 从真实安装入口验收。离开源码目录启动，以下目录由本次测试独立使用。
 
-可以运行 `node tests/built-in-assets-host.mjs --pack <TARBALL>`，由夹具创建隔离 Profile、解包、启动真实 DSH Host 并通过原生 `read` 工具读取相对资源。
+```powershell
+$package = $report.tarball.path
+$isolated = Join-Path $env:TEMP ('drama-rc-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $isolated | Out-Null
+$env:DSH_HOME = Join-Path $isolated 'home'
+$env:DSH_AGENTS_HOME = Join-Path $isolated 'agents'
+$env:pnpm_config_store_dir = Join-Path $isolated 'pnpm-store'
+$dsh = Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd'
+& $dsh --version
+& $dsh plugin --help
+Push-Location $isolated
+try {
+    & $dsh plugin --profile web add $package
+    if ($LASTEXITCODE -ne 0) { throw '候选包安装失败' }
+    $installed = Join-Path $env:DSH_HOME 'profiles\web\node_modules\dsh-my-drama-studio'
+    Get-FileHash (Join-Path $installed 'dist\host.js'), (Join-Path $installed 'dist\client.js'), (Join-Path $installed 'dist\studio.exe')
+    go version -m (Join-Path $installed 'dist\studio.exe')
+    & $dsh web --host 127.0.0.1 --port 0 --no-open
+} finally {
+    Pop-Location
+}
+```
+
+核对安装文件的哈希与候选报告一致，实际 Go 进程从该 Profile 的安装路径启动。在新 Workspace 验证画布读取和视频输入契约。确认正文来自已保存节点，首帧只来自有效入边。发布验收的真实任务须使用已授权的渠道和预算，跟踪同一渠道 ID 到下载和画布回写。公开分发时使用已验收的这份 `.tgz`。
 
 ## 排查启动问题
 

@@ -3,6 +3,7 @@ package studio
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // Provider adapts a verified service. Calls must honor ctx. Its submit method
@@ -118,11 +122,39 @@ const runnableTasks = "status IN ('pending','submitting','polling')"
 const taskOrder = "CASE status WHEN 'submitting' THEN 0 WHEN 'polling' THEN 1 ELSE 2 END, created_at, rowid"
 const maxWorkerSlots = 32
 
+const (
+	receiptAttemptTimeout  = 5 * time.Second
+	receiptRetryDelay      = 200 * time.Millisecond
+	receiptShutdownTimeout = 8 * time.Second
+	// GenerationShutdownTimeout leaves time for the kernel to close its database
+	// after the workers stop saving receipts. The Host's kill timer is longer.
+	GenerationShutdownTimeout = receiptShutdownTimeout + 2*time.Second
+)
+
+func receiptDrainContext(ctx context.Context) (context.Context, func()) {
+	drain, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	stop := context.AfterFunc(ctx, func() {
+		timer := time.NewTimer(receiptShutdownTimeout)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			cancel()
+		case <-drain.Done():
+		}
+	})
+	return drain, func() {
+		stop()
+		cancel()
+	}
+}
+
 // Run owns the local concurrency slots. A slot stays occupied through polling and download.
 func (s *Service) Run(ctx context.Context) {
 	if s.provider == nil {
 		return
 	}
+	receiptCtx, stopReceiptDrain := receiptDrainContext(ctx)
+	defer stopReceiptDrain()
 	ticker := time.NewTicker(s.pollInterval)
 	defer ticker.Stop()
 	finished := make(chan jobKey, maxWorkerSlots)
@@ -161,8 +193,11 @@ func (s *Service) Run(ctx context.Context) {
 						case <-ctx.Done():
 						}
 					}()
-					if err := job.project.runGeneration(ctx, s.provider, job.id, s.pollInterval, s.pollTimeout); err != nil && ctx.Err() == nil {
-						log.Printf("Studio task worker: %s", (videoHTTP{}).safeMessage(err.Error()))
+					if err := job.project.runGeneration(ctx, receiptCtx, s.provider, job.id, s.pollInterval, s.pollTimeout); err != nil {
+						var receiptErr *receiptPersistenceError
+						if !errors.As(err, &receiptErr) && ctx.Err() == nil {
+							log.Printf("Studio task worker: %s", (videoHTTP{}).safeMessage(err.Error()))
+						}
 					}
 				})
 			}
@@ -213,7 +248,7 @@ func (s *Service) generationJobs(ctx context.Context, limit int) []generationJob
 	return jobs
 }
 
-func (p *project) runGeneration(ctx context.Context, registry providerRegistry, id string, interval, timeout time.Duration) error {
+func (p *project) runGeneration(ctx, receiptCtx context.Context, registry providerRegistry, id string, interval, timeout time.Duration) error {
 	var deadline time.Time
 	var onCompleted func()
 	for ctx.Err() == nil {
@@ -232,7 +267,7 @@ func (p *project) runGeneration(ctx context.Context, registry providerRegistry, 
 		default:
 			return nil
 		}
-		if err := p.advanceTask(ctx, registry, task, input, deadline, &onCompleted); err != nil {
+		if err := p.advanceTask(ctx, receiptCtx, registry, task, input, deadline, &onCompleted); err != nil {
 			return err
 		}
 		delay := interval
@@ -257,11 +292,13 @@ func (p *project) advance(ctx context.Context, registry providerRegistry) error 
 	if err != nil {
 		return err
 	}
+	receiptCtx, stopReceiptDrain := receiptDrainContext(ctx)
+	defer stopReceiptDrain()
 	var onCompleted func()
-	return p.advanceTask(ctx, registry, task, input, time.Time{}, &onCompleted)
+	return p.advanceTask(ctx, receiptCtx, registry, task, input, time.Time{}, &onCompleted)
 }
 
-func (p *project) advanceTask(ctx context.Context, registry providerRegistry, task Task, input string, deadline time.Time, onCompleted *func()) error {
+func (p *project) advanceTask(ctx, receiptCtx context.Context, registry providerRegistry, task Task, input string, deadline time.Time, onCompleted *func()) error {
 	if task.ProviderTaskID != "" && (task.Status == "pending" || task.Status == "submitting") {
 		return p.transition(ctx, task, "polling", task.ProviderTaskID, "")
 	}
@@ -302,10 +339,8 @@ func (p *project) advanceTask(ctx context.Context, registry providerRegistry, ta
 		call, cancelCall := context.WithTimeout(ctx, 60*time.Second)
 		reply, submitErr := provider.Submit(call, request.GenerationInput)
 		cancelCall()
-		persist, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
 		if strings.TrimSpace(reply.TaskID) != "" {
-			if err := p.transition(persist, task, "polling", reply.TaskID, ""); err != nil {
+			if err := p.persistProviderReceipt(receiptCtx, task.ID, reply.TaskID); err != nil {
 				return err
 			}
 			if resolved, ok := provider.(*resolvedChannelProvider); ok {
@@ -313,6 +348,8 @@ func (p *project) advanceTask(ctx context.Context, registry providerRegistry, ta
 			}
 			return nil
 		}
+		persist, cancel := context.WithTimeout(receiptCtx, receiptAttemptTimeout)
+		defer cancel()
 		message := "Submission outcome unknown. Confirm with provider before submitting again."
 		if reply.Rejected {
 			message = "Provider rejected submission."
@@ -371,6 +408,123 @@ func (p *project) advanceTask(ctx context.Context, registry providerRegistry, ta
 		}
 	}
 	return fmt.Errorf("unknown generation state %q", task.Status)
+}
+
+var errReceiptConflict = errors.New("different upstream task ID already stored")
+var errReceiptState = errors.New("task is no longer in the submitting state")
+
+type receiptPersistenceError struct {
+	taskID     string
+	providerID string
+	reason     string
+}
+
+func (e *receiptPersistenceError) Error() string {
+	return fmt.Sprintf("known upstream receipt needs reconciliation: task=%q providerTaskId=%q: %s", e.taskID, e.providerID, e.reason)
+}
+
+// Keep the receipt in the worker that still holds the task lock. Only the
+// local transaction is retried, with a new context on every attempt.
+func (p *project) persistProviderReceipt(ctx context.Context, taskID, providerID string) error {
+	const shutdownMessage = "shutdown budget exhausted"
+	var reported sync.Once
+	fail := func(reason string) error {
+		err := &receiptPersistenceError{taskID, providerID, reason}
+		reported.Do(func() { log.Printf("Studio task worker: %s", err) })
+		return err
+	}
+	// The diagnostic still runs if a database driver call outlasts its context.
+	stopReport := context.AfterFunc(ctx, func() { _ = fail(shutdownMessage) })
+	defer stopReport()
+	for {
+		attempt, cancel := context.WithTimeout(ctx, receiptAttemptTimeout)
+		err := p.saveProviderReceipt(attempt, taskID, providerID)
+		attemptErr := attempt.Err()
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return fail(shutdownMessage)
+		}
+		if !retryableReceiptError(err, attemptErr) {
+			return fail(receiptFailureReason(err))
+		}
+		timer := time.NewTimer(receiptRetryDelay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return fail(shutdownMessage)
+		}
+	}
+}
+
+func retryableReceiptError(err, attemptErr error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, driver.ErrBadConn) {
+		return true
+	}
+	expired := errors.Is(attemptErr, context.DeadlineExceeded)
+	var dbError *sqlite.Error
+	if errors.As(err, &dbError) {
+		switch dbError.Code() & 0xff {
+		case sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED:
+			return true
+		case sqlite3.SQLITE_INTERRUPT:
+			return expired
+		}
+	}
+	return expired && errors.Is(err, sql.ErrTxDone)
+}
+
+func receiptFailureReason(err error) string {
+	switch {
+	case errors.Is(err, errReceiptConflict):
+		return errReceiptConflict.Error()
+	case errors.Is(err, errReceiptState):
+		return errReceiptState.Error()
+	case errors.Is(err, sql.ErrNoRows):
+		return "local task no longer exists"
+	}
+	var dbError *sqlite.Error
+	if errors.As(err, &dbError) {
+		// Report the code without SQL content or other sensitive values.
+		return fmt.Sprintf("SQLite error %d", dbError.Code())
+	}
+	return fmt.Sprintf("local database write failed (%T)", err)
+}
+
+func (p *project) saveProviderReceipt(ctx context.Context, taskID, providerID string) error {
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	task := Task{ID: taskID}
+	if err := tx.QueryRowContext(ctx, "SELECT status,provider_id FROM tasks WHERE id=?", taskID).
+		Scan(&task.Status, &task.ProviderTaskID); err != nil {
+		return err
+	}
+	if task.ProviderTaskID == providerID {
+		return nil
+	}
+	if task.ProviderTaskID != "" {
+		return errReceiptConflict
+	}
+	if task.Status != "submitting" {
+		return errReceiptState
+	}
+	if err := updateTask(ctx, tx, task, "polling", providerID, "", "", ""); err != nil {
+		return err
+	}
+	if _, err := addEvent(ctx, tx, "task", []string{taskID}); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	p.notify()
+	return nil
 }
 
 func (p *project) providerTaskError(ctx context.Context, task Task, err error) error {

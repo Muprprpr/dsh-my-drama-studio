@@ -188,7 +188,7 @@ func (p *minimaxProvider) Submit(ctx context.Context, input GenerationInput) (Pr
 		if ref.URL != "" {
 			continue
 		}
-		local, err := openMinimaxMedia(input, ref)
+		local, err := openMinimaxMedia(input, ref, false)
 		if err != nil {
 			return ProviderSubmission{Rejected: true}, fmt.Errorf("视频输入素材 %d: %w", index+1, err)
 		}
@@ -242,12 +242,12 @@ type minimaxMultipart struct {
 func (b minimaxMultipart) Size() int64 { return b.size }
 
 type minimaxLocalMedia struct {
-	file io.ReadCloser
+	file *os.File
 	size int64
 }
 
-func openMinimaxMedia(input GenerationInput, ref GenerationReference) (minimaxLocalMedia, error) {
-	file, mime, err := readVideoMedia(input, ref, minimaxFileLimits[ref.Type])
+func openMinimaxMedia(input GenerationInput, ref GenerationReference, stable bool) (minimaxLocalMedia, error) {
+	file, mime, err := readVideoMedia(input, ref, minimaxFileLimits[ref.Type], stable)
 	if err != nil {
 		return minimaxLocalMedia{}, err
 	}
@@ -255,13 +255,8 @@ func openMinimaxMedia(input GenerationInput, ref GenerationReference) (minimaxLo
 		_ = file.Close()
 		return minimaxLocalMedia{}, errors.New("MiniMax H3 参考素材支持 PNG、JPEG、WebP、MP4、MOV、WAV 或 MP3")
 	}
-	local, ok := file.(interface{ Stat() (os.FileInfo, error) })
-	if !ok {
-		_ = file.Close()
-		return minimaxLocalMedia{}, errors.New("无法读取 MiniMax H3 素材的文件大小")
-	}
-	info, err := local.Stat()
-	if err != nil || info.Size() <= 0 || info.Size() > minimaxFileLimits[ref.Type] {
+	info, err := file.Stat()
+	if err != nil {
 		_ = file.Close()
 		return minimaxLocalMedia{}, errors.New("MiniMax H3 参考素材不可读或超出大小限制")
 	}

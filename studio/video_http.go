@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -285,9 +286,9 @@ func isVideoOutput(probe []byte) bool {
 	return format == "video/mp4" || format == "video/webm" || quickTime
 }
 
-func readVideoMedia(input GenerationInput, ref GenerationReference, limit int64) (io.ReadCloser, string, error) {
+func readVideoMedia(input GenerationInput, ref GenerationReference, limit int64, stable bool) (*os.File, string, error) {
 	if ref.Type == "image" {
-		return openImageReference(input, ref, limit)
+		return openImageReference(input, ref, limit, stable)
 	}
 	formats := map[string]string{
 		"video/.mp4": "video/mp4", "video/.mov": "video/quicktime", "video/.webm": "video/webm", "video/.m4v": "video/mp4",
@@ -302,7 +303,7 @@ func readVideoMedia(input GenerationInput, ref GenerationReference, limit int64)
 		!filepath.IsLocal(ref.Path) || filepath.ToSlash(filepath.Clean(ref.Path)) != ref.Path {
 		return nil, "", errors.New("Invalid project video or audio reference")
 	}
-	file, err := openProviderReference(input, ref, limit)
+	file, err := openProviderReference(input, ref, limit, stable)
 	if err != nil {
 		return nil, "", err
 	}
@@ -316,7 +317,7 @@ func videoMediaValue(input GenerationInput, ref GenerationReference, remaining *
 	if ref.Path == "" {
 		return "", errors.New("Video reference needs an accessible HTTP/HTTPS URL or a project asset")
 	}
-	file, mime, err := readVideoMedia(input, ref, *remaining)
+	file, mime, err := readVideoMedia(input, ref, *remaining, false)
 	if err != nil {
 		return "", err
 	}

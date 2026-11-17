@@ -4,6 +4,7 @@ import (
 	"image"
 	_ "image/jpeg"
 	_ "image/png"
+	"io"
 	"maps"
 	"slices"
 	"strings"
@@ -28,9 +29,6 @@ func prepareVideoGeneration(input *GenerationInput, profile *ProviderProfile, gl
 	}
 	if ratio := input.productionAspectRatio; ratio != "" && overrides.AspectRatio == "" {
 		if videoInheritsFirstFrameRatio(input.Mode, *profile) {
-			if err := checkProductionFirstFrame(*input, ratio); err != nil {
-				return err
-			}
 			model.Defaults.AspectRatio = ""
 			model.Limits.AspectRatios = nil
 		} else {
@@ -73,16 +71,7 @@ func videoInheritsFirstFrameRatio(mode string, profile ProviderProfile) bool {
 		(profile.Provider == "ark" || profile.Provider == "byteplus") && arkContractFor(profile).family == arkSeedance25)
 }
 
-func checkProductionFirstFrame(input GenerationInput, ratio string) error {
-	if len(input.References) == 0 {
-		return invalid("该模型从首帧继承画幅，请提供符合 %s 制作规格的首帧", ratio)
-	}
-	const imageLimit = 100 << 20
-	file, _, err := openImageReference(input, input.References[0], imageLimit)
-	if err != nil {
-		return invalid("该模型从首帧继承画幅，请使用可核对画幅的项目内 PNG 或 JPEG 首帧")
-	}
-	defer file.Close()
+func checkProductionFirstFrame(file io.Reader, ratio string) error {
 	config, _, err := image.DecodeConfig(file)
 	if err != nil {
 		return invalid("该模型从首帧继承画幅，请使用可核对画幅的项目内 PNG 或 JPEG 首帧")

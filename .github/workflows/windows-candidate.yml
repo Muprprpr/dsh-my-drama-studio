@@ -1,0 +1,64 @@
+name: Windows candidate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-pack:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      GOOS: windows
+      GOARCH: amd64
+      CGO_ENABLED: '0'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Go regression tests
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force .runtime/ci | Out-Null
+          go test -json -count=1 ./... | Tee-Object .runtime/ci/go-test.jsonl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go vet ./... 2>&1 | Tee-Object .runtime/ci/go-vet.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Node regression tests
+        shell: pwsh
+        run: |
+          node --test tests/canvas-layout.mjs tests/built-in-assets.mjs 2>&1 | Tee-Object .runtime/ci/node-test.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build and verify candidate tarball
+        shell: pwsh
+        run: |
+          & ./scripts/build.ps1 -Candidate 2>&1 | Tee-Object .runtime/ci/build.log
+      - name: Retain local test and build logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-test-logs
+          path: .runtime/ci/*
+          include-hidden-files: true
+      - name: Retain verified candidate and hashes
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-candidate-${{ github.sha }}
+          path: |
+            .runtime/release-candidate/**/candidate.json
+            .runtime/release-candidate/**/*.tgz
+          include-hidden-files: true
+          if-no-files-found: error

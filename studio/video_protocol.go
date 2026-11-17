@@ -181,10 +181,7 @@ func (p *videoProvider) Submit(ctx context.Context, input GenerationInput) (Prov
 	if p.key == "" && !p.channel.withoutKey() {
 		return ProviderSubmission{Rejected: true}, errors.New("视频渠道没有可用的 API 密钥")
 	}
-	remaining := int64(32 << 20)
-	if p.channel.Protocol == "openai-video" {
-		remaining = 15 << 20 // The encoded OpenAI image URL is limited to 20 MiB.
-	}
+	remaining := videoInlineMediaLimit(p.channel.Protocol)
 	refs := make([]string, 0, len(input.References))
 	for _, ref := range input.References {
 		value, err := videoMediaValue(input, ref, &remaining)
@@ -216,6 +213,13 @@ func (p *videoProvider) Submit(ctx context.Context, input GenerationInput) (Prov
 		}
 	}
 	return ProviderSubmission{}, errors.New("Video API did not return a valid task ID")
+}
+
+func videoInlineMediaLimit(protocol string) int64 {
+	if protocol == "openai-video" {
+		return 15 << 20 // The encoded OpenAI image URL is limited to 20 MiB.
+	}
+	return 32 << 20
 }
 
 func (p *videoProvider) submitRequest(input GenerationInput, refs []string) (string, string, map[string]any) {
