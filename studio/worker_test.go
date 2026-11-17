@@ -1,11 +1,15 @@
 package studio
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"image"
 	"image/png"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +17,370 @@ import (
 
 	"github.com/google/uuid"
 )
+
+func TestFrozenProjectMediaRejectsSamePathReplacement(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		replace bool
+	}{
+		{"replaced second reference prevents all channel calls", true},
+		{"unchanged references stay write-protected through upload", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const first = "assets/images/first.png"
+			const second = "assets/audio/sound.wav"
+			const audio = "RIFF\x28\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x40\x1f\x00\x00\x80\x3e\x00\x00\x02\x00\x10\x00data\x04\x00\x00\x00\xff\x1f\x01\x00"
+			dir := t.TempDir()
+			var frame bytes.Buffer
+			if err := png.Encode(&frame, image.NewRGBA(image.Rect(0, 0, 8, 8))); err != nil {
+				t.Fatal(err)
+			}
+			for path, content := range map[string][]byte{first: frame.Bytes(), second: []byte(audio)} {
+				file := filepath.Join(dir, filepath.FromSlash(path))
+				if err := os.MkdirAll(filepath.Dir(file), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(file, content, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			settings, err := OpenProfileSettings("")
+			if err != nil {
+				t.Fatal(err)
+			}
+			const channel = "local-media-freeze"
+			settings.data.Channels = []VideoChannel{{ID: channel, Name: "H3 fixture", Protocol: minimaxH3Protocol}}
+			settings.data.Profiles = []ProviderProfile{{
+				ID: uuid.NewString(), Name: "H3 fixture", ChannelID: channel, Model: minimaxH3Model, Modes: []string{"r2v"},
+				Limits: VideoLimits{References: map[string]int{"image": 1, "audio": 1}, MaxReferences: 2},
+			}}
+			settings.data.Keys[channel] = "fixture-not-a-live-token"
+			uploads, submits := 0, 0
+			settings.client.Transport = testTransport(func(req *http.Request) (*http.Response, error) {
+				if tc.replace {
+					t.Fatalf("changed local file reached the HTTP boundary: %s %s", req.Method, req.URL.Path)
+				}
+				switch req.Method + " " + req.URL.Path {
+				case "POST /api/minimax" + minimaxH3Upload:
+					uploads++
+					if uploads > 2 {
+						t.Fatalf("unexpected additional media upload: %d", uploads)
+					}
+					for _, path := range []string{first, second} {
+						writer, err := os.OpenFile(filepath.Join(dir, filepath.FromSlash(path)), os.O_WRONLY, 0)
+						if err == nil {
+							writer.Close()
+							t.Fatalf("adapter is uploading while %q can be opened for writing", path)
+						}
+					}
+					body, err := io.ReadAll(req.Body)
+					want := [][]byte{frame.Bytes(), []byte(audio)}[uploads-1]
+					if err != nil || !bytes.Contains(body, want) {
+						t.Fatalf("upload %d did not read the frozen file bytes: %v", uploads, err)
+					}
+					return arkFixtureResponse(http.StatusOK, fmt.Sprintf(`{"file":{"file_id":%d}}`, uploads))
+				case "POST /api/minimax" + minimaxH3Submit:
+					submits++
+					return arkFixtureResponse(http.StatusOK, `{"task_id":"4191234567891234"}`)
+				default:
+					t.Fatalf("unexpected channel request: %s %s", req.Method, req.URL)
+					return nil, nil
+				}
+			})
+			service := New(settings)
+			defer service.Close()
+			bindSession(t, service, dir, "a")
+			firstID, secondID, videoID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+			mustCall(t, service, dir, "a", "append", appendArgs{operation: operation{ID: "local-media-draft"}, Nodes: []NodeInput{
+				{ID: firstID, Type: "image", Content: json.RawMessage(`{"path":"` + first + `"}`)},
+				{ID: secondID, Type: "audio", Content: json.RawMessage(`{"path":"` + second + `"}`)},
+				{ID: videoID, Type: "video", Content: encodeMentionFixture(t, map[string]any{
+					"mode": "r2v", "prompt": "Maintain the framing and sound.",
+					"mixedListOrder": []string{firstID, secondID},
+				})},
+			}, Edges: []Edge{{firstID, videoID}, {secondID, videoID}}})
+			mustCall(t, service, dir, "a", "generateR2V", map[string]any{"operationId": "queue", "nodeId": videoID, "confirmed": true})
+			p, err := service.open(context.Background(), dir, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			task, stored, err := scanTask(p.db.QueryRow("SELECT " + taskColumns + " FROM tasks"))
+			if err != nil || task.Status != "pending" {
+				t.Fatalf("task did not queue: %+v (%v)", task, err)
+			}
+			var snapshot generationRequest
+			if err := json.Unmarshal([]byte(stored), &snapshot); err != nil || len(snapshot.References) != 2 ||
+				snapshot.References[0].LocalSHA256 != fmt.Sprintf("%x", sha256.Sum256(frame.Bytes())) ||
+				snapshot.References[1].LocalSHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte(audio))) {
+				t.Fatalf("snapshot did not freeze local media bytes: %s (%v)", stored, err)
+			}
+			if tc.replace {
+				file := filepath.Join(dir, filepath.FromSlash(second))
+				info, err := os.Stat(file)
+				if err != nil {
+					t.Fatal(err)
+				}
+				modified := []byte(audio)
+				modified[len(modified)-1] ^= 1
+				replacement := file + ".replacement"
+				if err := os.WriteFile(replacement, modified, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chtimes(replacement, info.ModTime(), info.ModTime()); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Rename(replacement, file); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := p.advance(context.Background(), settings); err != nil {
+				t.Fatal(err)
+			}
+			current, after, err := scanTask(p.db.QueryRow("SELECT " + taskColumns + " FROM tasks"))
+			if err != nil || after != stored || current.ID != task.ID {
+				t.Fatalf("task snapshot changed: %+v (%v)", current, err)
+			}
+			if tc.replace {
+				if uploads != 0 || submits != 0 || current.Status != "failed" ||
+					!strings.Contains(current.Error, second) || !strings.Contains(current.Error, "冻结的文件内容") {
+					t.Fatalf("changed media was not safely rejected: %+v, uploads=%d submits=%d", current, uploads, submits)
+				}
+			} else if uploads != 2 || submits != 1 || current.Status != "polling" || current.ProviderTaskID == "" {
+				t.Fatalf("valid frozen files did not reach the channel: %+v, uploads=%d submits=%d", current, uploads, submits)
+			}
+		})
+	}
+}
+
+func queueReplicateSettings(t *testing.T, profile ProviderProfile, transport testTransport) *ProviderSettings {
+	t.Helper()
+	settings, err := OpenProfileSettings("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.data.Profiles = []ProviderProfile{profile}
+	settings.data.Channels = []VideoChannel{{ID: "replicate", Name: "Replicate", Protocol: "replicate"}}
+	settings.data.Keys["replicate"] = "fixture-not-a-live-token"
+	settings.client.Transport = transport
+	return settings
+}
+
+func TestQueuedVideoSendsFrozenUpstreamVersion(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	const prompt = "  光线映在窗边。\n人物说：开始。\n最后一帧停住。\n"
+	const firstURL = "https://images.example/first.png"
+	const newerURL = "https://images.example/newer.png"
+	profile := ProviderProfile{ID: uuid.NewString(), Name: "Image to video fixture",
+		Provider: "replicate", ChannelID: "replicate", Modes: []string{"i2v"},
+		Model: "kwaivgi/kling-v2.5-turbo-pro", InputField: "start_image"}
+	var sends int
+	settings := queueReplicateSettings(t, profile, func(req *http.Request) (*http.Response, error) {
+		sends++
+		if req.Method != http.MethodPost || req.URL.Host != "api.replicate.com" ||
+			req.URL.Path != "/v1/models/"+profile.Model+"/predictions" {
+			t.Fatalf("unexpected channel request: %s %s", req.Method, req.URL)
+		}
+		var payload replicatePredictionInput
+		if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Input["prompt"] != prompt || payload.Input["start_image"] != firstURL {
+			t.Fatalf("channel did not send frozen prompt and first result: %+v", payload)
+		}
+		return &http.Response{StatusCode: http.StatusCreated, Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(`{"id":"frozen-receipt","status":"starting"}`))}, nil
+	})
+	service := New(settings)
+	defer service.Close()
+	bindSession(t, service, dir, "a")
+	service.SetHumanWriteCheck(func(context.Context, string, string, []string) (bool, error) { return true, nil })
+	sourceID, firstID, newerID, videoID := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
+	draft, err := json.Marshal(map[string]any{"mode": "i2v", "prompt": prompt, "mixedListOrder": []string{sourceID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustCall(t, service, dir, "a", "append", appendArgs{operation: operation{ID: "first-drafts"}, Nodes: []NodeInput{
+		{ID: sourceID, Type: "image", Content: json.RawMessage(`{"prompt":"First frame"}`)},
+		{ID: firstID, Type: "image", BasedOn: sourceID, Content: json.RawMessage(`{"url":"` + firstURL + `"}`)},
+	}})
+	p, err := service.open(ctx, dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordResult := func(outputID string) {
+		t.Helper()
+		if _, err := p.db.ExecContext(ctx, `INSERT INTO tasks(id,node_id,session_id,type,status,input,result_node_id,created_at,updated_at)
+			VALUES(?,?,'a','image','succeeded','{}',?,'','')`, uuid.NewString(), sourceID, outputID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recordResult(firstID)
+	if _, err := editCall(service, dir, "a", "human", "append", appendArgs{operation: operation{ID: "video-draft"}, Nodes: []NodeInput{
+		{ID: videoID, Type: "video", Content: draft},
+	}, Edges: []Edge{{sourceID, videoID}}}); err != nil {
+		t.Fatal(err)
+	}
+	args := map[string]any{"operationId": "freeze-video", "nodeId": videoID, "confirmed": true}
+	mustCall(t, service, dir, "a", "submit_manual", args)
+	before, snapshot, err := scanTask(p.db.QueryRow("SELECT " + taskColumns + " FROM tasks WHERE type='video'"))
+	if err != nil || before.Status != "pending" {
+		t.Fatalf("pending snapshot: %+v, %v", before, err)
+	}
+	var frozen generationRequest
+	if err := json.Unmarshal([]byte(snapshot), &frozen); err != nil || frozen.Prompt != prompt ||
+		frozen.VideoInputContract != videoInputContractVersion || len(frozen.References) != 1 {
+		t.Fatalf("wrong stored input: %s (%v)", snapshot, err)
+	}
+	if ref := frozen.References[0]; ref.URL != firstURL || ref.SourceNodeID != sourceID ||
+		ref.ResultNodeID != firstID || ref.Role != "first_frame" || ref.ResultRevision == 0 {
+		t.Fatalf("missing input version or role: %+v", ref)
+	}
+	mustCall(t, service, dir, "a", "append", appendArgs{operation: operation{ID: "newer-source-result"}, Nodes: []NodeInput{
+		{ID: newerID, Type: "image", BasedOn: sourceID, Content: json.RawMessage(`{"url":"` + newerURL + `"}`)},
+	}})
+	recordResult(newerID)
+	// Emulate a changed canvas on disk at recovery. Ordinary edits to active
+	// task sources are still protected by the service's workspace write checks.
+	if _, err := p.db.ExecContext(ctx, `DELETE FROM edges WHERE target=?;
+		UPDATE nodes SET content=json_set(content,'$.prompt','Edited canvas text') WHERE id=?;
+		UPDATE nodes SET deleted=1 WHERE id=?`, videoID, videoID, firstID); err != nil {
+		t.Fatal(err)
+	}
+	mustCall(t, service, dir, "a", "submit_manual", args)
+	if err := p.advance(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	after, stored, err := scanTask(p.db.QueryRow("SELECT " + taskColumns + " FROM tasks WHERE type='video'"))
+	if err != nil || sends != 1 || after.ID != before.ID || after.Status != "polling" || after.ProviderTaskID != "frozen-receipt" || stored != snapshot {
+		t.Fatalf("frozen task was replaced or rewritten: %+v, sends=%d, %v", after, sends, err)
+	}
+}
+
+func TestRecoveredVideoRequiresInputContractOnlyToSubmit(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	profile := ProviderProfile{ID: uuid.NewString(), Name: "Legacy fixture",
+		Provider: "replicate", ChannelID: "replicate", Mode: "t2v", Modes: []string{"t2v"},
+		Model: "wan-video/wan-2.7-t2v"}
+	var polls, downloads int
+	settings := queueReplicateSettings(t, profile, func(req *http.Request) (*http.Response, error) {
+		var body string
+		status := http.StatusOK
+		switch req.Method + " " + req.URL.Host + req.URL.Path {
+		case "GET api.replicate.com/v1/predictions/known-legacy-id":
+			polls++
+			if polls == 1 {
+				status, body = http.StatusServiceUnavailable, `{"detail":"transient upstream error"}`
+			} else {
+				body = `{"id":"known-legacy-id","status":"succeeded","output":"https://replicate.delivery/test/kept.mp4"}`
+			}
+		case "GET replicate.delivery/test/kept.mp4":
+			downloads++
+			body = string(protocolTestVideo)
+		default:
+			t.Fatalf("historical task made an unexpected channel call: %s %s", req.Method, req.URL)
+		}
+		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})
+	service := New(settings)
+	bindSession(t, service, dir, "a")
+	nodeID, archivedID, knownID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	const historyPath = "assets/videos/saved-history.mp4"
+	mustCall(t, service, dir, "a", "append", appendArgs{operation: operation{ID: "current"}, Nodes: []NodeInput{
+		{ID: nodeID, Type: "video", Content: json.RawMessage(`{"mode":"t2v","prompt":"Current canvas prompt"}`)},
+		{ID: archivedID, Type: "video", BasedOn: nodeID, Content: json.RawMessage(`{"path":"` + historyPath + `"}`)},
+	}})
+	if err := os.MkdirAll(filepath.Join(dir, "assets", "videos"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, filepath.FromSlash(historyPath)), protocolTestVideo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p, err := service.open(ctx, dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := generationRequest{GenerationInput: GenerationInput{Type: "video", Mode: "t2v", Profile: profile, Prompt: "Legacy prompt"}}
+	proofless, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy.References = []GenerationReference{{Type: "image", URL: "https://images.example/old-unconnected.png"}}
+	violating, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshots := map[string][]byte{
+		"proofless": proofless, "violating": violating, "interrupted": violating,
+		knownID: violating, "history": proofless,
+	}
+	for _, row := range []struct{ id, status, providerID, resultID, outputPath string }{
+		{id: "proofless", status: "pending"},
+		{id: "violating", status: "pending"},
+		{id: "interrupted", status: "submitting"},
+		{id: knownID, status: "paused", providerID: "known-legacy-id"},
+		{id: "history", status: "succeeded", providerID: "older-legacy-id", resultID: archivedID, outputPath: historyPath},
+	} {
+		if _, err := p.db.ExecContext(ctx, `INSERT INTO tasks(id,node_id,session_id,type,status,input,provider_id,result_node_id,output_path,created_at,updated_at)
+			VALUES(?,?,'a','video',?,?,?,?,?,'2025-01-01','2025-01-01')`, row.id, nodeID, row.status, string(snapshots[row.id]), row.providerID, row.resultID, row.outputPath); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := service.Close(); err != nil {
+		t.Fatal(err)
+	}
+	service = New(settings)
+	defer service.Close()
+	p = recoverProject(t, service, dir)
+	for range 5 {
+		if err := p.advance(ctx, settings); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if polls != 2 || downloads != 1 {
+		t.Fatalf("known ID did not survive recovery and a temporary polling error: polls=%d downloads=%d", polls, downloads)
+	}
+	tasks := tasksIn(t, service, dir, "a")
+	if len(tasks) != len(snapshots) {
+		t.Fatalf("historical task list has %d records, want %d", len(tasks), len(snapshots))
+	}
+	for _, task := range tasks {
+		switch task.ID {
+		case "proofless", "violating":
+			if task.Status != "failed" || task.Error != rebuildVideoInput || task.ProviderTaskID != "" {
+				t.Fatalf("unverified task not held for rebuild: %+v", task)
+			}
+			if _, err := call(service, dir, "a", "resume_task", map[string]any{"operationId": "try-" + task.ID, "taskId": task.ID}); err == nil || !strings.Contains(err.Error(), "有上游 ID") {
+				t.Fatalf("resume_task should require a provider ID for %s: %v", task.ID, err)
+			}
+		case "interrupted":
+			if task.Status != "uncertain" || !strings.Contains(task.Error, "确认未提交后，从当前 Canvas 节点重新生成") {
+				t.Fatalf("possibly submitted legacy task lost restart guidance: %+v", task)
+			}
+		case "history":
+			if task.Status != "succeeded" || task.ResultNodeID != archivedID || task.OutputPath != historyPath {
+				t.Fatalf("historical task was changed: %+v", task)
+			}
+		case knownID:
+			if task.Status != "succeeded" || task.ProviderTaskID != "known-legacy-id" || task.ResultNodeID == "" || task.OutputPath == "" {
+				t.Fatalf("known legacy task did not complete: %+v", task)
+			}
+		default:
+			t.Fatalf("unexpected task: %+v", task)
+		}
+		if task.Status == "succeeded" {
+			saved, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(task.OutputPath)))
+			if err != nil || !bytes.Equal(saved, protocolTestVideo) {
+				t.Fatalf("historical output is invalid: %s (%v)", task.OutputPath, err)
+			}
+		}
+		_, stored, err := scanTask(p.db.QueryRow("SELECT "+taskColumns+" FROM tasks WHERE id=?", task.ID))
+		if err != nil || stored != string(snapshots[task.ID]) {
+			t.Fatalf("snapshot %s was rewritten: %s (%v)", task.ID, stored, err)
+		}
+	}
+}
 
 type providerFixture struct {
 	submit func(GenerationInput) (ProviderSubmission, error)

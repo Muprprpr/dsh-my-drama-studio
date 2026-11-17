@@ -9,7 +9,8 @@ import { TaskDrawer, taskActive } from './task-drawer.jsx'
 import { availablePosition, layoutCanvas } from './canvas-layout.js'
 import {
   groupFields, isMedia, mediaTypes, textTypes,
-  nodeLabels, nodeTitle, presets, profileCandidates, referenceIds, referenceLimit, resolveProfile, shotLabel, videoMode,
+  nodeLabels, nodeTitle, presets, profileCandidates, referenceIds, referenceLimit, resolveProfile, shotLabel,
+  videoMode, videoReferenceIds,
 } from './canvas-node.jsx'
 
 const nodeTypes = { drama: GraphNode }
@@ -125,7 +126,8 @@ export function CanvasViewport({
 
   const index = useMemo(() => new Map([...referenceNodes, ...nodes].map(node => [node.id, node])), [nodes, referenceNodes])
   const resolvedMedia = useMemo(() => new Map(Object.entries(snapshot.resolvedMedia ?? {})), [snapshot.resolvedMedia])
-  const mentionedAssets = snapshot.mentionedAssets
+  const { mentionedAssets, invalidMedia } = snapshot
+  const sourceIds = node => node.type === 'video' ? videoReferenceIds(node, edges, index) : referenceIds(node)
   const locked = new Set(lockedNodeIds)
   latestLocks.current = locked
   const taskLockReason = id => locked.has(id) ? '执行中使用的节点，结束后可编辑。' : ''
@@ -223,7 +225,7 @@ export function CanvasViewport({
         },
         draft, editor: draft && editorFor(draft), rename: rename?.id === node.id ? rename.token : undefined,
         referenceFocus: referenceFocus?.id === node.id ? referenceFocus.token : undefined,
-        index, edges, resolvedMedia, mentionedAssets, mediaURL, generationProfiles, generationDefaults,
+        index, edges, resolvedMedia, mentionedAssets, invalidMedia, mediaURL, generationProfiles, generationDefaults,
         providerVersion, providerSettingsReady,
         tasks: taskIndex.get(node.id), selectedResult: selectedResultIds.has(node.id),
       },
@@ -245,7 +247,7 @@ export function CanvasViewport({
         ...actions, edit: () => selectNode(draft.id), delete: () => closeDraft(draft.id),
         upload: undefined, chooseAsset: undefined,
       }, rename: rename?.id === draft.id ? rename.token : undefined,
-      index, edges, resolvedMedia, mentionedAssets, mediaURL, generationProfiles, generationDefaults,
+      index, edges, resolvedMedia, mentionedAssets, invalidMedia, mediaURL, generationProfiles, generationDefaults,
       providerVersion, providerSettingsReady } })
   }
 
@@ -447,7 +449,7 @@ export function CanvasViewport({
     if (action !== 'update_node') return trackRevisions(await mutate(action, data))
     const base = committed ?? index.get(data.id)
     const previous = { id: base.id, ...groupOf(base), content: base.content,
-      referenceSources: mutableSources(base) ? referenceIds(base) : undefined }
+      referenceSources: mutableSources(base) ? base.referenceSources ?? sourceIds(base) : undefined }
     const result = trackRevisions(await mutate(action, data))
     const restore = async patch => trackRevisions(await mutate(action, {
       ...patch, revision: latestRevisions.current.get(data.id),
@@ -643,23 +645,25 @@ export function CanvasViewport({
     const to = index.get(target)
     if (!from || !to || from.deleted || to.deleted || source === target) return { error: '请选择另一个可用节点' }
     if (taskLockReason(target)) return { error: taskLockReason(target) }
-    if (edges.some(edge => edge.source === source && edge.target === target) || referenceIds(to).includes(source)) {
+    const current = sourceIds(to)
+    if (edges.some(edge => edge.source === source && edge.target === target) || current.includes(source)) {
       return { error: '此来源已连接' }
     }
     const original = reconnecting.current
     if (original && (original.target !== target || !canChangeEdge(original))) return { error: '此连线暂不可更改' }
     const ordered = original
-      ? referenceIds(to).map(id => id === original.source ? source : id)
-      : [...referenceIds(to), source]
+      ? current.map(id => id === original.source ? source : id)
+      : [...current, source]
     const content = { ...to.content }
     const kinds = ordered.map(id => index.get(id)?.type)
     if (to.type === 'video') {
       if (!mediaTypes.has(from.type)) return { error: '视频节点只接受图片、视频或音频输入' }
       const mode = videoMode(to)
       if (mode === 'asset') return { error: '请先为视频节点选择生成方式' }
+      if (mode === 't2v') return { error: '文生视频不接收素材。请先选择支持该输入的生成方式。' }
       // A draft with no saved mode can accept media without changing its settings.
       if (aiRunning && !to.content.mode) return { to, ordered, content }
-      const nextMode = !mode || mode === 't2v' ? defaultVideoInputMode(from.type) : mode
+      const nextMode = mode || defaultVideoInputMode(from.type)
       if (aiRunning && nextMode !== mode) return { error: '此连线需要修改视频生成方式，AI 结束后可操作。' }
       const profile = resolveProfile(profileCandidates(generationProfiles, nextMode), nextMode === mode ? content.profileId : undefined)
       const count = kind => kinds.filter(item => item === kind).length
@@ -872,11 +876,16 @@ export function CanvasViewport({
         const content = { ...node.content }
         delete content.providerTaskId
         delete content.canvasPosition
-        if (node.type === 'video') delete content.textList
+        if (node.type === 'video') {
+          delete content.textList
+          content.mixedListOrder = videoReferenceIds(node, edges, index).filter(id =>
+            !index.get(id)?.deleted && mediaTypes.has(index.get(id)?.type))
+        }
         return { id: node.id, type: node.type, content, position, ...groupOf(node) }
       }),
       edges: edges.filter(edge => byId.has(edge.target) &&
-        (index.get(edge.target)?.type !== 'video' || mediaTypes.has(index.get(edge.source)?.type))),
+        (index.get(edge.target)?.type !== 'video' ||
+          !index.get(edge.source)?.deleted && mediaTypes.has(index.get(edge.source)?.type))),
     }
   }
 
@@ -898,6 +907,16 @@ export function CanvasViewport({
     const nodesToAdd = data.nodes.map(({ id, position, ...node }) => {
       const content = { ...node.content }
       if (Array.isArray(content.mixedListOrder)) content.mixedListOrder = content.mixedListOrder.map(outgoing)
+      if (node.type === 'video' && Array.isArray(content.promptDoc?.content)) {
+        content.promptDoc = {
+          ...content.promptDoc,
+          content: content.promptDoc.content.map(paragraph => !paragraph.content ? paragraph : {
+            ...paragraph,
+            content: paragraph.content.map(part => part.type === 'assetMention' && ids.has(part.attrs?.assetId)
+              ? { ...part, attrs: { ...part.attrs, assetId: outgoing(part.attrs.assetId) } } : part),
+          }),
+        }
+      }
       return { ...node, id: ids.get(id), content }
     })
     await appendWithHistory({ nodes: nodesToAdd, edges: data.edges.map(edge => ({

@@ -40,7 +40,7 @@ func TestArkCreatePollDownloadAndVerify(t *testing.T) {
 	for _, region := range regions {
 		for _, mode := range []string{"t2v", "i2v", "r2v"} {
 			t.Run(region.provider+"/"+mode, func(t *testing.T) {
-				const prompt = "风吹过森林。保留完整提示词与声音描述。"
+				const prompt = " 风吹过森林。\n对白和屏显 @图片3 保持完整。 "
 				const outputURL = "https://ark-content-generation.tos-cn-beijing.volces.com/out.mov?signature=fixture"
 				const id = "cgt-fixture-01"
 				profile := ProviderProfile{
@@ -52,6 +52,12 @@ func TestArkCreatePollDownloadAndVerify(t *testing.T) {
 				}
 				input := GenerationInput{Type: "video", Mode: mode, Prompt: prompt}
 				wantContent := []any{map[string]any{"type": "text", "text": prompt}}
+				if mode == "r2v" {
+					input.Prompt += "\n沿用 @森林 的光线。"
+					start := strings.Index(input.Prompt, "@森林")
+					input.PromptMentions = []GenerationPromptMention{{Start: start, End: start + len("@森林"), Type: "image", Ordinal: 2}}
+					wantContent[0] = map[string]any{"type": "text", "text": prompt + "\n沿用 @图片2 的光线。"}
+				}
 				for i := 0; i < map[string]int{"t2v": 0, "i2v": 1, "r2v": 2}[mode]; i++ {
 					source := fmt.Sprintf("https://assets.example.test/ref-%d.png", i)
 					input.References = append(input.References, GenerationReference{Type: "image", URL: source})

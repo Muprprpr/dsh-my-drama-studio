@@ -170,12 +170,37 @@ func (p *minimaxProvider) Submit(ctx context.Context, input GenerationInput) (Pr
 	if err := p.Validate(input); err != nil {
 		return ProviderSubmission{Rejected: true}, err
 	}
-	content := []map[string]any{{"type": "text", "text": input.Prompt}}
+	prompt := input.Prompt
+	if input.Mode == "r2v" {
+		var err error
+		prompt, err = videoRequestPrompt(input, func(mention GenerationPromptMention) string {
+			return fmt.Sprintf("%s %d", assetMentionLabels[mention.Type], mention.Ordinal)
+		})
+		if err != nil {
+			return ProviderSubmission{Rejected: true}, err
+		}
+	}
+	if p.key == "" {
+		return ProviderSubmission{Rejected: true}, errors.New("视频渠道没有可用的 API 密钥")
+	}
+	localMedia := make([]minimaxLocalMedia, len(input.References))
+	for index, ref := range input.References {
+		if ref.URL != "" {
+			continue
+		}
+		local, err := openMinimaxMedia(input, ref)
+		if err != nil {
+			return ProviderSubmission{Rejected: true}, fmt.Errorf("视频输入素材 %d: %w", index+1, err)
+		}
+		defer local.file.Close()
+		localMedia[index] = local
+	}
+	content := []map[string]any{{"type": "text", "text": prompt}}
 	for index, ref := range input.References {
 		mediaURL := ref.URL
 		if mediaURL == "" {
 			var err error
-			mediaURL, err = p.upload(ctx, input, ref)
+			mediaURL, err = p.upload(ctx, localMedia[index], ref.Path)
 			if err != nil {
 				return ProviderSubmission{Rejected: true}, err
 			}
@@ -216,29 +241,40 @@ type minimaxMultipart struct {
 
 func (b minimaxMultipart) Size() int64 { return b.size }
 
-func (p *minimaxProvider) upload(ctx context.Context, input GenerationInput, ref GenerationReference) (string, error) {
+type minimaxLocalMedia struct {
+	file io.ReadCloser
+	size int64
+}
+
+func openMinimaxMedia(input GenerationInput, ref GenerationReference) (minimaxLocalMedia, error) {
 	file, mime, err := readVideoMedia(input, ref, minimaxFileLimits[ref.Type])
 	if err != nil {
-		return "", err
+		return minimaxLocalMedia{}, err
 	}
-	defer file.Close()
 	if !slices.Contains([]string{"image/png", "image/jpeg", "image/webp", "video/mp4", "video/quicktime", "audio/wav", "audio/mpeg"}, mime) {
-		return "", errors.New("MiniMax H3 参考素材支持 PNG、JPEG、WebP、MP4、MOV、WAV 或 MP3")
+		_ = file.Close()
+		return minimaxLocalMedia{}, errors.New("MiniMax H3 参考素材支持 PNG、JPEG、WebP、MP4、MOV、WAV 或 MP3")
 	}
 	local, ok := file.(interface{ Stat() (os.FileInfo, error) })
 	if !ok {
-		return "", errors.New("无法读取 MiniMax H3 素材的文件大小")
+		_ = file.Close()
+		return minimaxLocalMedia{}, errors.New("无法读取 MiniMax H3 素材的文件大小")
 	}
 	info, err := local.Stat()
 	if err != nil || info.Size() <= 0 || info.Size() > minimaxFileLimits[ref.Type] {
-		return "", errors.New("MiniMax H3 参考素材不可读或超出大小限制")
+		_ = file.Close()
+		return minimaxLocalMedia{}, errors.New("MiniMax H3 参考素材不可读或超出大小限制")
 	}
+	return minimaxLocalMedia{file, info.Size()}, nil
+}
+
+func (p *minimaxProvider) upload(ctx context.Context, media minimaxLocalMedia, path string) (string, error) {
 	var envelope bytes.Buffer
 	writer := multipart.NewWriter(&envelope)
 	if err := writer.WriteField("purpose", "video_generation_input"); err != nil {
 		return "", err
 	}
-	if _, err := writer.CreateFormFile("file", "reference"+strings.ToLower(filepath.Ext(ref.Path))); err != nil {
+	if _, err := writer.CreateFormFile("file", "reference"+strings.ToLower(filepath.Ext(path))); err != nil {
 		return "", err
 	}
 	prefixLength := envelope.Len()
@@ -247,8 +283,8 @@ func (p *minimaxProvider) upload(ctx context.Context, input GenerationInput, ref
 	}
 	prefix, suffix := envelope.Bytes()[:prefixLength], envelope.Bytes()[prefixLength:]
 	body := minimaxMultipart{
-		Reader: io.MultiReader(bytes.NewReader(prefix), io.LimitReader(file, info.Size()), bytes.NewReader(suffix)),
-		size:   int64(envelope.Len()) + info.Size(),
+		Reader: io.MultiReader(bytes.NewReader(prefix), io.LimitReader(media.file, media.size), bytes.NewReader(suffix)),
+		size:   int64(envelope.Len()) + media.size,
 	}
 	response, err := p.request(ctx, http.MethodPost, p.endpoint(minimaxH3Upload), writer.FormDataContentType(), body)
 	if err != nil {

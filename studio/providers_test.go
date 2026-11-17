@@ -160,16 +160,3 @@ func TestProviderTemplatesAndModeConstraints(t *testing.T) {
 		}
 	}
 }
-
-func TestKlingPresetUsesNativeReferenceMarker(t *testing.T) {
-	profile := ProviderProfile{Mode: "r2v", Model: "kwaivgi/kling-v3-omni-video", InputField: "reference_images"}
-	input := GenerationInput{Mode: "r2v", Type: "video", Prompt: "@图片1 转身看向 @image2。",
-		References: []GenerationReference{
-			{Type: "image", URL: "https://example.com/first.png"},
-			{Type: "image", URL: "https://example.com/second.png"},
-		}}
-	_, request, err := replicateRequest(profile, input)
-	if err != nil || request.Input["prompt"] != "<<<image_1>>> 转身看向 <<<image_2>>>。" {
-		t.Fatalf("Kling reference prompt: %+v %v", request, err)
-	}
-}

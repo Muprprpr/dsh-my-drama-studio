@@ -216,26 +216,27 @@ func TestHumanOrderedEdgesStayConsistent(t *testing.T) {
 	if result := exactNode(t, s, dir, "a", video); result.Revision != 2 || !strings.Contains(string(result.Content), second) {
 		t.Fatalf("edge replacement did not update the ordered slot: %+v", result)
 	}
-	for _, args := range []changeEdgeArgs{
-		{operation: operation{ID: "remove-required"}, Source: second, Target: video, Revision: 2},
-		{operation: operation{ID: "replace-with-text"}, Source: second, Target: video, NewSource: note, Revision: 2},
-	} {
-		action := "update_edge"
-		if args.NewSource == "" {
-			action = "delete_edge"
-		}
-		_, err := editCall(s, dir, "a", "human", action, args)
-		var bad *requestError
-		if !errors.As(err, &bad) || bad.code != http.StatusBadRequest {
-			t.Fatalf("invalid video relationship accepted: %v", err)
-		}
+	_, err := editCall(s, dir, "a", "human", "update_edge", changeEdgeArgs{
+		operation: operation{ID: "replace-with-text"}, Source: second, Target: video, NewSource: note, Revision: 2,
+	})
+	var bad *requestError
+	if !errors.As(err, &bad) || bad.code != http.StatusBadRequest {
+		t.Fatalf("invalid video relationship accepted: %v", err)
 	}
 	if current := exactNode(t, s, dir, "a", video); current.Revision != 2 || !strings.Contains(string(current.Content), second) {
 		t.Fatalf("invalid relationship corrupted video: %+v", current)
 	}
+	mustEdit(t, s, dir, "a", "delete_edge", changeEdgeArgs{
+		operation: operation{ID: "remove-required"}, Source: second, Target: video, Revision: 2,
+	})
+	if _, err := call(s, dir, "a", "generateI2V", map[string]any{
+		"operationId": "submit-without-frame", "nodeId": video, "confirmed": true,
+	}); err == nil || !strings.Contains(err.Error(), "需要首帧") {
+		t.Fatalf("incomplete draft reached submission: %v", err)
+	}
 	none := []string{}
 	mustEdit(t, s, dir, "a", "update_node", updateNodeArgs{
-		nodeRevisionArgs: nodeRevisionArgs{operation: operation{ID: "switch-mode"}, ID: video, Revision: 2},
+		nodeRevisionArgs: nodeRevisionArgs{operation: operation{ID: "switch-mode"}, ID: video, Revision: 3},
 		Content:          json.RawMessage(`{"mode":"t2v","prompt":"演员穿过房间。"}`), ReferenceSources: &none,
 	})
 	mustEdit(t, s, dir, "a", "delete_node", nodeRevisionArgs{operation: operation{ID: "archive-image"}, ID: first, Revision: 1})

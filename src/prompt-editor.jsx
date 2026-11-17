@@ -76,7 +76,7 @@ function Thumbnail({ item, className = '', video = false, onDuration }) {
   </span>
 }
 
-function AssetDetails({ anchor, item, close, onPreview, onLocate }) {
+function AssetDetails({ anchor, item, close, onPreview, onLocate, asText }) {
   const surface = useRef(null)
   const [duration, setDuration] = useState(null)
   useLayoutEffect(() => {
@@ -129,19 +129,20 @@ function AssetDetails({ anchor, item, close, onPreview, onLocate }) {
       <strong>{item.label}</strong>
       <span>{assetSummary(item, duration)}</span>
     </div>
-    {(onPreview && !item.disabled || onLocate && item.nodeId) && <div className="drama-prompt-asset-actions">
+    {(onPreview && !item.disabled || onLocate && item.nodeId || asText) && <div className="drama-prompt-asset-actions">
       {onPreview && !item.disabled && <Button type="button" size="sm" onClick={() => { close(); onPreview(item) }}>
         预览素材
       </Button>}
       {onLocate && item.nodeId && <Button type="button" size="sm" onClick={() => { close(); onLocate(item.nodeId) }}>
         定位节点
       </Button>}
+      {asText && <Button type="button" size="sm" onClick={() => { close(); asText() }}>转为普通文字</Button>}
     </div>}
   </div>, anchor.ownerDocument.body)
 }
 
-function AssetMentionView({ node, selected }) {
-  const { assets, showThumbnails, onPreview, onLocate } = useContext(Assets)
+function AssetMentionView({ node, selected, editor, getPos }) {
+  const { assets, showThumbnails, onPreview, onLocate, allowPlainMention, disabled } = useContext(Assets)
   const { assetId, assetType, label } = node.attrs
   const current = assets.get(assetId)
   const asset = current?.assetType === assetType ? current : null
@@ -149,6 +150,12 @@ function AssetMentionView({ node, selected }) {
     label: asset?.label || label || mediaLabels[assetType] }
   const [anchor, setAnchor] = useState(null)
   const close = React.useCallback(() => setAnchor(null), [])
+  const asText = allowPlainMention && !disabled ? () => {
+    const from = getPos()
+    if (!Number.isInteger(from) || editor.view.composing) return
+    editor.chain().focus().insertContentAt({ from, to: from + node.nodeSize },
+      { type: 'text', text: '@' + (label || mediaLabels[assetType]) }).run()
+  } : undefined
   return <NodeViewWrapper as="span" data-asset-mention="" data-asset-id={assetId} data-asset-type={assetType}
     className={'drama-prompt-mention' + (selected ? ' is-selected' : '') + (item.disabled ? ' is-unavailable' : '')}>
     <button type="button" tabIndex={0} aria-haspopup="dialog" aria-expanded={Boolean(anchor)}
@@ -162,7 +169,7 @@ function AssetMentionView({ node, selected }) {
       <span className="drama-prompt-token-label">@{item.label}</span>
       {item.disabled && <small>失效</small>}
     </button>
-    {anchor && <AssetDetails anchor={anchor} item={item} close={close} onPreview={onPreview} onLocate={onLocate} />}
+    {anchor && <AssetDetails anchor={anchor} item={item} close={close} onPreview={onPreview} onLocate={onLocate} asText={asText} />}
   </NodeViewWrapper>
 }
 
@@ -183,7 +190,7 @@ function SuggestionAsset({ item }) {
 }
 
 const SuggestionList = forwardRef(function SuggestionList({ command, query, bridge }, ref) {
-  const { assets, search } = useContext(Assets)
+  const { assets, search, allowPlainMention } = useContext(Assets)
   const [category, setCategory] = useState('all')
   const [active, setActive] = useState(0)
   const [remote, setRemote] = useState(null)
@@ -199,7 +206,7 @@ const SuggestionList = forwardRef(function SuggestionList({ command, query, brid
     for (const item of current ?? []) {
       if (!combined.has(item.assetId)) combined.set(item.assetId, assets.get(item.assetId) ?? item)
     }
-    return [...combined.values()].filter(item => atomAttrs(item) && matchesCategory(item, category)).slice(0, 50)
+    return [...combined.values()].filter(item => !item.lookupOnly && atomAttrs(item) && matchesCategory(item, category)).slice(0, 50)
   }, [remote, query, category, assets, searchTerm])
   const available = matches.filter(item => !item.disabled)
   const activeItem = available[active] ?? available[0]
@@ -260,12 +267,13 @@ const SuggestionList = forwardRef(function SuggestionList({ command, query, brid
         return true
       }
       if (event.key === 'Enter' || event.key === 'Tab' && !event.shiftKey && activeItem) {
+        if (!activeItem && allowPlainMention) return false
         if (activeItem) command(activeItem)
         return true
       }
       return false
     },
-  }), [available, activeItem, category, command])
+  }), [available, activeItem, allowPlainMention, category, command])
 
   return <section className="drama-prompt-suggestions nodrag nopan nowheel" aria-label="素材搜索"
     onPointerDown={event => event.stopPropagation()} onMouseDown={event => event.preventDefault()}
@@ -282,7 +290,8 @@ const SuggestionList = forwardRef(function SuggestionList({ command, query, brid
         <SuggestionAsset key={item.thumbnailUrl || item.mediaUrl || item.assetId} item={item} />
       </button>)}
       {!matches.length && <p role="status">{loading ? '正在查找素材…' : error ? '无法读取项目素材。'
-        : category === 'character' || category === 'scene' ? '当前项目没有匹配的' + categories[category] + '资产。'
+        : allowPlainMention ? '暂无匹配的已连接素材。'
+          : category === 'character' || category === 'scene' ? '当前项目没有匹配的' + categories[category] + '资产。'
           : '暂无匹配素材。'}</p>}
     </div>
   </section>
@@ -381,7 +390,7 @@ function mentionExtension(bridge) {
 export const PromptEditor = forwardRef(function PromptEditor({
   value, prompt = '', onChange, assets = emptyAssets, search, onPreview, onLocate, onAssetSelect,
   onCompositionChange, disabled = false, ariaLabel = '提示词', placeholder = '', autoFocus = false,
-  showThumbnails = true, className = '', name = 'prompt',
+  showThumbnails = true, allowPlainMention = false, className = '', name = 'prompt',
 }, ref) {
   const bridge = useRef({ composing: false, compositionClosedAt: 0, lastDoc: null })
   bridge.current.onAssetSelect = onAssetSelect
@@ -509,7 +518,8 @@ export const PromptEditor = forwardRef(function PromptEditor({
 
   const assetContext = useMemo(() => ({
     assets: new Map(assets.map(item => [item.assetId, item])), search, onPreview, onLocate, showThumbnails,
-  }), [assets, search, onPreview, onLocate, showThumbnails])
+    allowPlainMention, disabled,
+  }), [assets, search, onPreview, onLocate, showThumbnails, allowPlainMention, disabled])
   return <Assets.Provider value={assetContext}>
     <div className={'drama-prompt-editor nodrag nopan nowheel ' + className}
       onKeyDown={event => {

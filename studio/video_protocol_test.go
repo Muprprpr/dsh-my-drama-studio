@@ -9,7 +9,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -160,7 +162,11 @@ func TestOpenAIVideoUsesReferenceObjectAndContentEndpoint(t *testing.T) {
 }
 
 func TestCustomRESTMapsV2VAndChecksAuthentication(t *testing.T) {
+	const prompt = " Edit the motion.\nKeep this dialogue: “Start.”\nKeep @图片2 as visible lettering. "
+	const route = "/jobs?api-version=2026-11&tenant=production%2Fstudio"
+	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		requests.Add(1)
 		if req.Header.Get("X-Video-Key") != "fixture-video-key" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
@@ -170,17 +176,26 @@ func TestCustomRESTMapsV2VAndChecksAuthentication(t *testing.T) {
 		}
 		switch req.Method + " " + req.URL.Path {
 		case "PATCH /api/jobs":
+			if req.URL.RawQuery != "api-version=2026-11&tenant=production%2Fstudio" {
+				t.Errorf("unexpected submit route metadata %q", req.URL.RawQuery)
+			}
 			body := protocolBody(t, req)
-			if videoField(body, "options.source") != "https://media.example.com/source.mp4" ||
-				videoField(body, "options.assets") != nil ||
-				videoField(body, "options.sound") != false ||
-				videoField(body, "options.prompt") != "Edit the motion." ||
-				videoField(body, "resolution") != nil {
+			options := map[string]any{"sound": false, "prompt": prompt}
+			if videoField(body, "options.assets") == nil {
+				options["source"] = "https://media.example.com/source.mp4"
+			} else {
+				options["assets"] = []any{
+					map[string]any{"type": "video", "url": "https://media.example.com/source.mp4"},
+					map[string]any{"type": "audio", "url": "https://media.example.com/audio.wav"},
+				}
+			}
+			want := map[string]any{"model": "provider/demo", "options": options}
+			if !reflect.DeepEqual(body, want) {
 				t.Errorf("unexpected custom payload: %#v", body)
 			}
 			fmt.Fprint(w, `{"result":{"id":"job:1"}}`)
 		case "POST /api/query":
-			if req.URL.Query().Get("task") != "job:1" {
+			if req.URL.Query().Get("task") != "job:1" || req.URL.Query().Get("mode") != "status" {
 				t.Errorf("task ID was incorrectly encoded: %s", req.URL)
 			}
 			fmt.Fprint(w, `{"result":{"id":"job:1","phase":"done","files":[{"download":"/api/content.mp4"}]}}`)
@@ -197,15 +212,15 @@ func TestCustomRESTMapsV2VAndChecksAuthentication(t *testing.T) {
 	}))
 	defer server.Close()
 	channel := VideoChannel{Protocol: "custom-rest", BaseURL: server.URL + "/api", Advanced: &CustomREST{
-		SubmitURL: "/jobs", SubmitMethod: "PATCH", Auth: "header", AuthHeader: "X-Video-Key",
+		SubmitURL: route, SubmitMethod: "PATCH", Auth: "header", AuthHeader: "X-Video-Key",
 		Fields:     map[string]string{"prompt": "options.prompt", "sourceVideo": "options.source", "references": "options.assets", "generateAudio": "options.sound"},
-		TaskIDPath: "result.id", QueryURL: "/query?task={taskId}", QueryMethod: "POST",
+		TaskIDPath: "result.id", QueryURL: "/query?task={taskId}&mode=status", QueryMethod: "POST",
 		StatusPath: "result.phase", StatusMap: map[string]string{"done": "completed", "error": "failed"},
 		OutputURLPath: "result.files.0.download", ProbeURL: "/account", ModelProbeURL: "/models/{model}",
 	}}
 	p := protocolFixture(channel, server.Client())
 	audio := false
-	input := GenerationInput{Type: "video", Mode: "v2v", Prompt: "Edit the motion.",
+	input := GenerationInput{Type: "video", Mode: "v2v", Prompt: prompt,
 		Params: VideoParams{Resolution: "ignored-by-adapter", GenerateAudio: &audio},
 		References: []GenerationReference{
 			{Type: "video", URL: "https://media.example.com/source.mp4"},
@@ -213,18 +228,35 @@ func TestCustomRESTMapsV2VAndChecksAuthentication(t *testing.T) {
 	protocolSubmitAndDownload(t, p, input, "job:1", "succeeded")
 	input.Mode = "r2v"
 	input.References = append(input.References, GenerationReference{Type: "audio", URL: "https://media.example.com/audio.wav"})
-	if err := p.Validate(input); err != nil {
-		t.Fatal(err)
-	}
-	body := p.customPayload(input, []string{input.References[0].URL, input.References[1].URL})
-	media, _ := videoField(body, "options.assets").([]map[string]string)
-	if len(media) != 2 || media[0]["type"] != "video" || media[1]["url"] != input.References[1].URL {
-		t.Fatalf("custom R2V did not preserve ordered media: %#v", body)
-	}
+	protocolSubmitAndDownload(t, p, input, "job:1", "succeeded")
 	probe := p.Probe(context.Background(), "provider/demo")
 	if probe.Authentication != "verified" || probe.ModelCallable != "listed" || probe.TaskSucceeded != "unverified" {
 		t.Fatalf("custom auth challenge and model lookup failed: %+v", probe)
 	}
+	before := requests.Load()
+	for _, injection := range []string{
+		"%70rompt=external-text",
+		"negative-prompt=external-text",
+		"IMAGE_URL=https%3A%2F%2Fexample.test%2Funconnected.png",
+		"model_id=external-model",
+		"generate-audio=true",
+		"options=external-input",
+		"options.assets=external-input",
+		"options%5Bassets%5D%5B0%5D=external-input",
+		"options.route=external-input",
+	} {
+		channel.Advanced.SubmitURL = route + "&" + injection
+		submission, err := p.Submit(context.Background(), input)
+		if err == nil || !strings.Contains(err.Error(), "查询参数") || strings.Contains(err.Error(), "external-") ||
+			!submission.Rejected || requests.Load() != before {
+			t.Errorf("submit URL with query %q returned %+v, %v; requests %d", injection, submission, err, requests.Load()-before)
+		}
+	}
+	result, err := p.Poll(context.Background(), "job:1")
+	if err != nil || result.Status != "succeeded" || requests.Load() != before+1 {
+		t.Fatalf("static submit query blocked polling an existing task: %+v, %v", result, err)
+	}
+	channel.Advanced.SubmitURL = route
 	channel.Advanced.Fields["duration"] = "options"
 	if err := validateVideoChannel(channel); err == nil {
 		t.Fatal("custom field path collisions must be rejected")

@@ -44,8 +44,9 @@ func (p *project) permission(ctx context.Context, r Request) (any, error) {
 
 type submitArgs struct {
 	operation
-	NodeID    string `json:"nodeId"`
-	ProfileID string `json:"profileId,omitempty"`
+	NodeID           string `json:"nodeId"`
+	ProfileID        string `json:"profileId,omitempty"`
+	ExpectedRevision *int64 `json:"expectedRevision,omitempty"`
 }
 
 func (p *project) submit(ctx context.Context, r Request, providers providerRegistry, expectedMode string) (any, error) {
@@ -86,18 +87,15 @@ func (p *project) submit(ctx context.Context, r Request, providers providerRegis
 		if err != nil {
 			return nil, err
 		}
+		if args.ExpectedRevision != nil && *args.ExpectedRevision != revision {
+			return nil, revisionConflict
+		}
 		if kind == "video" {
 			if r.Action == "submit" {
 				if err := checkAutomaticVideoDraft(ctx, tx, snapshot, workflowRef{ID: args.NodeID, Revision: revision}); err != nil {
 					return nil, err
 				}
 			}
-			if err := validateVideo(ctx, tx, args.NodeID, true); err != nil {
-				return nil, err
-			}
-		}
-		if providers == nil {
-			return nil, providerUnavailable
 		}
 		input, pinned, sourceIDs, err := generationInput(ctx, tx, p.dir, args.NodeID, kind, snapshot)
 		if err != nil {
@@ -105,6 +103,9 @@ func (p *project) submit(ctx context.Context, r Request, providers providerRegis
 		}
 		if expectedMode != "" && (input.Type != "video" || input.Mode != expectedMode) {
 			return nil, invalid("当前视频节点的生成方式与请求不匹配")
+		}
+		if providers == nil {
+			return nil, providerUnavailable
 		}
 		if args.ProfileID == "" {
 			args.ProfileID = pinned
@@ -117,8 +118,12 @@ func (p *project) submit(ctx context.Context, r Request, providers providerRegis
 		if err != nil {
 			return nil, err
 		}
-		encoded, err := json.Marshal(generationRequest{GenerationInput: input, SourceGroup: &group, SourceNodeIDs: sourceIDs,
-			SourceNodeRevision: revision, ManualConfirmation: r.Action != "submit"})
+		request := generationRequest{GenerationInput: input, SourceGroup: &group, SourceNodeIDs: sourceIDs,
+			SourceNodeRevision: revision, ManualConfirmation: r.Action != "submit"}
+		if kind == "video" {
+			request.VideoInputContract = videoInputContractVersion
+		}
+		encoded, err := json.Marshal(request)
 		if err != nil {
 			return nil, err
 		}
@@ -327,32 +332,29 @@ func (p *project) controlTask(ctx context.Context, r Request) (any, error) {
 }
 
 func generationInput(ctx context.Context, tx *sql.Tx, workspace, id, kind, snapshot string) (GenerationInput, string, []string, error) {
+	if kind == "video" {
+		return videoGenerationInput(ctx, tx, workspace, id, snapshot)
+	}
 	var content struct {
-		Prompt                string          `json:"prompt"`
-		PromptDoc             json.RawMessage `json:"promptDoc"`
-		Order                 []string        `json:"mixedListOrder"`
-		Mode                  string          `json:"mode"`
-		ProfileID             string          `json:"profileId"`
-		Params                json.RawMessage `json:"params"`
-		ProductionAspectRatio string          `json:"productionAspectRatio"`
+		Prompt    string          `json:"prompt"`
+		PromptDoc json.RawMessage `json:"promptDoc"`
+		Order     []string        `json:"mixedListOrder"`
+		Mode      string          `json:"mode"`
+		ProfileID string          `json:"profileId"`
+		Params    json.RawMessage `json:"params"`
 	}
 	if err := json.Unmarshal([]byte(snapshot), &content); err != nil {
 		return GenerationInput{}, "", nil, invalid("生成节点格式无效")
 	}
 	input := GenerationInput{Type: kind, Prompt: content.Prompt, Mode: content.Mode, WorkspacePath: workspace}
-	if kind == "video" {
-		input.productionAspectRatio = content.ProductionAspectRatio
-	}
 	params, err := decodeVideoParams(content.Params)
 	if err != nil {
 		return GenerationInput{}, "", nil, err
 	}
 	input.Params = params
-	if kind == "image" {
-		content.Order, err = imageReferenceOrder(ctx, tx, id, content.Order)
-		if err != nil {
-			return GenerationInput{}, "", nil, err
-		}
+	content.Order, err = imageReferenceOrder(ctx, tx, id, content.Order)
+	if err != nil {
+		return GenerationInput{}, "", nil, err
 	}
 	sourceIDs := []string{}
 	var text []string
@@ -361,24 +363,21 @@ func generationInput(ctx context.Context, tx *sql.Tx, workspace, id, kind, snaps
 		var raw string
 		err := tx.QueryRowContext(ctx, `SELECT nodes.type,nodes.content FROM nodes JOIN edges ON edges.source=nodes.id
 			WHERE edges.target=? AND nodes.id=? AND nodes.deleted=0`, id, reference).Scan(&source.Type, &raw)
-		if errors.Is(err, sql.ErrNoRows) && kind == "image" {
-			continue // Legacy archived image links do not participate in current generation.
-		}
 		if errors.Is(err, sql.ErrNoRows) {
-			return GenerationInput{}, "", nil, invalid("视频节点引用了已移除的素材")
+			continue // Legacy archived image links do not participate in current generation.
 		}
 		if err != nil {
 			return GenerationInput{}, "", nil, err
 		}
 		source.ID, source.Content = reference, json.RawMessage(raw)
 		sourceIDs = append(sourceIDs, reference)
-		if kind == "image" && isTextNode(source.Type) {
+		if isTextNode(source.Type) {
 			if context := nodeText(source.Content); context != "" {
 				text = append(text, context)
 			}
 			continue
 		}
-		if source.Type != "image" && (kind != "video" || !isVideoMedia(source.Type)) {
+		if source.Type != "image" {
 			return GenerationInput{}, "", nil, invalid("生成节点包含不兼容的参考素材")
 		}
 		resolved, err := resolveMediaNode(ctx, tx, source)
@@ -414,38 +413,10 @@ func generationInput(ctx context.Context, tx *sql.Tx, workspace, id, kind, snaps
 	if strings.TrimSpace(input.Prompt) == "" {
 		return GenerationInput{}, "", nil, invalid("请填写生成提示词")
 	}
-	if kind == "image" {
-		if input.Mode != "" && input.Mode != "t2i" {
-			return GenerationInput{}, "", nil, invalid("图片生成需要 T2I 预设")
-		}
-		input.Mode = "t2i"
-		return input, content.ProfileID, sourceIDs, nil
+	if input.Mode != "" && input.Mode != "t2i" {
+		return GenerationInput{}, "", nil, invalid("图片生成需要 T2I 预设")
 	}
-	kinds := make([]string, 0, len(input.References))
-	for _, ref := range input.References {
-		kinds = append(kinds, ref.Type)
-	}
-	if input.Mode == "" {
-		for _, media := range kinds {
-			if media != "image" {
-				return GenerationInput{}, "", nil, invalid("引用视频或音频素材时请明确选择生成方式")
-			}
-		}
-		switch len(kinds) {
-		case 0:
-			input.Mode = "t2v"
-		case 1:
-			input.Mode = "i2v"
-		default:
-			input.Mode = "r2v"
-		}
-	}
-	if err := validateVideoInputs(input.Mode, kinds); err != nil {
-		return GenerationInput{}, "", nil, err
-	}
-	if err := validateVideoPromptReferences(input.Prompt, kinds); err != nil {
-		return GenerationInput{}, "", nil, err
-	}
+	input.Mode = "t2i"
 	return input, content.ProfileID, sourceIDs, nil
 }
 

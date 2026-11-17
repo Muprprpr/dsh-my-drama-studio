@@ -36,11 +36,11 @@ func parsePromptDoc(raw json.RawMessage) (*promptElement, error) {
 	if err := json.Unmarshal(raw, &doc); err != nil || doc.Type != "doc" || doc.Text != "" || len(doc.Attrs) != 0 {
 		return nil, invalid("提示词文档格式无效")
 	}
-	_, err := doc.render(false, func(assetMention) (string, error) { return "", nil })
+	_, err := doc.render(false, func(assetMention, int) (string, error) { return "", nil })
 	return &doc, err
 }
 
-func (doc *promptElement) render(numberedMentions bool, mention func(assetMention) (string, error)) (string, error) {
+func (doc *promptElement) render(numberedMentions bool, mention func(assetMention, int) (string, error)) (string, error) {
 	var prompt strings.Builder
 	for index, paragraph := range doc.Content {
 		if paragraph.Type != "paragraph" || paragraph.Text != "" || len(paragraph.Attrs) != 0 {
@@ -77,7 +77,7 @@ func (doc *promptElement) render(numberedMentions bool, mention func(assetMentio
 				if err != nil || part.Text != "" {
 					return "", invalid("提示词提及必须引用项目图片、视频或音频的素材 ID")
 				}
-				token, err := mention(data)
+				token, err := mention(data, prompt.Len())
 				if err != nil {
 					return "", err
 				}
@@ -116,22 +116,27 @@ func normalizePromptDoc(kind string, raw json.RawMessage) (json.RawMessage, erro
 		return raw, err
 	}
 	doc, err := parsePromptDoc(content["promptDoc"])
-	if err != nil || doc == nil || kind == "prompt" {
-		// Prompt notes preserve their existing text/description/prompt field.
+	if err != nil || doc == nil || kind != "image" {
+		// Video drafts own their saved prompt. Prompt notes preserve their
+		// existing text/description/prompt field.
 		return raw, err
 	}
-	plain, err := doc.render(false, func(data assetMention) (string, error) {
-		label := data.Label
-		if label == "" {
-			label = assetMentionLabels[data.AssetType]
-		}
-		return "@" + label, nil
+	plain, err := doc.render(false, func(data assetMention, _ int) (string, error) {
+		return assetMentionText(data), nil
 	})
 	if err != nil {
 		return nil, err
 	}
 	content["prompt"], _ = json.Marshal(plain)
 	return json.Marshal(content)
+}
+
+func assetMentionText(data assetMention) string {
+	label := data.Label
+	if label == "" {
+		label = assetMentionLabels[data.AssetType]
+	}
+	return "@" + label
 }
 
 // Look up the original project asset. The graph card may be archived, while
@@ -181,7 +186,7 @@ func compileAssetMentions(ctx context.Context, tx *sql.Tx, workspace string, tar
 	var sources []string
 	targetRef, _ := mediaGenerationReference(target)
 	ordinals := make(map[assetMention]string)
-	prompt, err := doc.render(true, func(mention assetMention) (string, error) {
+	prompt, err := doc.render(true, func(mention assetMention, _ int) (string, error) {
 		key := assetMention{AssetType: mention.AssetType, AssetID: mention.AssetID}
 		if token, ok := ordinals[key]; ok {
 			return token, nil
@@ -227,7 +232,7 @@ func referenceOrdinal(ordered []GenerationReference, ref GenerationReference) in
 func (p *project) projectMentionedAssets(ctx context.Context, tx *sql.Tx, result *queryResult) error {
 	seen := make(map[assetMention]bool)
 	for _, node := range result.Nodes {
-		if node.Type != "image" && node.Type != "video" && node.Type != "prompt" {
+		if node.Type != "image" && node.Type != "prompt" {
 			continue
 		}
 		var content struct {
@@ -240,7 +245,7 @@ func (p *project) projectMentionedAssets(ctx context.Context, tx *sql.Tx, result
 		if err != nil || doc == nil {
 			continue
 		}
-		_, err = doc.render(false, func(mention assetMention) (string, error) {
+		_, err = doc.render(false, func(mention assetMention, _ int) (string, error) {
 			key := assetMention{AssetType: mention.AssetType, AssetID: mention.AssetID}
 			if seen[key] {
 				return "", nil

@@ -57,7 +57,7 @@ func TestPromptMentionsReachMiniMaxR2VRequest(t *testing.T) {
 	t.Cleanup(func() { _ = service.Close() })
 	bindSession(t, service, dir, "a")
 	service.SetHumanWriteCheck(func(context.Context, string, string, []string) (bool, error) { return true, nil })
-	order := []string{linked}
+	order := []string{linked, audio, video, uploaded}
 	mustCall(t, service, dir, "a", "append", appendArgs{
 		operation: operation{ID: "create"},
 		Nodes: []NodeInput{
@@ -71,16 +71,17 @@ func TestPromptMentionsReachMiniMaxR2VRequest(t *testing.T) {
 				"mode": "r2v", "prompt": "固定中景。", "mixedListOrder": order,
 			})},
 		},
-		Edges: []Edge{{Source: linked, Target: target}},
+		Edges: []Edge{{Source: linked, Target: target}, {Source: audio, Target: target},
+			{Source: video, Target: target}, {Source: uploaded, Target: target}},
 	})
 	imageMention := promptMentionPart(assetID, "image", "人物")
 	mustEdit(t, service, dir, "a", "update_node", updateNodeArgs{
 		nodeRevisionArgs: nodeRevisionArgs{operation: operation{ID: "save-prompt"}, ID: target, Revision: 1},
-		Content: promptMentionContent(t, "r2v",
-			docText("使用 "), promptMentionPart(audio, "audio", "环境声"),
+		Content: promptMentionContent(t, "r2v", "  使用 @环境声，参考 @构图 和 @动作，切回 @人物，保持 @人物2秒。\n尾部限制：保留人声。  ",
+			docText("  使用 "), promptMentionPart(audio, "audio", "环境声"),
 			docText("，参考 "), promptMentionPart(linked, "image", "构图"),
 			docText(" 和 "), promptMentionPart(video, "video", "动作"),
-			docText("，切回 "), imageMention, docText("，保持 "), imageMention, docText("2秒。")),
+			docText("，切回 "), imageMention, docText("，保持 "), imageMention, docText("2秒。\n尾部限制：保留人声。  ")),
 		ReferenceSources: &order,
 	})
 	if err := service.Close(); err != nil {
@@ -88,13 +89,11 @@ func TestPromptMentionsReachMiniMaxR2VRequest(t *testing.T) {
 	}
 	service = New(settings)
 	result := mustCall(t, service, dir, "a", "query", queryArgs{ID: target}).(queryResult)
-	if len(result.Nodes) != 1 || len(result.Edges) != 1 || result.Edges[0] != (Edge{Source: linked, Target: target}) {
+	if len(result.Nodes) != 1 || len(result.Edges) != len(order) || result.Edges[0] != (Edge{Source: linked, Target: target}) {
 		t.Fatalf("target or original canvas edge lost on reload: %+v", result)
 	}
-	for asset, node := range map[string]string{assetID: uploaded, linked: linked, video: video, audio: audio} {
-		if got := result.MentionedAssets[asset].ID; got != node {
-			t.Fatalf("mention %s resolves to %q, want %q", asset, got, node)
-		}
+	if len(result.MentionedAssets) != 0 || len(result.InvalidMedia) != 0 {
+		t.Fatalf("target projected detached mentions or reported invalid media: %+v", result)
 	}
 
 	var requests []string
@@ -116,7 +115,7 @@ func TestPromptMentionsReachMiniMaxR2VRequest(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := []map[string]any{
-				{"type": "text", "text": "使用 @音频1，参考 @图片1 和 @视频1，切回 @图片2，保持 @图片2 2秒。"},
+				{"type": "text", "text": "  使用 音频 1，参考 图片 1 和 视频 1，切回 图片 2，保持 图片 2 2秒。\n尾部限制：保留人声。  "},
 				minimaxFixtureContent("image", "reference_image", linkedURL),
 				minimaxFixtureContent("audio", "reference_audio", audioURL),
 				minimaxFixtureContent("video", "reference_video", videoURL),
@@ -147,137 +146,227 @@ func TestPromptMentionsReachMiniMaxR2VRequest(t *testing.T) {
 	}
 }
 
-func TestPromptMentionsJoinGenerationSnapshotWithoutGraphMutation(t *testing.T) {
-	dir := t.TempDir()
-	s := New(providerFixture{})
-	defer s.Close()
-	bindSession(t, s, dir, "a")
-	s.SetHumanWriteCheck(func(context.Context, string, string, []string) (bool, error) { return true, nil })
-	frame, audio, draft := uuid.NewString(), uuid.NewString(), uuid.NewString()
-	assetID := uuid.NewString() + ".png"
-	imagePath := "assets/images/" + assetID
-	audioURL := "https://assets.example.test/ambience.wav"
-	if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, imagePath)), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, imagePath), []byte("file fixture"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	image := promptMentionPart(assetID, "image", "图片99")
-	sound := promptMentionPart(audio, "audio", "雨声")
-	content := promptMentionContent(t, "r2v", docText("沿用 "), image, docText(" 与 "), sound, docText("，再次使用 "), image)
-	appended, err := editCall(s, dir, "a", "human", "append", appendArgs{
-		operation: operation{ID: "create"},
-		Nodes: []NodeInput{
-			{ID: frame, Type: "image", Content: encodeMentionFixture(t, map[string]string{"path": imagePath, "assetId": assetID})},
-			{ID: audio, Type: "audio", Content: encodeMentionFixture(t, map[string]string{"url": audioURL})},
-			{ID: draft, Type: "video", Content: content},
-		},
-	})
-	if err != nil || len(appended.(appendResult).IDs) != 3 {
-		t.Fatalf("append: %v, %v", appended, err)
-	}
-	mustEdit(t, s, dir, "a", "delete_node", nodeRevisionArgs{operation: operation{ID: "delete-original-card"}, ID: frame, Revision: 1})
-	result := mustCall(t, s, dir, "a", "query", queryArgs{ID: draft}).(queryResult)
-	if len(result.Edges) != 0 || result.MentionedAssets[assetID].ID != frame || !result.MentionedAssets[assetID].Deleted ||
-		result.MentionedAssets[audio].ID != audio || !strings.Contains(string(result.Nodes[0].Content), "沿用 @图片99 与 @雨声，再次使用 @图片99") {
-		t.Fatalf("query: %+v", result)
-	}
-	request := map[string]any{"operationId": "generate", "nodeId": draft, "confirmed": true}
-	mustCall(t, s, dir, "a", "generateR2V", request)
-	p, err := s.open(context.Background(), dir, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var raw string
-	if err := p.db.QueryRow("SELECT input FROM tasks WHERE node_id=?", draft).Scan(&raw); err != nil {
-		t.Fatal(err)
-	}
-	var generation generationRequest
-	if err := json.Unmarshal([]byte(raw), &generation); err != nil {
-		t.Fatal(err)
-	}
-	want := []GenerationReference{{Type: "image", Path: imagePath}, {Type: "audio", URL: audioURL}}
-	if generation.Prompt != "沿用 @图片1 与 @音频1，再次使用 @图片1" || !slices.Equal(generation.References, want) ||
-		!slices.Equal(generation.SourceNodeIDs, []string{frame, audio}) {
-		t.Fatalf("unexpected generated input: %+v", generation)
-	}
-	after := mustCall(t, s, dir, "a", "query", nil).(queryResult)
-	if len(after.Nodes) != 2 || len(after.Edges) != 0 || !slices.Contains(after.LockedNodeIDs, audio) {
-		t.Fatalf("unexpected graph changes or dependency locks: %+v", after)
-	}
-}
-
-func TestPromptMentionsPreserveLegacySlotsAndValidateMissingOrIncompatible(t *testing.T) {
-	for _, variant := range []struct {
-		name, mode, kind, assetURL, graph, expectedError string
+func TestVideoInputRulesReachMiniMaxHTTP(t *testing.T) {
+	const aURL = "https://assets.example.test/a.png"
+	const bURL = "https://assets.example.test/b.png"
+	const literal = "  镜头推进。\n角色说：“保持原声。” 字面文本 @图片1，联系 film@image1.example。\n尾部限制：保留停顿。  "
+	for _, tc := range []struct {
+		name, mode, prompt, doc, change, wantError string
+		sources                                    string
+		automatic                                  bool
+		wantMedia                                  []map[string]any
 	}{
-		{name: "I2V same connected image", mode: "i2v", kind: "image", assetURL: "https://assets.example.test/frame.png", graph: "image"},
-		{name: "I2V mention becomes tail frame", mode: "i2v", kind: "image", assetURL: "https://assets.example.test/tail.png", graph: "other"},
-		{name: "V2V source video", mode: "v2v", kind: "video", assetURL: "https://assets.example.test/source.mp4"},
-		{name: "T2V incompatible", mode: "t2v", kind: "image", assetURL: "https://assets.example.test/frame.png", expectedError: "T2V 只接受"},
-		{name: "Unregistered asset", mode: "i2v", kind: "image", expectedError: "不存在"},
+		{name: "T01 zero edge and plain email", mode: "t2v", prompt: literal, automatic: true},
+		{name: "T02 detached image and audio doc", mode: "t2v", prompt: literal, doc: "stale"},
+		{name: "T03 active image without edge", mode: "t2v", prompt: "参考 @图B", doc: "image", wantError: "图B"},
+		{name: "T03 active audio without edge", mode: "t2v", prompt: "参考 @环境声", doc: "audio", wantError: "环境声"},
+		{name: "T04 long plain authority", mode: "t2v", prompt: strings.Repeat("台词：“直到最后。”\n", 160) + literal, doc: "pure"},
+		{name: "T05 only edge A, stale B", mode: "r2v", prompt: literal, doc: "stale", sources: "A",
+			wantMedia: []map[string]any{minimaxFixtureContent("image", "reference_image", aURL)}},
+		{name: "T05 only edge A, active B", mode: "r2v", prompt: "参考 @图B", doc: "image", sources: "A", wantError: "图B"},
+		{name: "T06 deleted card with URL and file", mode: "r2v", prompt: "参考 @图B", doc: "image", sources: "B", change: "delete", wantError: "图B"},
+		{name: "T06 disconnected card", mode: "r2v", prompt: "参考 @图B", doc: "image", sources: "B", change: "disconnect", wantError: "图B"},
+		{name: "T06 connected file is missing", mode: "r2v", prompt: literal, sources: "B", change: "file-missing", wantError: "项目文件"},
+		{name: "T07 copied stale doc", mode: "t2v", prompt: literal, doc: "stale", change: "copy"},
+		{name: "T08 legacy note edge and basedOn", mode: "t2v", prompt: literal, change: "legacy-text"},
+		{name: "T09 no first frame", mode: "i2v", prompt: literal, wantError: "需要首帧"},
+		{name: "T09 no source video", mode: "v2v", prompt: literal, wantError: "需要一个源视频"},
+		{name: "T09 too many images for profile", mode: "r2v", prompt: literal, sources: "ABC", wantError: "参考"},
+		{name: "T09 source type unsupported by profile", mode: "r2v", prompt: literal, sources: "D", wantError: "参考"},
+		{name: "T09 T2V cannot discard edges", mode: "t2v", prompt: literal, change: "legacy-media", wantError: "T2V 只接受"},
+		{name: "T10 same URL in two frame roles", mode: "i2v", prompt: literal, sources: "CA",
+			wantMedia: []map[string]any{minimaxFixtureContent("image", "first_frame", aURL), minimaxFixtureContent("image", "last_frame", aURL)}},
+		{name: "T11 T12 stale expected revision", mode: "t2v", prompt: literal, change: "conflict", wantError: "节点已更新"},
+		{name: "T11 newly saved prompt", mode: "t2v", prompt: literal, change: "saved"},
+		{name: "explicitly linked doc disagrees with prompt", mode: "t2v", prompt: literal, doc: "mismatch", wantError: "不一致"},
 	} {
-		t.Run(variant.name, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
 			dir := t.TempDir()
-			s := New(providerFixture{})
-			defer s.Close()
-			bindSession(t, s, dir, "a")
-			asset, draft, linked := uuid.NewString(), uuid.NewString(), uuid.NewString()
-			parts := []map[string]any{docText("使用 "), promptMentionPart(asset, variant.kind, "已选素材")}
-			args := appendArgs{operation: operation{ID: "create"}}
-			if variant.assetURL != "" {
-				args.Nodes = append(args.Nodes, NodeInput{ID: asset, Type: variant.kind,
-					Content: encodeMentionFixture(t, map[string]string{"url": variant.assetURL})})
+			settings := miniMaxInputFixture(t)
+			service := New(settings)
+			t.Cleanup(func() { _ = service.Close() })
+			bindSession(t, service, dir, "a")
+			service.SetHumanWriteCheck(func(context.Context, string, string, []string) (bool, error) { return true, nil })
+			project, err := service.open(ctx, dir, false)
+			if err != nil {
+				t.Fatal(err)
 			}
-			content := promptMentionContent(t, variant.mode, parts...)
-			if variant.graph != "" {
-				if variant.graph == "image" {
-					linked = asset
-				} else {
-					args.Nodes = append(args.Nodes, NodeInput{ID: linked, Type: "image",
-						Content: json.RawMessage(`{"url":"https://assets.example.test/frame.png"}`)})
+			draft, a, b, c, audio, note := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
+			const relative = "assets/images/b.png"
+			if err := os.MkdirAll(filepath.Join(dir, "assets", "images"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if tc.change != "file-missing" {
+				if err := os.WriteFile(filepath.Join(dir, relative), []byte("fixture image"), 0o600); err != nil {
+					t.Fatal(err)
 				}
-				args.Edges = []Edge{{linked, draft}}
 			}
-			args.Nodes = append(args.Nodes, NodeInput{ID: draft, Type: "video", Content: content})
-			if _, err := editCall(s, dir, "a", "human", "append", args); err != nil {
-				t.Fatalf("draft save: %v", err)
+			base := note
+			if tc.change == "copy" {
+				base = uuid.NewString()
 			}
-			request := map[string]any{"operationId": "generate", "nodeId": draft, "confirmed": true}
-			_, err := call(s, dir, "a", "submit_manual", request)
-			if variant.expectedError != "" {
-				if err == nil || !strings.Contains(err.Error(), variant.expectedError) {
-					t.Fatalf("submission = %v, expected %s", err, variant.expectedError)
+			bMention := promptMentionPart(b, "image", "图B")
+			audioMention := promptMentionPart(audio, "audio", "环境声")
+			var contentParts []map[string]any
+			switch tc.doc {
+			case "image", "mismatch":
+				contentParts = []map[string]any{docText("参考 "), bMention}
+			case "audio":
+				contentParts = []map[string]any{docText("参考 "), audioMention}
+			case "stale":
+				contentParts = []map[string]any{docText("旧文 "), bMention, audioMention}
+			case "pure":
+				contentParts = []map[string]any{docText("完全不同的旧文")}
+			}
+			raw := promptMentionContent(t, tc.mode, tc.prompt, contentParts...)
+			if tc.doc == "mismatch" {
+				var fields map[string]any
+				_ = json.Unmarshal(raw, &fields)
+				fields["promptDocLinked"] = true
+				raw = encodeMentionFixture(t, fields)
+			}
+			nodes := []NodeInput{
+				{ID: a, Type: "image", Content: encodeMentionFixture(t, map[string]string{"url": aURL})},
+				{ID: b, Type: "image", Content: encodeMentionFixture(t, map[string]string{"url": bURL, "path": relative, "thumbnail": bURL})},
+				{ID: c, Type: "image", Content: encodeMentionFixture(t, map[string]string{"url": aURL})},
+				{ID: audio, Type: "audio", Content: json.RawMessage(`{"url":"https://assets.example.test/rain.wav"}`)},
+				{ID: note, Type: "prompt", Content: json.RawMessage(`{"text":"外部台词不可拼入视频正文"}`)},
+			}
+			if tc.change == "copy" {
+				nodes = append(nodes, NodeInput{ID: base, Type: "video", Content: raw})
+			}
+			nodes = append(nodes, NodeInput{ID: draft, Type: "video", BasedOn: base, Content: raw})
+			var edges []Edge
+			var expectedSources []string
+			for _, code := range tc.sources {
+				source := map[rune]string{'A': a, 'B': b, 'C': c, 'D': audio}[code]
+				edges = append(edges, Edge{source, draft})
+				expectedSources = append(expectedSources, source)
+			}
+			if _, err := editCall(service, dir, "a", "human", "append", appendArgs{
+				operation: operation{ID: "create"}, Nodes: nodes, Edges: edges,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			request := map[string]any{"operationId": "submit", "nodeId": draft, "confirmed": true, "expectedRevision": 1}
+			wanted := tc.prompt
+			switch tc.change {
+			case "delete":
+				mustEdit(t, service, dir, "a", "delete_node", nodeRevisionArgs{operation: operation{ID: "delete"}, ID: b, Revision: 1})
+				delete(request, "expectedRevision")
+				if _, err := os.Stat(filepath.Join(dir, relative)); err != nil {
+					t.Fatal("deleting the card removed its media:", err)
+				}
+			case "disconnect":
+				mustEdit(t, service, dir, "a", "delete_edge", changeEdgeArgs{operation: operation{ID: "disconnect"}, Source: b, Target: draft, Revision: 1})
+				delete(request, "expectedRevision")
+			case "legacy-text", "legacy-media":
+				source := note
+				if tc.change == "legacy-media" {
+					source = a
+				}
+				if _, err := project.db.Exec("INSERT INTO edges(source,target) VALUES(?,?)", source, draft); err != nil {
+					t.Fatal(err)
+				}
+			case "saved", "conflict":
+				wanted = tc.prompt + "\n现在改成推轨。"
+				mustEdit(t, service, dir, "a", "update_node", updateNodeArgs{
+					nodeRevisionArgs: nodeRevisionArgs{operation: operation{ID: "save"}, ID: draft, Revision: 1},
+					Content:          promptMentionContent(t, tc.mode, wanted),
+				})
+				if tc.change == "saved" {
+					request["expectedRevision"] = 2
+				}
+			}
+			readback := mustCall(t, service, dir, "a", "query", queryArgs{ID: draft}).(queryResult)
+			var stored struct {
+				Prompt   string
+				TextList []string
+			}
+			if err := json.Unmarshal(readback.Nodes[0].Content, &stored); err != nil || stored.Prompt != wanted || len(stored.TextList) > 0 {
+				t.Fatalf("stored raw draft = %s (%v), want %q", readback.Nodes[0].Content, err, wanted)
+			}
+			if tc.change == "file-missing" && !strings.Contains(readback.InvalidMedia[b], "项目文件") {
+				t.Fatalf("readback lost missing file diagnostic: %+v", readback.InvalidMedia)
+			}
+			var httpCalls int
+			settings.client.Transport = arkFixtureTransport(func(req *http.Request) (*http.Response, error) {
+				httpCalls++
+				if tc.wantError != "" || req.URL.Path != "/api/minimax"+minimaxH3Submit || req.Method != "POST" {
+					t.Fatalf("unexpected HTTP call %s %s", req.Method, req.URL.Path)
+				}
+				var body struct {
+					Content []map[string]any
+				}
+				if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				expected := append([]map[string]any{{"type": "text", "text": wanted}}, tc.wantMedia...)
+				if !reflect.DeepEqual(body.Content, expected) {
+					t.Fatalf("HTTP request content = %#v, want %#v", body.Content, expected)
+				}
+				return arkFixtureResponse(http.StatusOK, `{"task_id":"123456"}`)
+			})
+			action := "submit_manual"
+			if tc.automatic {
+				enabled := true
+				mustCall(t, service, dir, "a", "permission", map[string]any{"operationId": "enable", "enabled": enabled})
+				action = "submit"
+				delete(request, "confirmed")
+			}
+			_, err = call(service, dir, "a", action, request)
+			if tc.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantError) || len(tasksIn(t, service, dir, "a")) != 0 {
+					t.Fatalf("submit = %v, want %q with no tasks", err, tc.wantError)
+				}
+				if err := project.advance(ctx, settings); err != nil || httpCalls != 0 {
+					t.Fatalf("rejected draft reached channel: %d, %v", httpCalls, err)
 				}
 				return
 			}
 			if err != nil {
 				t.Fatal(err)
 			}
-			p, err := s.open(context.Background(), dir, false)
-			if err != nil {
+			var saved string
+			if err := project.db.QueryRow("SELECT input FROM tasks WHERE node_id=?", draft).Scan(&saved); err != nil {
 				t.Fatal(err)
 			}
-			var raw string
-			if err := p.db.QueryRow("SELECT input FROM tasks WHERE node_id=?", draft).Scan(&raw); err != nil {
-				t.Fatal(err)
+			var snapshot generationRequest
+			if err := json.Unmarshal([]byte(saved), &snapshot); err != nil || snapshot.Prompt != wanted ||
+				snapshot.VideoInputContract != videoInputContractVersion || len(snapshot.PromptMentions) != 0 ||
+				!slices.Equal(snapshot.SourceNodeIDs, expectedSources) || len(snapshot.References) != len(expectedSources) {
+				t.Fatalf("wrong frozen snapshot %s (%v)", saved, err)
 			}
-			var generation generationRequest
-			if err := json.Unmarshal([]byte(raw), &generation); err != nil {
-				t.Fatal(err)
+			for i, ref := range snapshot.References {
+				if ref.SourceNodeID != expectedSources[i] || ref.SourceRevision != 1 ||
+					ref.Role != tc.wantMedia[i]["role"] {
+					t.Fatalf("wrong source or role in %s", saved)
+				}
 			}
-			want := []GenerationReference{{Type: variant.kind, URL: variant.assetURL}}
-			prompt := "使用 @" + assetMentionLabels[variant.kind] + "1"
-			if variant.graph == "other" {
-				want = append([]GenerationReference{{Type: "image", URL: "https://assets.example.test/frame.png"}}, want...)
-				prompt = "使用 @图片2"
-			}
-			if generation.Prompt != prompt || !slices.Equal(generation.References, want) {
-				t.Fatalf("unexpected generated input: %+v", generation)
+			if err := project.advance(ctx, settings); err != nil || httpCalls != 1 {
+				t.Fatalf("worker sent %d requests: %v, tasks %+v", httpCalls, err, tasksIn(t, service, dir, "a"))
 			}
 		})
 	}
+}
+
+func miniMaxInputFixture(t *testing.T) *ProviderSettings {
+	t.Helper()
+	settings, err := OpenProfileSettings("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	channelID := "h3"
+	modelID := uuid.NewString()
+	settings.data.Channels = []VideoChannel{{ID: channelID, Name: "H3 fixture", Protocol: minimaxH3Protocol}}
+	settings.data.Profiles = []ProviderProfile{{
+		ID: modelID, Name: "H3 fixture", Model: minimaxH3Model, ChannelID: channelID, Modes: []string{"t2v", "i2v", "r2v"},
+		Limits: VideoLimits{LastFrame: true, References: map[string]int{"image": 2}, MaxReferences: 2},
+	}}
+	settings.data.Generation.DefaultModelID = modelID
+	settings.data.Keys[channelID] = "fixture-key"
+	return settings
 }
 
 func TestPromptMentionRejectsTextAtomAndInvalidPath(t *testing.T) {
@@ -291,7 +380,7 @@ func TestPromptMentionRejectsTextAtomAndInvalidPath(t *testing.T) {
 	} {
 		_, err := editCall(s, dir, "a", "human", "append", appendArgs{
 			operation: operation{ID: uuid.NewString()},
-			Nodes:     []NodeInput{{Type: "video", Content: promptMentionContent(t, "r2v", part)}},
+			Nodes:     []NodeInput{{Type: "video", Content: promptMentionContent(t, "r2v", "参考素材", part)}},
 		})
 		if err == nil {
 			t.Fatalf("invalid mention accepted: %v", part)
@@ -344,12 +433,13 @@ func encodeMentionFixture(t *testing.T, fixture any) json.RawMessage {
 	return json.RawMessage(data)
 }
 
-func promptMentionContent(t *testing.T, mode string, parts ...map[string]any) json.RawMessage {
+func promptMentionContent(t *testing.T, mode, prompt string, parts ...map[string]any) json.RawMessage {
 	t.Helper()
-	return encodeMentionFixture(t, map[string]any{
-		"mode": mode, "prompt": "old plain fallback",
-		"promptDoc": map[string]any{"type": "doc", "content": []any{map[string]any{"type": "paragraph", "content": parts}}},
-	})
+	content := map[string]any{"mode": mode, "prompt": prompt}
+	if len(parts) > 0 {
+		content["promptDoc"] = map[string]any{"type": "doc", "content": []any{map[string]any{"type": "paragraph", "content": parts}}}
+	}
+	return encodeMentionFixture(t, content)
 }
 
 func docText(text string) map[string]any {

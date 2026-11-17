@@ -225,7 +225,7 @@ func updateNode(ctx context.Context, tx *sql.Tx, args updateNodeArgs) (editResul
 		preserveContentField(content, previous, "productionAspectRatio")
 		preserveContentField(content, previous, "workflowDeploymentDraft")
 	}
-	if len(content["promptDoc"]) > 0 && bytes.Equal(previous["promptDoc"], content["promptDoc"]) {
+	if kind != "video" && len(content["promptDoc"]) > 0 && bytes.Equal(previous["promptDoc"], content["promptDoc"]) {
 		var oldPrompt, newPrompt string
 		if kind == "prompt" {
 			oldPrompt, newPrompt = nodeText(json.RawMessage(raw)), nodeText(args.Content)
@@ -438,7 +438,7 @@ func changeEdge(ctx context.Context, tx *sql.Tx, args changeEdgeArgs) (editResul
 		return editResult{}, err
 	}
 	if kind == "video" {
-		if err := validateVideo(ctx, tx, args.Target, args.NewSource != ""); err != nil {
+		if err := validateVideo(ctx, tx, args.Target, true); err != nil {
 			return editResult{}, err
 		}
 	}

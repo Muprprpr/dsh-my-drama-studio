@@ -2,8 +2,11 @@ package studio
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -13,6 +16,7 @@ import (
 
 func TestCanvasVideoDraftCanSaveMediaBeforePrompt(t *testing.T) {
 	dir := t.TempDir()
+	writeVideoReferenceFixture(t, dir, "assets/images/first.png")
 	s := New(providerFixture{})
 	defer s.Close()
 	bindSession(t, s, dir, "a")
@@ -109,10 +113,11 @@ func TestCanvasReferencesWaitResolveAndProtectTaskInput(t *testing.T) {
 		t.Fatalf("missing pending reference: %+v", target)
 	}
 	request := map[string]any{"operationId": "video-submit", "nodeId": video, "confirmed": true}
-	if _, err := call(s, dir, "a", "generateI2V", request); err == nil || !strings.Contains(err.Error(), "等待上游") {
+	if _, err := call(s, dir, "a", "generateI2V", request); err == nil || !strings.Contains(err.Error(), "尚无可用产物") {
 		t.Fatalf("video submitted with pending image: %v", err)
 	}
 	const assetPath = "assets/images/frame.png"
+	writeVideoReferenceFixture(t, dir, assetPath)
 	mustEdit(t, s, dir, "a", "update_node", updateNodeArgs{
 		nodeRevisionArgs: nodeRevisionArgs{operation: operation{ID: "attach-image"}, ID: image, Revision: 1},
 		Content:          json.RawMessage(fmt.Sprintf(`{"path":%q}`, assetPath)),
@@ -157,8 +162,22 @@ func TestCanvasReferencesWaitResolveAndProtectTaskInput(t *testing.T) {
 		t.Fatal(err)
 	}
 	if snapshot.Prompt != "Continue the motion in @image1." ||
-		!slices.Equal(snapshot.References, []GenerationReference{{Type: "image", Path: assetPath}}) {
+		!slices.Equal(snapshot.References, []GenerationReference{{
+			Type: "image", Path: assetPath, SourceNodeID: image, SourceRevision: 2, Role: "first_frame",
+			LocalSHA256: fmt.Sprintf("%x", sha256.Sum256([]byte("reference fixture"))),
+		}}) {
 		t.Fatalf("connected asset did not enter the generation snapshot: %+v", snapshot)
+	}
+}
+
+func writeVideoReferenceFixture(t *testing.T, dir, relative string) {
+	t.Helper()
+	file := filepath.Join(dir, relative)
+	if err := os.MkdirAll(filepath.Dir(file), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("reference fixture"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 

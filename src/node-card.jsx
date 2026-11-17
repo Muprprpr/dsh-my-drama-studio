@@ -9,7 +9,7 @@ import {
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import {
   assetFolders, groupFields, isMedia, mediaTypes, modeLabels, nodeLabels, nodeTitle,
-  profileCandidates, referenceIds, referenceLimit, resolveProfile, shotLabel, textTypes, videoMode,
+  profileCandidates, referenceIds, referenceLimit, resolveProfile, shotLabel, textTypes, videoMode, videoReferenceIds,
 } from './canvas-node.jsx'
 import { TaskStatus, taskActive } from './task-drawer.jsx'
 import { useNodeEditorPlacement } from './node-editor-placement.js'
@@ -248,7 +248,8 @@ function paramSummary(profile, generationDefaults, overrides, mode, productionRa
   ].filter(Boolean)
 }
 
-function GenerateControl({ node, profile, generationDefaults, providerVersion, providerSettingsReady, actions, unavailable, latest }) {
+function GenerateControl({ node, profile, generationDefaults, providerVersion, providerSettingsReady, actions, unavailable, latest,
+  saveForGeneration }) {
   const mode = node.type === 'image' ? 't2i' : videoMode(node)
   const [confirmation, setConfirmation] = useState(null)
   const [busy, setBusy] = useState(false)
@@ -265,12 +266,26 @@ function GenerateControl({ node, profile, generationDefaults, providerVersion, p
   }, [invalidated])
 
   if (!actions.submitGeneration || !['image', 'video'].includes(node.type) || mode === 'asset') return null
+  async function confirmInputs() {
+    if (busy || blocked) return
+    setBusy(true)
+    setError('')
+    try {
+      const saved = saveForGeneration ? await saveForGeneration() : node
+      setConfirmation({ node: saved, version: providerVersion, profileId: profile.id })
+    } catch (failure) {
+      setError(failure.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function submit() {
     if (!confirmation || stale || blocked || busy) return
     setBusy(true)
     setError('')
     try {
-      await actions.submitGeneration(node, profile.id, confirmation.version)
+      await actions.submitGeneration(confirmation.node, confirmation.profileId, confirmation.version)
       setConfirmation(null)
     } catch (failure) {
       if (failure.status === 409) setConfirmation(current => current && { ...current, stale: true })
@@ -282,9 +297,9 @@ function GenerateControl({ node, profile, generationDefaults, providerVersion, p
 
   return <>
     <Button size="sm" variant="primary" className="drama-node-generate" icon={<IconSparkleRegular size={14} />}
-      disabled={blocked} title={unavailable}
-      onClick={() => { setError(''); setConfirmation({ version: providerVersion, profileId: profile.id }) }}>
+      disabled={blocked || busy} title={unavailable} onClick={confirmInputs}>
       {latest ? '重新生成…' : '生成…'}</Button>
+    {!confirmation && error && <p className="drama-node-form-error" role="alert">{error}</p>}
     {confirmation && <Modal open title="确认生成" closeLabel="关闭生成确认"
       onClose={() => { if (!busy) setConfirmation(null) }} footer={<>
         <Button size="sm" disabled={busy} onClick={() => setConfirmation(null)}>取消</Button>
@@ -294,7 +309,8 @@ function GenerateControl({ node, profile, generationDefaults, providerVersion, p
       </>}>
       {!stale && profile && <>
         <p className="drama-node-dialog-summary">{[profile.name, profile.model,
-          ...paramSummary(profile, generationDefaults, node.content.params, mode, node.content.productionAspectRatio)].join(' · ')}</p>
+          ...paramSummary(profile, generationDefaults, confirmation.node.content.params, mode,
+            confirmation.node.content.productionAspectRatio)].join(' · ')}</p>
         {profile.channelLabel && <p className="drama-node-caption" data-testid="drama-generation-channel">{profile.channelLabel}</p>}
       </>}
       {stale && <p className="drama-node-form-error" role="alert">本次生成确认已失效，请关闭后重新确认。</p>}
@@ -364,7 +380,7 @@ function referenceReady(item, resolvedMedia) {
 
 export function GraphNode({ data, selected }) {
   const { node, draft, editor, compact, mediaURL, index, edges, tasks = [], generationProfiles = [],
-    generationDefaults, providerVersion, providerSettingsReady, resolvedMedia, mentionedAssets, rename,
+    generationDefaults, providerVersion, providerSettingsReady, resolvedMedia, mentionedAssets, invalidMedia, rename,
     referenceFocus, selectedResult, isFocused, actions = {} } = data
   const compactEditor = draft?.edit && (node.type === 'image' || node.type === 'video')
   const panelRef = useNodeEditorPlacement(node.id, Boolean(compactEditor && editor), Boolean(isFocused))
@@ -382,8 +398,9 @@ export function GraphNode({ data, selected }) {
   const saved = !node.id.startsWith('draft-')
   const locked = Boolean(actions.mutationReason)
   const generationNode = node.type === 'image' || node.type === 'video' && mode !== 'asset'
-  const ordered = referenceIds(node)
-  const pending = generationNode && ordered.some(id => !referenceReady(index?.get(id), resolvedMedia))
+  const ordered = node.type === 'video' ? videoReferenceIds(node, edges, index) : referenceIds(node)
+  const pending = generationNode && ordered.some(id =>
+    node.type === 'video' && invalidMedia?.[id] || !referenceReady(index?.get(id), resolvedMedia))
   const configured = Boolean(textValue(node.content, 'prompt')) ||
     node.type === 'image' && ordered.some(id => textTypes.has(index?.get(id)?.type))
   return <article className={'drama-node-card' + (selected ? ' is-selected' : '') + (draft && !draft.edit ? ' is-draft' : '')
@@ -452,7 +469,8 @@ export function GraphNode({ data, selected }) {
     </div>}
     {draft && editor && <div ref={panelRef}
       className={'drama-node-editor-panel' + (compactEditor ? ' is-creative' : '')}>
-      <NodeEditor draft={draft} {...editor} node={node} index={index} resolvedMedia={resolvedMedia} rename={rename} referenceFocus={referenceFocus}
+      <NodeEditor draft={draft} {...editor} node={node} index={index} edges={edges} resolvedMedia={resolvedMedia}
+        invalidMedia={invalidMedia} rename={rename} referenceFocus={referenceFocus}
         mediaURL={mediaURL} mentionedAssets={mentionedAssets} generationProfiles={generationProfiles} generationDefaults={generationDefaults}
         providerVersion={providerVersion} providerSettingsReady={providerSettingsReady} actions={actions} latest={latest} isFocused={isFocused} />
     </div>}
@@ -487,18 +505,6 @@ function referenceIssue(mode, kinds, profile, ready = false) {
     const count = kinds.filter(kind => kind === 'image').length
     const max = referenceLimit(mode, 'image', profile)
     if (count > max) return max ? '所选模型最多支持 ' + max + ' 张参考图片。' : '所选模型不接收参考图片。'
-  }
-  return ''
-}
-
-function inlineReferenceIssue(prompt, kinds) {
-  const names = { 图片: 'image', 视频: 'video', 音频: 'audio' }
-  const mentions = prompt.matchAll(/@(图片|视频|音频|文本|脚本|提示词|说明|image|video|audio|text|script|prompt|note)[ 	]*([0-9]+)|<<<(image|video|audio|text|script|prompt|note)_([0-9]+)>>>/giu)
-  for (const [mention, name, ordinal, alias, aliasOrdinal] of mentions) {
-    const label = (name ?? alias).toLowerCase()
-    const kind = names[label] ?? label
-    const index = Number(ordinal ?? aliasOrdinal)
-    if (index < 1 || kinds.filter(value => value === kind).length < index) return mention + ' 没有对应的已连接素材。'
   }
   return ''
 }
@@ -572,8 +578,33 @@ function promptAssetKey(node) {
   return node.type + ':' + (node.content.path || node.content.url)
 }
 
+function videoPromptAssets(ids, index, resolvedMedia, invalidMedia, mediaURL) {
+  const assets = new Map()
+  const aliases = new Map()
+  for (const id of ids) {
+    const source = index?.get(id)
+    const resolved = resolvedMedia?.get(id) ?? source
+    if (!source || !mediaTypes.has(source.type)) continue
+    const status = invalidMedia?.[id] || (source.deleted ? '来源节点已删除' : !isMedia(resolved) ? '上游暂无可用素材' : '')
+    const item = {
+      ...promptAsset(resolved, mediaURL, '已连接'),
+      assetId: id, nodeId: source.deleted ? undefined : id, label: nodeName(source),
+      disabled: Boolean(status), lookupOnly: Boolean(status), status,
+    }
+    assets.set(id, item)
+    for (const key of new Set([resolved.id, resolved.content.assetId])) {
+      if (!key || key === id) continue
+      aliases.set(key, aliases.has(key)
+        ? { ...item, assetId: key, lookupOnly: true, disabled: true, status: '多个已连接素材使用此标识，请重新选择具体连线' }
+        : { ...item, assetId: key, lookupOnly: true })
+    }
+  }
+  for (const [id, item] of aliases) if (!assets.has(id)) assets.set(id, item)
+  return assets
+}
+
 function NodeEditor({
-  draft, append, mutate, mutationReason, media = [], queryCanvas, finish, close, mediaURL, index,
+  draft, append, mutate, mutationReason, media = [], queryCanvas, finish, close, mediaURL, index, edges, invalidMedia,
   generationProfiles, generationDefaults, providerVersion, providerSettingsReady, node, actions, latest, resolvedMedia,
   mentionedAssets, rename, referenceFocus, uploadReference,
   importFile, attachAsset, reportSaveError, isFocused, textDrafts,
@@ -602,7 +633,11 @@ function NodeEditor({
   const [description, setDescription] = useState(() => retainedDraft?.values.get('description') ?? storedDescription)
   const [plainPrompt, setPlainPrompt] = useState(storedPrompt)
   const [promptDoc, setPromptDoc] = useState(storedPromptDoc)
-  const prompt = promptDoc ? promptDocumentText(promptDoc) : plainPrompt
+  const projectedPrompt = promptDoc && promptDocumentText(promptDoc)
+  const displayedPromptDoc = type !== 'video' || projectedPrompt === plainPrompt ? promptDoc : null
+  const prompt = type === 'video' ? plainPrompt : projectedPrompt ?? plainPrompt
+  const linkedDocMismatch = type === 'video' && content.promptDocLinked === true && !displayedPromptDoc &&
+    promptDocumentMentions(promptDoc).length > 0
   const [pickedAssets, setPickedAssets] = useState(new Map())
   const [profileId, setProfileId] = useState(storedProfileId)
   const [overrides, setOverrides] = useState(() => parameterValues(content))
@@ -619,7 +654,9 @@ function NodeEditor({
   const assetNode = mediaTypes.has(type) && !(type === 'video' && generation)
   const [asset, setAsset] = useState(null)
   const supportsRefs = generation || type === 'shot'
-  const persistedRefs = sameKind ? referenceIds(base) : []
+  const persistedRefs = sameKind
+    ? type === 'video' ? videoReferenceIds(base, edges, index) : referenceIds(base)
+    : []
   const persistedRefKey = persistedRefs.join(',')
   const previous = useRef({ mode: savedMode, ids: persistedRefs })
   const seedMode = type === 'image' ? 't2i' : type === 'video' ? mode : ''
@@ -637,7 +674,7 @@ function NodeEditor({
   const revision = useRef(retainedDraft?.revision ?? base?.revision)
   const committed = useRef(base)
   const mounted = useRef(false)
-  const queue = useRef({ pending: null, saving: false, savedVersion: 0, timer: 0, error: '' })
+  const queue = useRef({ pending: null, inFlight: null, latestVersion: 0, savedVersion: 0, timer: 0, error: '' })
 
   function markDirty() {
     setDirty(true)
@@ -751,6 +788,17 @@ function NodeEditor({
   const hasTextRef = type === 'image' && referenceItems.some(item => textTypes.has(item?.type) && savedText(item))
   const ownMediaKey = isMedia(node) ? promptAssetKey(node) : null
   const promptAssets = useMemo(() => {
+    if (type === 'video') {
+      const linked = edit ? persistedRefs.filter(id => references.includes(id)) : []
+      const assets = videoPromptAssets(linked, index, resolvedMedia, invalidMedia, mediaURL)
+      for (const attrs of promptDocumentMentions(displayedPromptDoc)) {
+        if (assets.has(attrs.assetId)) continue
+        const status = invalidMedia?.[attrs.assetId] || (index?.get(attrs.assetId)?.deleted
+          ? '来源节点已删除' : '没有有效连线，连线已断开或来源已删除')
+        assets.set(attrs.assetId, { ...attrs, disabled: true, lookupOnly: true, status })
+      }
+      return assets
+    }
     const assets = new Map()
     for (const asset of media) {
       if (asset.id === node.id || asset.deleted || !isMedia(asset) || promptAssetKey(asset) === ownMediaKey) continue
@@ -771,15 +819,23 @@ function NodeEditor({
       }
     }
     return assets
-  }, [media, mediaURL, mentionedAssets, node.id, ownMediaKey, pickedAssets, storedPromptDoc])
+  }, [type, edit, persistedRefKey, references, index, resolvedMedia, invalidMedia, displayedPromptDoc,
+    media, mediaURL, mentionedAssets, node.id, ownMediaKey, pickedAssets, storedPromptDoc])
   const generationKinds = [...referenceKinds]
   const linkedMediaKeys = new Set(referenceItems.filter(Boolean).map(item => resolvedMedia?.get(item.id) ?? item)
     .filter(isMedia).map(promptAssetKey))
-  let missingMention = ''
+  let missingMention = linkedDocMismatch ? '提示词正文与已保存的素材引用不一致。请保留正文并清除旧引用，再重新选择所需素材。' : ''
   const mentionSlots = new Map()
-  for (const attrs of promptDocumentMentions(promptDoc)) {
+  for (const attrs of promptDocumentMentions(displayedPromptDoc)) {
     const { assetId, assetType, label } = attrs
     const asset = promptAssets.get(assetId)
+    if (type === 'video') {
+      if (!asset || asset.disabled || asset.assetType !== assetType) {
+        missingMention ||= '引用「' + (label || nodeLabels[assetType]) + '」失效：' +
+          (asset?.status || '类型与已连接素材不符') + '。请重新连接、重新选择或将引用转为普通文字。'
+      }
+      continue
+    }
     const item = asset?.assetType === assetType ? asset.node : undefined
     const key = item ? promptAssetKey(item) : 'missing:' + assetType + ':' + assetId
     if (linkedMediaKeys.has(key)) continue
@@ -798,22 +854,27 @@ function NodeEditor({
     }
     generationKinds.push(assetType)
   }
-  const issue = missingMention || referenceIssue(referenceMode, generationKinds, activeProfile, true)
-    || (type === 'video' ? inlineReferenceIssue(promptDoc ? promptDocumentText(promptDoc, () => '') : prompt, generationKinds) : '')
+  const invalidReference = references.find(id =>
+    type === 'video' && invalidMedia?.[id] || !referenceReady(available.get(id), resolvedMedia))
+  const issue = missingMention || (invalidReference && (type === 'video'
+    ? '素材「' + (available.get(invalidReference) ? nodeName(available.get(invalidReference)) : invalidReference) + '」：' +
+      (invalidMedia?.[invalidReference] || '等待上游素材') + '。请检查来源或更换连线。'
+    : '等待上游素材。')) || referenceIssue(referenceMode, generationKinds, activeProfile, true)
   const savedProfile = compact ? activeProfile : resolveProfile(currentProfiles, storedProfileId)
   const generationIssue = [
     taskActive(latest ?? {}) && '此节点正在生成。',
     type === 'video' && !mode && '请选择视频生成方式。',
     !prompt.trim() && !hasTextRef && (type === 'video' ? '生成前请填写完整视频提示词。' : '请填写提示词。'),
-    referenceItems.some(item => !referenceReady(item, resolvedMedia)) && '等待上游素材。',
     issue,
     (!providerSettingsReady || !providerVersion) && '正在同步生成设置。',
     !savedProfile?.configured && '请选择已配置的生成预设。',
   ].find(Boolean)
-  const unavailable = actions.taskLockReason || (promptComposing && '请先完成提示词输入。') ||
-    (saving && '正在保存修改。') ||
-    (dirty && (compact ? error || '正在保存修改。' : '请先保存修改。')) || generationIssue
   const blocked = Boolean(edit && mutationReason)
+  const saveBeforeVideo = compact && type === 'video'
+  const unavailable = actions.taskLockReason || (promptComposing && '请先完成提示词输入。') ||
+    (saveBeforeVideo ? dirty && blocked && mutationReason
+      : (saving && '正在保存修改。') || (dirty && (compact ? error || '正在保存修改。' : '请先保存修改。'))) ||
+    generationIssue
 
   function changeMode(value) {
     if (compact) {
@@ -842,6 +903,7 @@ function NodeEditor({
 
   function updatePrompt(doc) {
     setPromptDoc(doc)
+    setPlainPrompt(promptDocumentText(doc))
     markDirty()
   }
 
@@ -854,9 +916,10 @@ function NodeEditor({
   }, [queryCanvas, mediaURL, node.id, ownMediaKey])
 
   const promptProps = {
-    value: promptDoc, prompt, assets: useMemo(() => [...promptAssets.values()], [promptAssets]), onChange: updatePrompt,
-    search: searchPromptAssets,
-    onAssetSelect: item => setPickedAssets(current => new Map(current).set(item.assetId, item)),
+    value: displayedPromptDoc, prompt, assets: useMemo(() => [...promptAssets.values()], [promptAssets]), onChange: updatePrompt,
+    search: type === 'video' ? undefined : searchPromptAssets,
+    onAssetSelect: type === 'video' ? undefined : item => setPickedAssets(current => new Map(current).set(item.assetId, item)),
+    allowPlainMention: type === 'video',
     onPreview: item => { if (item.node) actions.preview?.(item.node) },
     onLocate: id => actions.locate?.(id),
     onCompositionChange: composing => {
@@ -868,6 +931,11 @@ function NodeEditor({
   const mentionReferences = [...mentionSlots.values()]
   function removeMention({ ids, kind }) {
     promptInput.current?.removeMentions(ids, kind)
+  }
+
+  function clearStalePromptDoc() {
+    setPromptDoc(null)
+    markDirty()
   }
 
   function setAssetSource(item) {
@@ -888,6 +956,11 @@ function NodeEditor({
     if (hasPrompt) {
       next[promptField] = prompt
       if (promptDoc && (generation || type === 'prompt')) next.promptDoc = promptDoc
+      if (type === 'video') {
+        if (!promptDoc) delete next.promptDoc
+        if (displayedPromptDoc && promptDocumentMentions(displayedPromptDoc).length > 0) next.promptDocLinked = true
+        else if (!linkedDocMismatch) delete next.promptDocLinked
+      }
     }
     if (assetNode && (compact || asset || form.has('path') || form.has('url'))) {
       for (const field of ['path', 'url']) {
@@ -900,7 +973,7 @@ function NodeEditor({
     }
     const ordered = supportsRefs ? references : []
     if (generation) {
-      const structuralIssue = referenceIssue(referenceMode, referenceKinds, activeProfile)
+      const structuralIssue = referenceIssue(referenceMode, referenceKinds, type === 'video' ? undefined : activeProfile)
       if (structuralIssue) throw new Error(structuralIssue)
       const params = Object.fromEntries(Object.entries(overrides).filter(([key, value]) =>
         value.trim() && activeProfile?.parameters?.includes(key) &&
@@ -920,7 +993,7 @@ function NodeEditor({
     } else if (type === 'video') {
       if (compact) next.mode = 'asset'
       else delete next.mode
-      for (const key of ['profileId', 'params', 'prompt', 'promptDoc', 'textList', 'mixedListOrder']) delete next[key]
+      for (const key of ['profileId', 'params', 'prompt', 'promptDoc', 'promptDocLinked', 'textList', 'mixedListOrder']) delete next[key]
     } else if (type === 'shot') {
       if (ordered.length) next.mixedListOrder = ordered
       else delete next.mixedListOrder
@@ -968,34 +1041,46 @@ function NodeEditor({
 
   // Keep one in-flight update and coalesce typing into the latest pending edit.
   // The pending payload lives past deselection so a final keystroke is committed.
-  async function flushAutosave() {
+  function flushAutosave() {
     const state = queue.current
     clearTimeout(state.timer)
-    if (state.saving || !state.pending) return
+    if (state.inFlight || !state.pending) return state.inFlight
     const { payload, version, send } = state.pending
     state.pending = null
-    state.saving = true
     state.error = ''
     if (mounted.current) setSaving(true)
-    try {
-      const result = await send('update_node', { ...payload, revision: revision.current }, committed.current)
-      revision.current = result.revision
-      committed.current = { ...committed.current, ...payload, revision: result.revision }
-      state.savedVersion = version
-      if (mounted.current && !state.pending && !state.error) {
-        setDirty(false)
-        setError('')
+    state.inFlight = (async () => {
+      try {
+        const result = await send('update_node', { ...payload, revision: revision.current }, committed.current)
+        revision.current = result.revision
+        committed.current = { ...committed.current, ...payload, revision: result.revision }
+        state.savedVersion = version
+        if (mounted.current && !state.pending && !state.error) {
+          setDirty(false)
+          setError('')
+        }
+      } catch (failure) {
+        if (failure.cause?.status === 409) state.pending = null
+        state.error ||= failure.message
+        if (mounted.current) setError(state.error)
+        else reportSaveError?.(state.error)
+      } finally {
+        state.inFlight = null
+        if (mounted.current) setSaving(false)
+        if (state.pending) await flushAutosave()
       }
-    } catch (failure) {
-      if (failure.cause?.status === 409) state.pending = null
-      state.error ||= failure.message
-      if (mounted.current) setError(state.error)
-      else reportSaveError?.(state.error)
-    } finally {
-      state.saving = false
-      if (mounted.current) setSaving(false)
-      if (state.pending) void flushAutosave()
+    })()
+    return state.inFlight
+  }
+
+  async function saveForGeneration() {
+    await flushAutosave()
+    const state = queue.current
+    if (state.error) throw new Error(state.error)
+    if (state.latestVersion !== changeVersion || state.savedVersion < changeVersion || composingPrompt.current) {
+      throw new Error('提示词或输入在保存期间有变化，请确认当前内容后重新生成。')
     }
+    return committed.current
   }
 
   useLayoutEffect(() => {
@@ -1011,6 +1096,7 @@ function NodeEditor({
   useLayoutEffect(() => {
     if (!compact || !changeVersion || changeVersion <= queue.current.savedVersion) return
     const state = queue.current
+    state.latestVersion = changeVersion
     clearTimeout(state.timer)
     state.pending = null
     if (blocked) {
@@ -1032,7 +1118,7 @@ function NodeEditor({
 
   function changeProfile(id) {
     const profile = resolveProfile(currentProfiles, id)
-    const issue = compact && referenceIssue(referenceMode, referenceKinds, profile)
+    const issue = compact && type !== 'video' && referenceIssue(referenceMode, referenceKinds, profile)
     if (issue) { setError(issue); return }
     setProfileId(id)
     setOverrides(current => Object.fromEntries(Object.entries(current)
@@ -1132,6 +1218,8 @@ function NodeEditor({
         <div ref={referenceArea}>
           <MediaReferences compact mode={referenceMode} profile={activeProfile} media={available} mediaURL={mediaURL}
             resolvedMedia={resolvedMedia} queryCanvas={queryCanvas} nodeId={node.id} references={references}
+            invalidMedia={type === 'video' ? invalidMedia : undefined} pendingReferences={type === 'video'
+              ? references.filter(id => !persistedRefs.includes(id)) : undefined}
             kinds={generationKinds} mentions={mentionReferences} removeMention={removeMention}
             chooseMode={type === 'video' && (!mode || mode === 't2v') ? changeMode : undefined}
             setReferences={changeReferences} onSelect={attachReference} uploadReference={uploadReference}
@@ -1156,9 +1244,13 @@ function NodeEditor({
       <div className="drama-node-creative-footer">
         {(shownError || generation && (prompt.trim() || references.length > 0) && generationIssue) &&
           <p className="drama-node-creative-status" role={error ? 'alert' : 'status'}>{shownError || generationIssue}</p>}
+        {linkedDocMismatch && <Button size="sm" disabled={blocked} onClick={clearStalePromptDoc}>
+          保留正文，清除旧引用
+        </Button>}
         {generation && <GenerateControl node={effectiveNode} profile={savedProfile} generationDefaults={generationDefaults}
           providerVersion={providerVersion} providerSettingsReady={providerSettingsReady}
-          actions={actions} unavailable={unavailable} latest={latest} />}
+          actions={actions} unavailable={unavailable} latest={latest}
+          saveForGeneration={saveBeforeVideo ? saveForGeneration : undefined} />}
       </div>
       {settings && <Modal open title="节点详情" closeLabel="关闭节点详情"
         backdropBlur={false} onClose={() => setSettings('')}>
@@ -1219,6 +1311,9 @@ function NodeEditor({
         {hasPrompt && <div className="drama-node-field">{type === 'video' ? '完整视频提示词' : '提示词'}
           <PromptEditor ref={promptInput} {...promptProps} ariaLabel={type === 'video' ? '完整视频提示词' : '提示词'} disabled={blocked || saving} />
         </div>}
+        {linkedDocMismatch && <Button size="sm" disabled={blocked || saving} onClick={clearStalePromptDoc}>
+          保留正文，清除旧引用
+        </Button>}
         {!hasPrompt && <label className="drama-node-field">正文
           <textarea name="description" rows={3} value={description} onChange={event => setDescription(event.target.value)} />
         </label>}
@@ -1358,7 +1453,8 @@ function ReferenceModeMenu({ disabled, choose }) {
 }
 
 function MediaReferences({ compact, mode, profile, media, mediaURL, resolvedMedia, queryCanvas, nodeId, references,
-  kinds, mentions, removeMention, chooseMode, setReferences, onSelect, uploadReference, attachAsset, locate, preview, disabled }) {
+  kinds, mentions, removeMention, chooseMode, setReferences, onSelect, uploadReference, attachAsset, locate, preview, disabled,
+  invalidMedia, pendingReferences }) {
   const [search, setSearch] = useState('')
   const [pickerOpen, setPickerOpen] = useState(false)
   const totalLimit = mode === 'r2v' ? profile?.limits?.maxReferences ?? 32 : 32
@@ -1434,8 +1530,10 @@ function MediaReferences({ compact, mode, profile, media, mediaURL, resolvedMedi
             const item = known.get(id)
             const asset = resolvedMedia?.get(id) ?? item
             const label = referenceLabel(mode, kinds, index)
-            const title = label + ' · ' + (item ? nodeName(item) : '等待素材')
-            return <ReferenceSlot key={id} id={id} kind={item?.type} asset={asset} title={title} label={label} disabled={disabled}
+            const status = invalidMedia?.[id] || (pendingReferences?.includes(id) ? '连线待保存' : '')
+            const title = [label, item ? nodeName(item) : '等待素材', status].filter(Boolean).join(' · ')
+            return <ReferenceSlot key={id} id={id} kind={item?.type} asset={status ? undefined : asset} title={title}
+              label={status ? pendingReferences?.includes(id) ? '待保存' : '已失效' : label} disabled={disabled}
               index={index} count={references.length} mediaURL={mediaURL} locate={locate} preview={preview}
               move={delta => move(index, delta)} remove={() => setReferences(references.filter(ref => ref !== id))} />
           })}

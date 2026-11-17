@@ -36,6 +36,12 @@ export function referenceIds(node) {
   return Array.isArray(node?.content.mixedListOrder) ? node.content.mixedListOrder : []
 }
 
+export function videoReferenceIds(node, edges, index) {
+  const linked = new Set(edges.filter(edge => edge.target === node?.id && !textTypes.has(index?.get(edge.source)?.type))
+    .map(edge => edge.source))
+  return [...referenceIds(node).filter(id => linked.delete(id)), ...linked]
+}
+
 export function videoMode(node) {
   if (node.type !== 'video') return ''
   if (node.content.mode === '' || Object.hasOwn(modeLabels, node.content.mode)) return node.content.mode

@@ -47,6 +47,10 @@ func prepareVideoGeneration(input *GenerationInput, profile *ProviderProfile, gl
 		return err
 	}
 	input.Params = params
+	if profile.Provider == minimaxH3Protocol {
+		input.Params = minimaxParams(*input)
+		input.Params.Resolution = strings.ToUpper(input.Params.Resolution)
+	}
 	if slices.Contains(providerNames, profile.Provider) {
 		profile.Duration, profile.AspectRatio = params.Duration, params.AspectRatio
 		if params.Resolution != "" || params.GenerateAudio != nil {

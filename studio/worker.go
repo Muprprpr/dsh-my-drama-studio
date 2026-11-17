@@ -25,16 +25,17 @@ type Provider interface {
 }
 
 type GenerationInput struct {
-	Type                  string                `json:"type"`
-	Prompt                string                `json:"prompt"`
-	Mode                  string                `json:"mode,omitempty"`
-	Profile               ProviderProfile       `json:"profile,omitzero"`
-	WorkspacePath         string                `json:"-"`
-	References            []GenerationReference `json:"references,omitempty"`
-	Params                VideoParams           `json:"params,omitzero"`
-	OutputDirectory       string                `json:"outputDirectory,omitempty"`
-	providerVersion       string                // Checked at admission and omitted from the stored job.
-	productionAspectRatio string                // Resolved at admission into provider-specific parameters.
+	Type                  string                    `json:"type"`
+	Prompt                string                    `json:"prompt"`
+	Mode                  string                    `json:"mode,omitempty"`
+	Profile               ProviderProfile           `json:"profile,omitzero"`
+	WorkspacePath         string                    `json:"-"`
+	References            []GenerationReference     `json:"references,omitempty"`
+	PromptMentions        []GenerationPromptMention `json:"promptMentions,omitempty"`
+	Params                VideoParams               `json:"params,omitzero"`
+	OutputDirectory       string                    `json:"outputDirectory,omitempty"`
+	providerVersion       string                    // Checked at admission and omitted from the stored job.
+	productionAspectRatio string                    // Resolved at admission into provider-specific parameters.
 }
 
 type sourceGroup struct {
@@ -49,7 +50,11 @@ type generationRequest struct {
 	SourceNodeIDs      []string     `json:"sourceNodeIds,omitempty"`
 	SourceNodeRevision int64        `json:"sourceNodeRevision,omitempty"`
 	ManualConfirmation bool         `json:"manualConfirmation,omitempty"`
+	VideoInputContract int          `json:"videoInputContract,omitempty"`
 }
+
+const videoInputContractVersion = 1
+const rebuildVideoInput = "无法核验视频任务保存时的正文和素材连线，请从当前 Canvas 节点重新生成。"
 
 func readSourceGroup(ctx context.Context, tx *sql.Tx, id string) (sourceGroup, error) {
 	var group sourceGroup
@@ -59,9 +64,24 @@ func readSourceGroup(ctx context.Context, tx *sql.Tx, id string) (sourceGroup, e
 }
 
 type GenerationReference struct {
-	Type string `json:"type"`
-	URL  string `json:"url,omitempty"`
-	Path string `json:"path,omitempty"`
+	Type           string `json:"type"`
+	URL            string `json:"url,omitempty"`
+	Path           string `json:"path,omitempty"`
+	LocalSHA256    string `json:"localSha256,omitempty"`
+	SourceNodeID   string `json:"sourceNodeId,omitempty"`
+	SourceRevision int64  `json:"sourceRevision,omitempty"`
+	ResultNodeID   string `json:"resultNodeId,omitempty"`
+	ResultRevision int64  `json:"resultRevision,omitempty"`
+	Role           string `json:"role,omitempty"`
+}
+
+// GenerationPromptMention maps a byte range in the saved prompt to a frozen
+// media slot. Only adapters that require numbered tokens render these ranges.
+type GenerationPromptMention struct {
+	Start   int    `json:"start"`
+	End     int    `json:"end"`
+	Type    string `json:"type"`
+	Ordinal int    `json:"ordinal"`
 }
 
 type ProviderSubmission struct {
@@ -242,22 +262,36 @@ func (p *project) advance(ctx context.Context, registry providerRegistry) error 
 }
 
 func (p *project) advanceTask(ctx context.Context, registry providerRegistry, task Task, input string, deadline time.Time, onCompleted *func()) error {
+	if task.ProviderTaskID != "" && (task.Status == "pending" || task.Status == "submitting") {
+		return p.transition(ctx, task, "polling", task.ProviderTaskID, "")
+	}
 	var request generationRequest
-	var provider Provider
-	if task.Status != "submitting" {
-		if err := json.Unmarshal([]byte(input), &request); err != nil {
-			return p.transition(ctx, task, "failed", task.ProviderTaskID, "Stored generation request is invalid")
+	decodeErr := json.Unmarshal([]byte(input), &request)
+	unverifiedVideo := task.Type == "video" && (decodeErr != nil || request.Type != "video" || request.VideoInputContract != videoInputContractVersion)
+	if task.Status == "submitting" {
+		message := "Studio stopped before the provider task ID was saved. Confirm with provider before submitting again."
+		if unverifiedVideo {
+			message += " 请先向渠道确认旧任务是否已提交，确认未提交后，从当前 Canvas 节点重新生成。"
 		}
-		request.WorkspacePath = p.dir
-		var err error
-		provider, err = registry.Resolve(request.Profile)
-		if err != nil {
-			next := "failed"
-			if task.ProviderTaskID != "" {
-				next = "paused"
-			}
-			return p.transition(ctx, task, next, task.ProviderTaskID, "渠道凭据不可用，请检查 Drama Studio 设置")
+		return p.transition(ctx, task, "uncertain", "", message)
+	}
+	// Old video snapshots lack proof that every input came from the saved draft
+	// and its media edges. Only the initial POST needs that proof; known IDs
+	// still identify the original upstream task for polling and download.
+	if task.Status == "pending" && unverifiedVideo {
+		return p.transition(ctx, task, "failed", "", rebuildVideoInput)
+	}
+	if decodeErr != nil {
+		return p.transition(ctx, task, "failed", task.ProviderTaskID, "Stored generation request is invalid")
+	}
+	request.WorkspacePath = p.dir
+	provider, err := registry.Resolve(request.Profile)
+	if err != nil {
+		next := "failed"
+		if task.ProviderTaskID != "" {
+			next = "paused"
 		}
+		return p.transition(ctx, task, next, task.ProviderTaskID, "渠道凭据不可用，请检查 Drama Studio 设置")
 	}
 	switch task.Status {
 	case "pending":
@@ -292,11 +326,6 @@ func (p *project) advanceTask(ctx context.Context, registry providerRegistry, ta
 			return p.transition(persist, task, "failed", "", message)
 		}
 		return p.transition(persist, task, "uncertain", "", message)
-	case "submitting":
-		if task.ProviderTaskID != "" {
-			return p.transition(ctx, task, "polling", task.ProviderTaskID, "")
-		}
-		return p.transition(ctx, task, "uncertain", "", "Studio stopped before the provider task ID was saved. Confirm with provider before submitting again.")
 	case "polling":
 		budget := 30 * time.Second
 		if !deadline.IsZero() {

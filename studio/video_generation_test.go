@@ -1,6 +1,7 @@
 package studio
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"image"
@@ -78,6 +79,23 @@ func TestVideoGenerationEntryPointsAndSnapshots(t *testing.T) {
 	defer service.Close()
 	dir := t.TempDir()
 	bindSession(t, service, dir, "a")
+	var frame bytes.Buffer
+	if err := png.Encode(&frame, image.NewRGBA(image.Rect(0, 0, 16, 9))); err != nil {
+		t.Fatal(err)
+	}
+	for path, data := range map[string][]byte{
+		"assets/images/frame.png": frame.Bytes(), "assets/images/tail.png": frame.Bytes(),
+		"assets/previous/source.mp4": protocolTestVideo, "assets/audio/reference.wav": []byte("RIFF\x24\x00\x00\x00WAVE"),
+	} {
+		file := filepath.Join(dir, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(file, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustCall(t, service, dir, "a", "permission", map[string]any{"operationId": "allow", "enabled": true})
 	image, tail, video, audio := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
 	mustCall(t, service, dir, "a", "append", appendArgs{operation: operation{ID: "assets"}, Nodes: []NodeInput{
 		{ID: image, Type: "image", Content: json.RawMessage(`{"path":"assets/images/frame.png"}`)},
@@ -108,12 +126,37 @@ func TestVideoGenerationEntryPointsAndSnapshots(t *testing.T) {
 			}
 			mustCall(t, service, dir, "a", "append", appendArgs{operation: operation{ID: "draft-" + tc.mode},
 				Nodes: []NodeInput{{ID: nodeID, Type: "video", Content: raw}}, Edges: edges})
+			for _, entry := range []string{tc.action, "submit_manual", "submit"} {
+				for field, supplied := range map[string]any{
+					"prompt": "external text", "url": "https://example.test/unconnected.png",
+					"references": []GenerationReference{{Type: "image", URL: "https://example.test/unconnected.png"}},
+					"snapshot":   GenerationInput{Type: "video", Mode: "t2v", Prompt: "external snapshot"},
+				} {
+					args := map[string]any{"operationId": "inject-" + entry + "-" + field + "-" + tc.mode, "nodeId": nodeID, field: supplied}
+					if entry != "submit" {
+						args["confirmed"] = true
+					}
+					if _, err := call(service, dir, "a", entry, args); err == nil || !strings.Contains(err.Error(), "unknown field \""+field+"\"") {
+						t.Fatalf("%s accepted caller-supplied %s: %v", entry, field, err)
+					}
+				}
+			}
 			action := map[string]any{"operationId": "generate-" + tc.mode, "nodeId": nodeID, "confirmed": true}
 			mustCall(t, service, dir, "a", tc.action, action)
+			mustCall(t, service, dir, "a", "submit_manual", map[string]any{
+				"operationId": "regenerate-" + tc.mode, "nodeId": nodeID, "confirmed": true,
+			})
+			mustCall(t, service, dir, "a", "submit", submitArgs{operation: operation{ID: "auto-" + tc.mode}, NodeID: nodeID})
 			var snapshot string
 			for _, project := range service.projects {
-				if err := project.db.QueryRow("SELECT input FROM tasks WHERE node_id=?", nodeID).Scan(&snapshot); err != nil {
+				var count, distinct int
+				if err := project.db.QueryRow(
+					"SELECT count(*), count(DISTINCT json_remove(input, '$.manualConfirmation')), min(input) FROM tasks WHERE node_id=?", nodeID,
+				).Scan(&count, &distinct, &snapshot); err != nil {
 					t.Fatal(err)
+				}
+				if count != 3 || distinct != 1 {
+					t.Fatalf("expected three accepted submissions with the same generation inputs, got count %d and distinct %d", count, distinct)
 				}
 			}
 			var input GenerationInput

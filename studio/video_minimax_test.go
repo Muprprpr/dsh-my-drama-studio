@@ -24,7 +24,7 @@ func TestMiniMaxH3Transport(t *testing.T) {
 		taskID   = "4191234567891234"
 		output   = "https://cdn.example.test/finished.mp4?signature=fixture"
 		video    = "\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
-		prompt   = "相机缓慢推进。保留完整提示词、对白和声音描述。"
+		prompt   = " 相机缓慢推进。\n对白：“请留在画内。”\n屏显文字 @图片2 和 name@example.test。\n最后限制：保持环境声。 "
 		tailURL  = "https://assets.example.test/tail.png"
 		refVideo = "https://assets.example.test/clip.mp4"
 		refAudio = "https://assets.example.test/ambient.wav"
@@ -60,6 +60,19 @@ func TestMiniMaxH3Transport(t *testing.T) {
 			if mode == "r2v" {
 				input.References = append(input.References, GenerationReference{Type: "video", URL: refVideo}, GenerationReference{Type: "audio", URL: refAudio})
 				wantContent = append(wantContent, minimaxFixtureContent("video", "reference_video", refVideo), minimaxFixtureContent("audio", "reference_audio", refAudio))
+				input.Prompt = prompt + "\n参照 @街道、@舞步 和 @环境音。再次参照 @街道。"
+				newMention := func(label, kind string) GenerationPromptMention {
+					start := strings.Index(input.Prompt, label)
+					return GenerationPromptMention{Start: start, End: start + len(label), Type: kind, Ordinal: 1}
+				}
+				lastStart := strings.LastIndex(input.Prompt, "@街道")
+				input.PromptMentions = []GenerationPromptMention{
+					newMention("@街道", "image"),
+					newMention("@舞步", "video"),
+					newMention("@环境音", "audio"),
+					{Start: lastStart, End: lastStart + len("@街道"), Type: "image", Ordinal: 1},
+				}
+				wantContent[0] = map[string]any{"type": "text", "text": prompt + "\n参照 图片 1、视频 1 和 音频 1。再次参照 图片 1。"}
 			}
 			wantBody := map[string]any{"model": minimaxH3Model, "content": wantContent, "resolution": "768P", "duration": float64(4)}
 			if mode != "i2v" {
@@ -128,6 +141,20 @@ func TestMiniMaxH3Transport(t *testing.T) {
 			}
 		})
 	}
+	t.Run("later invalid local file prevents all uploads", func(t *testing.T) {
+		client := &http.Client{Transport: arkFixtureTransport(func(*http.Request) (*http.Response, error) {
+			t.Fatal("invalid after a valid reference reached the API")
+			return nil, errors.New("unexpected API call")
+		})}
+		provider := newMinimaxProvider(ProviderProfile{Model: minimaxH3Model, Mode: "r2v"}, key, client)
+		submitted, err := provider.Submit(context.Background(), GenerationInput{
+			Type: "video", Mode: "r2v", Prompt: prompt, WorkspacePath: workspace,
+			References: []GenerationReference{{Type: "image", Path: "assets/images/first.png"}, {Type: "audio", Path: "assets/audio/missing.wav"}},
+		})
+		if err == nil || !submitted.Rejected || !strings.Contains(err.Error(), "素材 2") {
+			t.Fatalf("invalid input not rejected: %+v, %v", submitted, err)
+		}
+	})
 }
 
 func minimaxFixtureContent(kind, role, source string) map[string]any {

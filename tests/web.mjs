@@ -3464,16 +3464,23 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
 
       const prompt = '以 @图片1 为首帧，保留小鸭轮廓。固定中景，停顿半秒后渐亮，保留室内环境声。'
       const formFor = node => card(page, node.id).getByRole('form', { name: '编辑节点', exact: true })
-      async function newVideo(title, mode = 't2v') {
+      async function newVideo(title, mode) {
         const video = await pick(page, '视频生成', ticket, 'video')
         await chooseVideoMode(page, ticket, video.id, mode)
         await editDetails(page, video.id, { 节点名称: title })
         await updateVideo(page, ticket, video.id, prompt.replace('以 @图片1 为首帧，', ''))
         return (await query(page, ticket, { id: video.id })).nodes[0]
       }
-      const first = await newVideo('首帧连接验收甲')
-      const second = await newVideo('首帧连接验收乙')
+      const first = await newVideo('首帧连接验收甲', 't2v')
+      const second = await newVideo('首帧连接验收乙', 'i2v')
       await clickBlank(page)
+      await dragReference(page, image.id, first.id)
+      await flow(page).getByRole('alert').filter({ hasText: /文生视频不接收素材/u }).waitFor()
+      const textDraft = await query(page, ticket, { id: first.id })
+      assert.equal(textDraft.nodes[0].content.mode, 't2v')
+      assert.ok(!textDraft.edges.some(item => item.target === first.id))
+      await card(page, first.id).locator('.drama-node-titlebar').click()
+      await chooseVideoMode(page, ticket, first.id, 'i2v')
       const edge = target => graphEdge(page, image.id, target.id)
       for (const target of [first, second]) {
         await clickBlank(page)
@@ -4105,8 +4112,8 @@ test('Native canvas uploads media and sends the connected PNG to the configured 
   }
 })
 
-test('Native prompt asset mentions survive reload and send real assets without canvas links', {
-  timeout: 90_000, skip: !hasImage || !existsSync(projectImageAsset),
+test('Native video prompt mentions follow canvas links, and generation flushes the saved prompt', {
+  timeout: 110_000, skip: !hasImage || !existsSync(projectImageAsset),
 }, async () => {
   const requests = []
   const endpoint = createHTTPServer(async (request, response) => {
@@ -4137,6 +4144,11 @@ test('Native prompt asset mentions survive reload and send real assets without c
       const standard = await saveProfile(configured.revision, standardName, 'mention-r2v', 2)
       const limited = await saveProfile(standard.revision, limitedName, 'mention-single', 1)
       const profileId = name => limited.profiles.find(profile => profile.name === name).id
+      const textName = '提及回环文生预设'
+      const profiles = await providers('provider_save', { revision: limited.revision, profile: {
+        name: textName, model: 'mention-t2v', channelId: channel.id, modes: ['t2v'],
+      } })
+      const textProfile = profiles.profiles.find(profile => profile.name === textName)
 
       await select(page, record)
       await open(page, record)
@@ -4146,7 +4158,7 @@ test('Native prompt asset mentions survive reload and send real assets without c
       const chooser = page.waitForEvent('filechooser')
       await card(page, canvasImage.id).getByRole('button', { name: '上传图片', exact: true }).click()
       await (await chooser).setFiles(imageAsset)
-      const canvasAssetId = await poll(async () => (await query(page, ticket, { id: canvasImage.id })).nodes[0]?.content.assetId,
+      await poll(async () => (await query(page, ticket, { id: canvasImage.id })).nodes[0]?.content.assetId,
         'the canvas image upload did not save')
       const canvasName = '画布小鸭'
       await editDetails(page, canvasImage.id, { 节点名称: canvasName, 集: 'MENTION' })
@@ -4162,7 +4174,9 @@ test('Native prompt asset mentions survive reload and send real assets without c
       const target = { id: randomUUID(), type: 'video', episodeId: 'MENTION', content: {
         title: '素材提及验收', mode: 'r2v', profileId: profileId(standardName), prompt: legacy,
       } }
-      await append(page, ticket, [project, target])
+      const unlinked = { ...project, id: randomUUID(), content: { ...project.content, title: '未连接图片' } }
+      const connectedIds = [canvasImage.id, project.id]
+      await append(page, ticket, [project, target, unlinked], connectedIds.map(source => ({ source, target: target.id })))
       await card(page, target.id).waitFor()
       const initial = await query(page, ticket)
       assert.equal(initial.nodes.find(node => node.id === target.id).content.promptDoc, undefined)
@@ -4178,12 +4192,12 @@ test('Native prompt asset mentions survive reload and send real assets without c
       const savedNode = async () => (await query(page, ticket, { id: target.id })).nodes[0]
       assert.equal(await prompt.innerText(), legacy)
       const mentions = prompt.locator('[data-asset-mention]')
-      const mentionSlots = editor.locator('.drama-node-reference-strip [data-mention-asset-id]')
+      const slots = editor.locator('.drama-node-reference-strip .drama-node-reference-slot')
       const assertMentionStrip = async () => {
-        await mentionSlots.nth(1).waitFor()
-        assert.deepEqual(await mentionSlots.evaluateAll(slots => slots.map(slot => slot.dataset.mentionAssetId)),
-          [canvasAssetId, project.id])
-        for (const [index, slot] of (await mentionSlots.all()).entries()) {
+        await slots.nth(1).waitFor()
+        assert.equal(await slots.count(), 2)
+        assert.equal(await editor.locator('.drama-node-reference-strip [data-mention-asset-id]').count(), 0)
+        for (const [index, slot] of (await slots.all()).entries()) {
           const thumb = slot.getByRole('button', { name: new RegExp('^@图片' + (index + 1) + ' · '), exact: false })
           assert.ok(await thumb.locator('img').evaluate(async img => {
             await img.decode()
@@ -4202,6 +4216,7 @@ test('Native prompt asset mentions survive reload and send real assets without c
       const canvasOption = candidates.getByRole('option', { name: /画布小鸭/u })
       await canvasOption.waitFor()
       await candidates.getByRole('option', { name: /项目餐厅/u }).waitFor()
+      assert.equal(await candidates.getByRole('option', { name: /未连接图片/u }).count(), 0)
       await prompt.press('ArrowDown')
       assert.notEqual(await canvasOption.getAttribute('aria-selected'), 'true')
       await prompt.press('ArrowUp')
@@ -4228,12 +4243,13 @@ test('Native prompt asset mentions survive reload and send real assets without c
       const atoms = mentionContent.promptDoc.content.flatMap(block => block.content ?? [])
         .filter(item => item.type === 'assetMention')
       assert.deepEqual(atoms.map(({ attrs }) => [attrs.assetId, attrs.assetType, attrs.label]),
-        [[canvasAssetId, 'image', canvasName], [project.id, 'image', project.content.title]])
+        [[canvasImage.id, 'image', canvasName], [project.id, 'image', project.content.title]])
       assert.equal(mentionContent.prompt, legacy + ` 参考 @${canvasName} 保留主体，沿用 @${project.content.title} 的构图。`)
       assert.ok(!mentionContent.textList?.length)
-      assert.deepEqual(mentionContent.mixedListOrder ?? [], [])
-      assert.equal((await query(page, ticket)).edges.filter(edge => edge.target === target.id).length, 0)
-      assert.equal((await query(page, ticket, { type: 'image' })).nodes.length, 2, 'mentioning a project asset cloned it into a node')
+      assert.equal(mentionContent.promptDocLinked, true)
+      assert.deepEqual(mentionContent.mixedListOrder, connectedIds)
+      assert.equal((await query(page, ticket)).edges.filter(edge => edge.target === target.id).length, 2)
+      assert.equal((await query(page, ticket, { type: 'image' })).nodes.length, 3, 'mentioning a connected asset cloned it into a node')
       await assertMentionStrip()
 
       await prompt.press('Control+End')
@@ -4278,7 +4294,7 @@ test('Native prompt asset mentions survive reload and send real assets without c
         const copied = new DOMParser().parseFromString(html, 'text/html')
         const atoms = [...copied.querySelectorAll('[data-asset-mention]')]
         return atoms.length === expectedIds.length && atoms.every((atom, i) => atom.dataset.assetId === expectedIds[i])
-      }, [canvasAssetId, project.id]), 'Ctrl+C did not serialize both asset atoms to the clipboard')
+      }, connectedIds), 'Ctrl+C did not serialize both asset atoms to the clipboard')
       await prompt.press('Control+End')
       await poll(() => prompt.evaluate(element => {
         const selection = document.getSelection()
@@ -4293,18 +4309,6 @@ test('Native prompt asset mentions survive reload and send real assets without c
         .filter(item => item.type === 'assetMention').length === 2, 'undo did not restore the original asset atoms after rich paste')
       await assertMentionStrip()
 
-      await mentionSlots.first().getByRole('button', { name: '移除参考 1', exact: true }).click()
-      await poll(async () => (await savedNode()).content.prompt === committedPrompt.replace('@' + canvasName, ''),
-        'removing a mention from the strip did not remove the matching prompt atom')
-      assert.equal(await mentionSlots.count(), 1)
-      assert.equal(await mentions.count(), 1)
-      assert.deepEqual((await savedNode()).content.mixedListOrder ?? [], [])
-      assert.equal((await query(page, ticket)).edges.filter(edge => edge.target === target.id).length, 0)
-      assert.equal((await query(page, ticket, { type: 'image' })).nodes.length, 2, 'removing a mention affected the source asset')
-      await prompt.press('Control+z')
-      await poll(async () => (await savedNode()).content.prompt === committedPrompt, 'undo did not restore the removed strip reference')
-      await assertMentionStrip()
-
       const oneAtom = mentions.locator('button').first()
       await oneAtom.evaluate(button => {
         const atom = button.closest('[data-asset-mention]')
@@ -4317,6 +4321,7 @@ test('Native prompt asset mentions survive reload and send real assets without c
       await poll(async () => (await savedNode()).content.prompt === committedPrompt.replace('@' + canvasName, ''),
         'Backspace did not delete the whole mention atom without changing neighboring text')
       assert.equal(await mentions.count(), 1)
+      assert.deepEqual((await savedNode()).content.mixedListOrder, connectedIds, 'removing a token changed the connected media')
       await prompt.press('Control+z')
       await poll(async () => (await savedNode()).content.prompt === committedPrompt, 'undo did not restore the deleted asset mention')
 
@@ -4416,7 +4421,7 @@ test('Native prompt asset mentions survive reload and send real assets without c
       const outgoing = await poll(() => requests[0], 'the worker did not call the configured endpoint with mentions')
       assert.deepEqual([outgoing.method, outgoing.path], ['POST', '/jobs'])
       assert.equal(outgoing.body.model, 'mention-r2v')
-      assert.equal(outgoing.body.prompt, legacy + ' 参考 @图片1 保留主体，沿用 @图片2 的构图。景。')
+      assert.equal(outgoing.body.prompt, saved.prompt)
       const references = outgoing.body.input.references
       assert.deepEqual(references.map(ref => ref.type), ['image', 'image'])
       const files = await Promise.all([imageAsset, projectImageAsset].map(file => readFile(file)))
@@ -4424,7 +4429,7 @@ test('Native prompt asset mentions survive reload and send real assets without c
         assert.match(ref.url, /^data:image\/png;base64,/u)
         assert.deepEqual(Buffer.from(ref.url.split(',')[1], 'base64'), files[index])
       }
-      assert.equal((await query(page, ticket)).edges.filter(edge => edge.target === target.id).length, 0)
+      assert.equal((await query(page, ticket)).edges.filter(edge => edge.target === target.id).length, 2)
       await poll(async () => (await operate(page, ticket, 'tasks', {})).tasks.some(task =>
         task.nodeId === target.id && task.status === 'failed'), 'the local capture rejection did not settle')
       assert.equal(requests.length, 1)
@@ -4440,13 +4445,124 @@ test('Native prompt asset mentions survive reload and send real assets without c
         await card(page, target.id).locator('.drama-node-titlebar').click()
         await mentions.nth(1).getByRole('button').waitFor()
         assert.match(await mentions.nth(1).getByRole('button').getAttribute('title'), /失效/u)
-        await editor.getByRole('status').filter({ hasText: /找不到引用素材/u }).waitFor()
+        await editor.getByRole('status').filter({ hasText: /引用.*失效.*文件/u }).waitFor()
         assert.ok(await editor.getByRole('button', { name: '重新生成…', exact: true }).isDisabled())
         assert.deepEqual((await savedNode()).content.promptDoc, saved.promptDoc)
         assert.equal(requests.length, 1, 'a reference without its local file reached the endpoint')
         await screenshot(page, 'prompt-asset-missing.png')
       } finally {
         await rename(missingPath, mediaPath)
+      }
+
+      await slots.nth(1).getByRole('button', { name: '移除参考 2', exact: true }).click()
+      await poll(async () => (await savedNode()).content.mixedListOrder.length === 1, 'removing an input did not disconnect it')
+      await editor.getByRole('status').filter({ hasText: /没有有效连线/u }).waitFor()
+      assert.match(await mentions.nth(1).getByRole('button').getAttribute('title'), /没有有效连线/u)
+      await mentions.nth(1).getByRole('button').click()
+      await page.getByRole('dialog', { name: '引用素材详情', exact: true })
+        .getByRole('button', { name: '转为普通文字', exact: true }).click()
+      await poll(async () => (await savedNode()).content.promptDoc.content.flatMap(block => block.content ?? [])
+        .filter(item => item.type === 'assetMention').length === 1, 'converting an invalid mention did not save')
+      assert.equal((await savedNode()).content.prompt, saved.prompt)
+      const [image] = (await query(page, ticket, { id: canvasImage.id })).nodes
+      await operate(page, ticket, 'canvas_delete', { operationId: randomUUID(), nodes: [{ id: image.id, revision: image.revision }] })
+      await editor.getByRole('status').filter({ hasText: /来源.*删除/u }).waitFor()
+      assert.equal(await slots.count(), 0)
+      assert.ok(await editor.getByRole('button', { name: '重新生成…', exact: true }).isDisabled())
+      const original = await savedNode()
+      await card(page, target.id).hover()
+      await card(page, target.id).getByRole('button', { name: '复制节点 · Ctrl+D', exact: true }).click()
+      const copied = await poll(async () => {
+        const graph = await query(page, ticket, { type: 'video' })
+        const copy = graph.nodes.find(node => node.id !== target.id && node.content.title === original.content.title)
+        if (!copy) return null
+        assert.ok(!graph.edges.some(edge => edge.target === copy.id))
+        return copy
+      }, 'copying an archived-reference draft did not create a new card')
+      assert.equal(copied.content.prompt, original.content.prompt)
+      assert.deepEqual(copied.content.promptDoc, original.content.promptDoc)
+      assert.deepEqual(copied.content.mixedListOrder, [])
+
+      const plain = { id: randomUUID(), type: 'video', episodeId: 'MENTION', content: {
+        title: '零边文生测试', mode: 't2v', profileId: textProfile.id, prompt: '新正文，联系邮箱 name@image1.example。',
+        promptDoc: saved.promptDoc,
+      } }
+      const mismatch = { ...plain, id: randomUUID(), content: {
+        ...plain.content, title: '显式引用不匹配', promptDocLinked: true,
+      } }
+      await append(page, ticket, [plain, mismatch])
+      await fit(page)
+      await card(page, mismatch.id).locator('.drama-node-titlebar').click()
+      const mismatchEditor = nodeEditor(page, mismatch.id)
+      assert.equal(await mismatchEditor.getByRole('textbox', { name: '提示词', exact: true }).innerText(), plain.content.prompt)
+      assert.ok(await mismatchEditor.getByRole('button', { name: '生成…', exact: true }).isDisabled())
+      await mismatchEditor.getByRole('button', { name: '保留正文，清除旧引用', exact: true }).click()
+      await poll(async () => {
+        const [updated] = (await query(page, ticket, { id: mismatch.id })).nodes
+        return updated.content.prompt === plain.content.prompt && !updated.content.promptDoc && !updated.content.promptDocLinked
+      }, 'explicitly clearing mismatched references did not preserve the saved text')
+
+      await card(page, plain.id).locator('.drama-node-titlebar').click()
+      const plainEditor = nodeEditor(page, plain.id)
+      const plainPrompt = plainEditor.getByRole('textbox', { name: '提示词', exact: true })
+      const plainGenerate = plainEditor.getByRole('button', { name: '生成…', exact: true })
+      const confirmation = page.getByRole('dialog', { name: '确认生成', exact: true })
+      assert.equal(await plainPrompt.innerText(), plain.content.prompt)
+      assert.equal(await plainPrompt.locator('[data-asset-mention]').count(), 0)
+
+      const operationRoute = '**/api/drama/operation'
+      const failedPrompt = '保存失败时不能提交上一版。'
+      const nextPrompt = '立刻生成应使用刚保存的新正文。'
+      let attempts = 0
+      let submits = 0
+      let submittedRevision
+      const releaseSave = Promise.withResolvers()
+      const watchSave = async route => {
+        const { action, data } = route.request().postDataJSON()
+        if (data.nodeId === plain.id && action === 'generateT2V') {
+          submits++
+          submittedRevision = data.expectedRevision
+        }
+        if (data.id === plain.id && action === 'update_node') {
+          if (data.content.prompt === failedPrompt) {
+            attempts++
+            return route.fulfill({ status: 409, json: { error: '测试保存冲突' } })
+          }
+          if (data.content.prompt === nextPrompt) {
+            attempts++
+            await releaseSave.promise
+          }
+        }
+        return route.continue()
+      }
+      await page.route(operationRoute, watchSave)
+      try {
+        await plainPrompt.fill(failedPrompt)
+        await plainGenerate.click()
+        await poll(() => attempts === 1, 'clicking Generate did not attempt the pending save')
+        await plainEditor.getByRole('alert').filter({ hasText: /画布内容已变化/u }).first().waitFor()
+        assert.equal(await confirmation.count(), 0)
+        assert.equal(submits, 0)
+        assert.equal((await query(page, ticket, { id: plain.id })).nodes[0].content.prompt, plain.content.prompt)
+        await plainPrompt.fill(nextPrompt)
+        await plainGenerate.click()
+        await poll(() => attempts === 2, 'clicking Generate did not flush the latest prompt')
+        assert.equal(await confirmation.count(), 0)
+        assert.equal(submits, 0)
+        releaseSave.resolve()
+        const confirm = confirmation.getByRole('button', { name: '确认提交', exact: true })
+        await confirm.waitFor()
+        const [justSaved] = (await query(page, ticket, { id: plain.id })).nodes
+        assert.equal(justSaved.content.prompt, nextPrompt)
+        await confirm.click()
+        const textRequest = await poll(() => requests[1], 'the worker did not send the saved zero-edge text')
+        assert.equal(textRequest.body.prompt, nextPrompt)
+        assert.ok(!textRequest.body.input?.references?.length)
+        assert.equal(submits, 1)
+        assert.equal(submittedRevision, justSaved.revision)
+      } finally {
+        releaseSave.resolve()
+        await page.unroute(operationRoute, watchSave)
       }
     })
   } finally {

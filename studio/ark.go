@@ -215,8 +215,19 @@ func (p *arkProvider) payload(input GenerationInput) ([]byte, error) {
 	if err := p.Validate(input); err != nil {
 		return nil, err
 	}
-	content := []map[string]any{{"type": "text", "text": input.Prompt}}
-	size := len(input.Prompt)
+	prompt := input.Prompt
+	family := arkContractFor(p.profile).family
+	if p.profile.Mode == "r2v" && (family == arkSeedance20 || family == arkSeedance25) {
+		var err error
+		prompt, err = videoRequestPrompt(input, func(mention GenerationPromptMention) string {
+			return fmt.Sprintf("@%s%d", assetMentionLabels[mention.Type], mention.Ordinal)
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	content := []map[string]any{{"type": "text", "text": prompt}}
+	size := len(prompt)
 	role := "reference_image"
 	if p.profile.Mode == "i2v" {
 		role = "first_frame"
@@ -236,7 +247,7 @@ func (p *arkProvider) payload(input GenerationInput) ([]byte, error) {
 	}
 
 	body := map[string]any{"model": p.profile.Model, "content": content}
-	if p.profile.Mode == "r2v" && arkContractFor(p.profile).family == arkSeedance25 {
+	if p.profile.Mode == "r2v" && family == arkSeedance25 {
 		body["omni_reference_task_type"] = "reference"
 	}
 	if p.profile.Duration != 0 {

@@ -317,12 +317,15 @@ function SessionPanel({ sessionId, visible, tabSignal, title, useWorkspaces }) {
     }
     try {
       const result = node.type === 'video'
-        ? await videoGeneration[videoMode(node)](ticket, request)
+        ? await videoGeneration[videoMode(node)](ticket, { ...request, expectedRevision: node.revision })
         : await operation(ticket, 'submit_manual', request)
       setRevision(value => value + 1)
       return result
     } catch (failure) {
-      if (failure.status === 409) setProviderReload(value => value + 1)
+      if (failure.status === 409) {
+        setProviderReload(value => value + 1)
+        setRevision(value => value + 1)
+      }
       throw failure
     }
   }

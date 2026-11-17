@@ -11,7 +11,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -303,19 +302,9 @@ func readVideoMedia(input GenerationInput, ref GenerationReference, limit int64)
 		!filepath.IsLocal(ref.Path) || filepath.ToSlash(filepath.Clean(ref.Path)) != ref.Path {
 		return nil, "", errors.New("Invalid project video or audio reference")
 	}
-	root, err := os.OpenRoot(input.WorkspacePath)
+	file, err := openProviderReference(input, ref, limit)
 	if err != nil {
-		return nil, "", errors.New("Could not open the reference workspace")
-	}
-	defer root.Close()
-	file, err := root.Open(ref.Path)
-	if err != nil {
-		return nil, "", errors.New("Could not open the project media")
-	}
-	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > limit {
-		_ = file.Close()
-		return nil, "", errors.New("Project media exceeds the provider limit or is unreadable")
+		return nil, "", err
 	}
 	return file, mime, nil
 }

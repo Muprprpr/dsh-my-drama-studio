@@ -215,6 +215,69 @@ func TestReplicateUploadsLocalImageBeforePrediction(t *testing.T) {
 	if err != nil || result.TaskID != "prediction-2" || requests.Load() != 2 {
 		t.Fatalf("local submission = %+v, %v, requests = %d", result, err, requests.Load())
 	}
+	client = &http.Client{Transport: replicateFixtureTransport(func(*http.Request) (*http.Response, error) {
+		t.Fatal("invalid after a valid reference reached the API")
+		return nil, nil
+	})}
+	provider = newReplicateProvider(ProviderProfile{Mode: "r2v", Model: "google/veo-3.1", InputField: "reference_images"}, "fixture-token", client)
+	result, err = provider.Submit(context.Background(), GenerationInput{Type: "video", Mode: "r2v", Prompt: "Match the reference images.",
+		WorkspacePath: workspace, References: []GenerationReference{{Type: "image", Path: relative}, {Type: "image", Path: "assets/images/missing.png"}}})
+	if err == nil || !result.Rejected || !strings.Contains(err.Error(), "参考图 2") {
+		t.Fatalf("invalid input not rejected: %+v, %v", result, err)
+	}
+}
+
+func TestKlingHTTPCompilesOnlyStructuredReferenceRanges(t *testing.T) {
+	const (
+		plain = " \n保持屏显 @图片1 和 hi@image2.example。\n"
+		line  = "@演员 转身看向 @街道，再切回 @演员。\n保留对白与尾部限制。 "
+		urlA  = "https://example.com/street.png"
+		urlB  = "https://example.com/actor.png"
+	)
+	for _, mode := range []string{"t2v", "r2v"} {
+		t.Run(mode, func(t *testing.T) {
+			profile := ProviderProfile{Mode: mode, Model: klingOmniModel}
+			input := GenerationInput{Mode: mode, Type: "video", Prompt: plain}
+			want := map[string]any{"prompt": plain}
+			if mode == "r2v" {
+				profile.InputField = "reference_images"
+				input.Prompt = plain + line
+				input.References = []GenerationReference{{Type: "image", URL: urlA}, {Type: "image", URL: urlB}}
+				first := strings.Index(input.Prompt, "@演员")
+				middle := strings.Index(input.Prompt, "@街道")
+				last := strings.LastIndex(input.Prompt, "@演员")
+				input.PromptMentions = []GenerationPromptMention{
+					{Start: first, End: first + len("@演员"), Type: "image", Ordinal: 2},
+					{Start: middle, End: middle + len("@街道"), Type: "image", Ordinal: 1},
+					{Start: last, End: last + len("@演员"), Type: "image", Ordinal: 2},
+				}
+				want["prompt"] = plain + "<<<image_2>>> 转身看向 <<<image_1>>>，再切回 <<<image_2>>>。\n保留对白与尾部限制。 "
+				want["reference_images"] = []any{urlA, urlB}
+			}
+			var requests atomic.Int32
+			client := replicateFixtureClient(t, func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				if r.Method != http.MethodPost || r.URL.Path != "/v1/models/"+klingOmniModel+"/predictions" {
+					t.Errorf("unexpected Kling route: %s %s", r.Method, r.URL.Path)
+				}
+				var body replicatePredictionInput
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil || !reflect.DeepEqual(body.Input, want) {
+					t.Errorf("prediction = %+v, %v, want %+v", body, err, want)
+				}
+				io.WriteString(w, "{\"id\":\"prediction-kling-1\",\"status\":\"starting\"}")
+			})
+			provider := newReplicateProvider(profile, "fixture-token", client)
+			result, err := provider.Submit(context.Background(), input)
+			if err != nil || result.TaskID != "prediction-kling-1" || requests.Load() != 1 {
+				t.Fatalf("unexpected submit: %+v, %v, requests %d", result, err, requests.Load())
+			}
+			input.Prompt += strings.Repeat("限", 2501)
+			result, err = provider.Submit(context.Background(), input)
+			if err == nil || !strings.Contains(err.Error(), "2500") || !result.Rejected || requests.Load() != 1 {
+				t.Fatalf("oversized prompt reached provider: %+v, %v, requests %d", result, err, requests.Load())
+			}
+		})
+	}
 }
 
 func TestReplicateRejectsInvalidInputsAndDoesNotRetrySubmission(t *testing.T) {

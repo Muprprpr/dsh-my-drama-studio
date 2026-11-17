@@ -97,6 +97,9 @@ func validateVideoChannel(channel VideoChannel) error {
 		}
 		paths = append(paths, field)
 	}
+	if err := validateCustomSubmitQuery(a.SubmitURL, paths); err != nil {
+		return err
+	}
 
 	hasCompletion, hasFailure := false, false
 	for remote, local := range a.StatusMap {
@@ -108,6 +111,50 @@ func validateVideoChannel(channel VideoChannel) error {
 	}
 	if !hasCompletion || !hasFailure {
 		return invalid("Custom REST 至少需要填写成功和失败的上游状态")
+	}
+	return nil
+}
+
+func validateCustomSubmitQuery(endpoint string, writePaths []string) error {
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return invalid("Custom REST 提交 URL 无效")
+	}
+	query, err := url.ParseQuery(parsed.RawQuery)
+	if err != nil {
+		return invalid("Custom REST 提交 URL 的查询参数无效")
+	}
+	// Servers may parse body and query together, including dotted and bracket
+	// notation for nested inputs. Reserve those keys on the submit URL only.
+	normalize := strings.NewReplacer("-", "", "_", "", "[", ".", "]", "", " ", "")
+	reserved := []string{
+		"mode", "modelid", "text", "caption", "negativeprompt", "multiprompt", "instructions",
+		"content", "input", "media", "textlist", "mixedlistorder",
+		"image", "images", "imageurl", "video", "videos", "videourl", "audio", "audios", "audiourl",
+		"imageurls", "videourls", "audiourls", "inputreference", "sourceimage", "sourceaudio",
+		"referenceimage", "referenceimages", "referencevideo", "referencevideos", "referenceaudio", "referenceaudios",
+		"inputimage", "inputvideo", "inputaudio", "startimage", "endimage", "startframe", "endframe",
+		"seconds", "size", "width", "height", "ratio", "seed", "fps",
+	}
+	conflict := func(key string) error {
+		return invalid("Custom REST 提交 URL 的查询参数 %q 与生成输入冲突，请将输入配置在请求体字段映射中", key)
+	}
+	for key := range query {
+		path := normalize.Replace(strings.ToLower(key))
+		for _, field := range writePaths {
+			root, _, _ := strings.Cut(field, ".")
+			mapped := normalize.Replace(strings.ToLower(root))
+			if path == mapped || strings.HasPrefix(path, mapped+".") {
+				return conflict(key)
+			}
+		}
+		for _, part := range strings.Split(path, ".") {
+			if slices.Contains(reserved, part) || slices.ContainsFunc(mappedVideoFields, func(field string) bool {
+				return strings.EqualFold(field, part)
+			}) {
+				return conflict(key)
+			}
+		}
 	}
 	return nil
 }

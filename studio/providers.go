@@ -313,19 +313,9 @@ func openImageReference(input GenerationInput, ref GenerationReference, limit in
 		!filepath.IsLocal(ref.Path) || filepath.ToSlash(filepath.Clean(ref.Path)) != ref.Path {
 		return nil, "", errors.New("Invalid project image reference")
 	}
-	root, err := os.OpenRoot(input.WorkspacePath)
+	file, err := openProviderReference(input, ref, limit)
 	if err != nil {
-		return nil, "", errors.New("Could not open the reference workspace")
-	}
-	defer root.Close()
-	file, err := root.Open(ref.Path)
-	if err != nil {
-		return nil, "", errors.New("Could not open the project image")
-	}
-	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > limit {
-		_ = file.Close()
-		return nil, "", errors.New("Project image exceeds the provider limit or is unreadable")
+		return nil, "", err
 	}
 	probe := make([]byte, 512)
 	n, err := file.Read(probe)

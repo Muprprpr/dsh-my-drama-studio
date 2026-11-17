@@ -67,14 +67,15 @@ func scanNode(row interface{ Scan(...any) error }) (Node, error) {
 }
 
 type queryResult struct {
-	ReferenceNodes  []Node          `json:"referenceNodes,omitempty"`
-	ResolvedMedia   map[string]Node `json:"resolvedMedia,omitempty"`
-	MentionedAssets map[string]Node `json:"mentionedAssets,omitempty"`
-	LockedNodeIDs   []string        `json:"lockedNodeIds,omitempty"`
-	Nodes           []Node          `json:"nodes"`
-	Edges           []Edge          `json:"edges"`
-	Status          Status          `json:"status"`
-	HasMore         bool            `json:"hasMore"`
+	ReferenceNodes  []Node            `json:"referenceNodes,omitempty"`
+	ResolvedMedia   map[string]Node   `json:"resolvedMedia,omitempty"`
+	InvalidMedia    map[string]string `json:"invalidMedia,omitempty"`
+	MentionedAssets map[string]Node   `json:"mentionedAssets,omitempty"`
+	LockedNodeIDs   []string          `json:"lockedNodeIds,omitempty"`
+	Nodes           []Node            `json:"nodes"`
+	Edges           []Edge            `json:"edges"`
+	Status          Status            `json:"status"`
+	HasMore         bool              `json:"hasMore"`
 }
 
 func (p *project) query(ctx context.Context, r Request) (queryResult, error) {
@@ -190,7 +191,7 @@ func (p *project) query(ctx context.Context, r Request) (queryResult, error) {
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return queryResult{}, err
 	}
-	if err := addReferenceProjection(ctx, tx, &result); err != nil {
+	if err := addReferenceProjection(ctx, tx, p.dir, &result); err != nil {
 		return queryResult{}, err
 	}
 	if err := p.projectMentionedAssets(ctx, tx, &result); err != nil {
@@ -200,12 +201,18 @@ func (p *project) query(ctx context.Context, r Request) (queryResult, error) {
 	return result, err
 }
 
-func addReferenceProjection(ctx context.Context, tx *sql.Tx, result *queryResult) error {
+func addReferenceProjection(ctx context.Context, tx *sql.Tx, workspace string, result *queryResult) error {
 	included := make(map[string]bool, len(result.Nodes))
+	videoTargets := make(map[string]bool)
+	videoSources := make(map[string]bool)
 	result.ResolvedMedia = make(map[string]Node)
+	result.InvalidMedia = make(map[string]string)
 	for i := range result.Nodes {
 		node := &result.Nodes[i]
 		included[node.ID] = true
+		if node.Type == "video" {
+			videoTargets[node.ID] = true
+		}
 		if node.Type == "image" {
 			var content map[string]json.RawMessage
 			if err := json.Unmarshal(node.Content, &content); err != nil {
@@ -226,11 +233,17 @@ func addReferenceProjection(ctx context.Context, tx *sql.Tx, result *queryResult
 		}
 	}
 	for _, edge := range result.Edges {
+		if videoTargets[edge.Target] {
+			videoSources[edge.Source] = true
+		}
 		if included[edge.Source] {
 			continue
 		}
 		source, err := scanNode(tx.QueryRowContext(ctx, "SELECT "+nodeColumns+" FROM nodes WHERE id=? AND deleted=0", edge.Source))
 		if errors.Is(err, sql.ErrNoRows) {
+			if videoTargets[edge.Target] {
+				result.InvalidMedia[edge.Source] = "来源卡片已删除，请重新连接可用的素材"
+			}
 			continue
 		}
 		if err != nil {
@@ -244,7 +257,18 @@ func addReferenceProjection(ctx context.Context, tx *sql.Tx, result *queryResult
 			if node.Deleted || !isVideoMedia(node.Type) {
 				continue
 			}
-			resolved, err := resolveMediaNode(ctx, tx, node)
+			var resolved Node
+			var err error
+			if videoSources[node.ID] {
+				resolved, _, err = resolveVideoEdgeMedia(ctx, tx, workspace, node)
+				var bad *requestError
+				if errors.As(err, &bad) {
+					result.InvalidMedia[node.ID] = bad.Error()
+					continue
+				}
+			} else {
+				resolved, err = resolveMediaNode(ctx, tx, node)
+			}
 			if err != nil {
 				return err
 			}
@@ -685,15 +709,16 @@ func validateVideo(ctx context.Context, tx *sql.Tx, id string, draft bool) error
 		return err
 	}
 	var data struct {
-		Prompt         string            `json:"prompt"`
-		PromptDoc      json.RawMessage   `json:"promptDoc"`
-		Mode           string            `json:"mode"`
-		ProfileID      json.RawMessage   `json:"profileId"`
-		Path           string            `json:"path"`
-		URL            string            `json:"url"`
-		TextList       []json.RawMessage `json:"textList"`
-		MixedListOrder []string          `json:"mixedListOrder"`
-		Params         json.RawMessage   `json:"params"`
+		Prompt          string            `json:"prompt"`
+		PromptDoc       json.RawMessage   `json:"promptDoc"`
+		PromptDocLinked bool              `json:"promptDocLinked"`
+		Mode            string            `json:"mode"`
+		ProfileID       json.RawMessage   `json:"profileId"`
+		Path            string            `json:"path"`
+		URL             string            `json:"url"`
+		TextList        []json.RawMessage `json:"textList"`
+		MixedListOrder  []string          `json:"mixedListOrder"`
+		Params          json.RawMessage   `json:"params"`
 	}
 	if err := json.Unmarshal([]byte(raw), &data); err != nil {
 		return invalid("视频提示词或媒体引用格式无效：%s", err)
@@ -733,7 +758,7 @@ func validateVideo(ctx context.Context, tx *sql.Tx, id string, draft bool) error
 		if len(media) != 0 || len(data.MixedListOrder) != 0 {
 			return invalid("视频素材节点不能接入生成参考")
 		}
-		if strings.TrimSpace(data.Prompt) != "" || len(data.PromptDoc) != 0 && string(data.PromptDoc) != "null" ||
+		if strings.TrimSpace(data.Prompt) != "" || len(data.PromptDoc) != 0 && string(data.PromptDoc) != "null" || data.PromptDocLinked ||
 			len(data.ProfileID) != 0 && string(data.ProfileID) != "null" && string(data.ProfileID) != `""` ||
 			len(data.Params) != 0 && string(data.Params) != "null" {
 			return invalid("视频素材节点不能保存生成提示词、模型或参数")
@@ -774,7 +799,7 @@ func validateVideo(ctx context.Context, tx *sql.Tx, id string, draft bool) error
 		}
 	}
 	if doc != nil {
-		plain, err := doc.render(false, func(assetMention) (string, error) { return "", nil })
+		plain, err := doc.render(false, func(assetMention, int) (string, error) { return " ", nil })
 		if err != nil {
 			return err
 		}
@@ -783,16 +808,14 @@ func validateVideo(ctx context.Context, tx *sql.Tx, id string, draft bool) error
 	return checkVideoPromptReferences(data.Prompt, counts, draft)
 }
 
-func validateVideoPromptReferences(prompt string, kinds []string) error {
-	counts := make(map[string]int)
-	for _, kind := range kinds {
-		counts[kind]++
-	}
-	return checkVideoPromptReferences(prompt, counts, false)
-}
-
 func checkVideoPromptReferences(prompt string, counts map[string]int, draft bool) error {
-	for _, ref := range mediaReference.FindAllStringSubmatch(prompt, -1) {
+	for _, span := range mediaReference.FindAllStringIndex(prompt, -1) {
+		token := prompt[span[0]:span[1]]
+		if token[0] == '@' && (span[0] > 0 && asciiIdentifier(prompt[span[0]-1]) ||
+			span[1] < len(prompt) && asciiIdentifier(prompt[span[1]])) {
+			continue
+		}
+		ref := mediaReference.FindStringSubmatch(token)
 		kind, number := ref[1], ref[2]
 		if kind == "" {
 			kind, number = ref[3], ref[4]
@@ -812,4 +835,8 @@ func checkVideoPromptReferences(prompt string, counts map[string]int, draft bool
 		}
 	}
 	return nil
+}
+
+func asciiIdentifier(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_'
 }

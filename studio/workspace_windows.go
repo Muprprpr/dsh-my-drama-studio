@@ -1,10 +1,26 @@
 package studio
 
 import (
+	"os"
+	"runtime"
 	"strings"
 
 	"golang.org/x/sys/windows"
 )
+
+var reopenFile = windows.NewLazySystemDLL("kernel32.dll").NewProc("ReOpenFile")
+
+// Keep the exact file opened below the workspace root. Deny write sharing
+// while hashing and reading it. Rename is safe because the handle stays open.
+func reopenMediaReadOnly(file *os.File) (*os.File, error) {
+	handle, _, err := reopenFile.Call(file.Fd(), windows.GENERIC_READ,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_DELETE, 0)
+	runtime.KeepAlive(file)
+	if handle == uintptr(windows.InvalidHandle) {
+		return nil, err
+	}
+	return os.NewFile(handle, file.Name()), nil
+}
 
 func canonicalWorkspace(directory string) (string, error) {
 	name, err := windows.UTF16PtrFromString(directory)

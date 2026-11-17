@@ -16,11 +16,14 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
 	replicateAPI        = "https://api.replicate.com/v1"
 	replicateImageLimit = 20 << 20
+	klingOmniModel      = "kwaivgi/kling-v3-omni-video"
+	klingOmniImageLimit = 10_000_000
 )
 
 var (
@@ -28,7 +31,6 @@ var (
 	replicateVersion    = regexp.MustCompile("^[0-9a-f]{64}$")
 	replicateIdentifier = regexp.MustCompile("^[A-Za-z0-9_-]+$")
 	replicateField      = regexp.MustCompile("^[A-Za-z][A-Za-z0-9_]*$")
-	klingImageToken     = regexp.MustCompile(`(?i)@(图片|image)[ \t]*([0-9]+)`)
 )
 
 type replicateProvider struct {
@@ -169,8 +171,19 @@ func replicateRequest(profile ProviderProfile, input GenerationInput) (string, r
 	}
 	prompt := input.Prompt
 	switch name {
-	case "kwaivgi/kling-v3-omni-video":
-		prompt = klingImageToken.ReplaceAllString(prompt, "<<<image_${2}>>>")
+	case klingOmniModel:
+		if mode == "r2v" {
+			var err error
+			prompt, err = videoRequestPrompt(input, func(mention GenerationPromptMention) string {
+				return fmt.Sprintf("<<<image_%d>>>", mention.Ordinal)
+			})
+			if err != nil {
+				return "", body, err
+			}
+		}
+		if utf8.RuneCountInString(prompt) > 2500 {
+			return "", body, errors.New("Kling 3.0 Omni 的提示词最多 2500 字符")
+		}
 		if len(input.References) > 7 || profile.Duration != 0 && (profile.Duration < 3 || profile.Duration > 15) {
 			return "", body, errors.New("Kling 3.0 Omni 接受至多 7 张参考图片，时长为 3–15 秒")
 		}
@@ -225,14 +238,32 @@ func (p *replicateProvider) Submit(ctx context.Context, input GenerationInput) (
 		return ProviderSubmission{Rejected: true}, err
 	}
 	if len(input.References) != 0 {
-		references := make([]string, 0, len(input.References))
-		for _, ref := range input.References {
-			assetURL, err := p.replicateMedia(ctx, input, ref)
+		references := make([]string, len(input.References))
+		type localImage struct {
+			index int
+			file  io.ReadCloser
+			mime  string
+		}
+		var locals []localImage
+		for index, ref := range input.References {
+			if ref.URL != "" {
+				references[index] = ref.URL
+				continue
+			}
+			file, mediaType, err := p.openReplicateImage(input, ref)
+			if err != nil {
+				return ProviderSubmission{Rejected: true}, fmt.Errorf("参考图 %d: %w", index+1, err)
+			}
+			defer file.Close()
+			locals = append(locals, localImage{index, file, mediaType})
+		}
+		for _, local := range locals {
+			assetURL, err := p.uploadReplicateImage(ctx, local.file, local.mime)
 			if err != nil {
 				// No prediction request was sent.
 				return ProviderSubmission{Rejected: true}, err
 			}
-			references = append(references, assetURL)
+			references[local.index] = assetURL
 		}
 		if p.profile.Mode == "i2v" || p.profile.Mode == "t2i" && p.profile.Limits.References["image"] == 1 {
 			body.Input[p.profile.InputField] = references[0]
@@ -361,22 +392,24 @@ func (p *replicateProvider) Download(ctx context.Context, result ProviderResult,
 	return err
 }
 
-func (p *replicateProvider) replicateMedia(ctx context.Context, input GenerationInput, ref GenerationReference) (string, error) {
-	if ref.URL != "" {
-		return ref.URL, nil
-	}
+func (p *replicateProvider) openReplicateImage(input GenerationInput, ref GenerationReference) (io.ReadCloser, string, error) {
 	limit := int64(replicateImageLimit)
-	if strings.SplitN(p.profile.Model, ":", 2)[0] == "kwaivgi/kling-v3-omni-video" {
-		limit = 10_000_000
+	isKling := strings.SplitN(p.profile.Model, ":", 2)[0] == klingOmniModel
+	if isKling {
+		limit = klingOmniImageLimit
 	}
 	file, mediaType, err := openImageReference(input, ref, limit)
 	if err != nil {
-		return "", err
+		return nil, "", err
 	}
-	defer file.Close()
-	if limit == 10_000_000 && mediaType != "image/png" && mediaType != "image/jpeg" {
-		return "", errors.New("Kling 3.0 Omni 图片需要 PNG 或 JPEG")
+	if isKling && mediaType != "image/png" && mediaType != "image/jpeg" {
+		_ = file.Close()
+		return nil, "", errors.New("Kling 3.0 Omni 图片需要 PNG 或 JPEG")
 	}
+	return file, mediaType, nil
+}
+
+func (p *replicateProvider) uploadReplicateImage(ctx context.Context, file io.Reader, mediaType string) (string, error) {
 	extension := map[string]string{
 		"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif", "image/bmp": ".bmp",
 	}[mediaType]
