@@ -138,7 +138,9 @@ function groupVersions(artifacts) {
 }
 
 function chosenVersion(choices, group) {
-  return Object.hasOwn(choices, group[0].artifactId) ? choices[group[0].artifactId] : group[0].version
+  const latest = group[0]
+  if (Object.hasOwn(choices, latest.artifactId)) return choices[latest.artifactId]
+  return latest.inputOutdated ? 0 : latest.version
 }
 
 function selectedRefs(groups, choices) {
@@ -423,7 +425,8 @@ export function WorkflowArtifacts({ session, workspaceTitle, useSessions, refres
       {feedback && <p className="drama-artifacts-error" role="alert">{feedback}</p>}
       {!stage && !loadError && <p className="drama-artifacts-empty" role="status">正在读取阶段产物…</p>}
       {panel === 'review' && <section className="drama-handoff" data-testid="drama-workflow-preview">
-        <Package packageData={review} stageLabel={stageLabel} sessionLabel={sessionLabel} ticket={ticket} openCanvas={openCanvas} />
+        <Package packageData={review} handoffHistory={view?.handoffs} stageLabel={stageLabel}
+          sessionLabel={sessionLabel} ticket={ticket} openCanvas={openCanvas} />
         <div className="drama-artifacts-actions">
           <Button type="button" size="sm" onClick={() => {
             setInteraction(ticket, { review: null, error: '', section: 'artifacts' })
@@ -445,12 +448,13 @@ export function WorkflowArtifacts({ session, workspaceTitle, useSessions, refres
               onClick={() => setInteraction(ticket, { handoffId: handoff.handoffId })}>
               <strong>{handoff.targetStageId ? '交接到 ' + stageLabel(handoff.targetStageId) : '成片验收包'}</strong>
               <small>{formatDate(handoff.confirmedAt)} · {sessionLabel(handoff.sourceSessionId)}
-                {handoff.stale && ' · 已过期'}</small>
+                {handoff.stale ? ' · 已过期' : handoff.handoffId !== handoffs[0].handoffId && ' · 已被取代'}</small>
             </button>
           </li>)}
         </ul>
         <section className="drama-handoff">
-          <Package packageData={selectedHandoff} stageLabel={stageLabel} sessionLabel={sessionLabel} ticket={ticket} openCanvas={openCanvas} />
+          <Package packageData={selectedHandoff} handoffHistory={view?.handoffs} stageLabel={stageLabel}
+            sessionLabel={sessionLabel} ticket={ticket} openCanvas={openCanvas} />
         </section>
       </> : <p className="drama-artifacts-empty">此阶段尚无正式交接记录。</p>)}
       {stage && panel === 'artifacts' && <>
@@ -476,7 +480,7 @@ export function WorkflowArtifacts({ session, workspaceTitle, useSessions, refres
             <div className="drama-artifact-preview-heading">
               <div>
                 <h3>{selected.title} <span>V{selected.version}</span></h3>
-                <small title={selected.sessionId}>{sessionLabel(selected.sessionId)} · {selected.handedOff ? '已正式交接' : '草稿'}</small>
+                <small title={selected.sessionId}>{sessionLabel(selected.sessionId)} · {artifactStatus(selected)}</small>
               </div>
               {current.version !== selected.version && <Button type="button" size="sm" aria-pressed={compare}
                 onClick={() => setCompare(value => !value)}>{compare ? '关闭比较' : '与最新版比较'}</Button>}
@@ -502,11 +506,19 @@ function formatDate(value) {
   return value ? new Date(value).toLocaleString() : ''
 }
 
+function artifactStatus(artifact) {
+  return [
+    artifact.handedOff ? '曾正式交接' : '草稿',
+    artifact.inputOutdated && '依据已更新',
+    artifact.reusedFrom && !artifact.handedOff && '跨版本复用待复核',
+  ].filter(Boolean).join(' · ')
+}
+
 function ArtifactRow({ artifact, active, select, sessionLabel }) {
   return <button type="button" aria-pressed={active} onClick={select}
     data-artifact-id={artifact.artifactId} data-version={artifact.version}>
     <strong>{artifact.title} <span>V{artifact.version}</span></strong>
-    <small title={artifact.sessionId}>{sessionLabel(artifact.sessionId)} · {artifact.handedOff ? '已交接' : '草稿'}</small>
+    <small title={artifact.sessionId}>{sessionLabel(artifact.sessionId)} · {artifactStatus(artifact)}</small>
   </button>
 }
 
@@ -525,9 +537,9 @@ function ArtifactContent({ artifact, ticket, openCanvas }) {
   </>
 }
 
-function Package({ packageData, stageLabel, sessionLabel, ticket, openCanvas }) {
+function Package({ packageData, handoffHistory = [], stageLabel, sessionLabel, ticket, openCanvas }) {
   const { sourceSessionId, sourceStageId, targetStageId, handoffId, sourceRevision, confirmedAt,
-    artifacts, summary, confirmedDecisions, constraints } = packageData
+    artifacts, summary, confirmedDecisions, constraints, reuseReviews } = packageData
   return <>
     <header className="drama-handoff-heading">
       <h3>{confirmedAt ? targetStageId ? '正式交接包' : '成片验收包' : targetStageId ? '交接预览' : '成片验收预览'}</h3>
@@ -557,6 +569,20 @@ function Package({ packageData, stageLabel, sessionLabel, ticket, openCanvas }) 
         })}
       </ul>
     </div>
+    {reuseReviews?.length > 0 && <div className="drama-handoff-block" data-testid="drama-workflow-reuse-review">
+      <h4>{confirmedAt ? '跨依据复用记录' : '交接前复核旧稿复用'}</h4>
+      {!confirmedAt && <p>确认前，请按当前正式输入核对复用版本的正文、决定和约束。</p>}
+      {reuseReviews.map(review => {
+        const artifact = artifacts?.find(item => item.artifactId === review.artifactId && item.version === review.version)
+        return <section key={artifactKey(review)}>
+          <p>{artifact?.title || review.artifactId} V{review.version}，复用自 V{review.reusedFrom.version}</p>
+          <dl className="drama-handoff-metadata">
+            <dt>原稿依据</dt><dd><HandoffBasis inputs={review.previousInputs} history={handoffHistory} stageLabel={stageLabel} /></dd>
+            <dt>当前依据</dt><dd><HandoffBasis inputs={review.currentInputs} history={handoffHistory} stageLabel={stageLabel} /></dd>
+          </dl>
+        </section>
+      })}
+    </div>}
     <PackageList title="确认的创作决策" items={confirmedDecisions} />
     <PackageList title="约束" items={constraints} />
     <details className="drama-artifact-versions">
@@ -568,6 +594,17 @@ function Package({ packageData, stageLabel, sessionLabel, ticket, openCanvas }) 
       </dl>
     </details>
   </>
+}
+
+function HandoffBasis({ inputs, history, stageLabel }) {
+  if (!inputs?.length) return '无正式上游'
+  return <ul>{inputs.map(input => {
+    const constraints = history.find(handoff => handoff.handoffId === input.handoffId)?.constraints
+    return <li key={input.handoffId} title={input.handoffId}>
+      {stageLabel(input.sourceStageId)} · 正式交接 V{input.sourceRevision}
+      {constraints?.length > 0 && <ul>{constraints.map((item, index) => <li key={index}>{item}</li>)}</ul>}
+    </li>
+  })}</ul>
 }
 
 function PackageList({ title, items }) {

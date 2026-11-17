@@ -1,6 +1,6 @@
 ---
 name: drama-shooting-script
-description: 把已确认的内容分析和创作约束组织成可拍摄的场景、对白和动作。
+description: 把剧本、故事或已确认的内容分析和创作约束组织成可拍摄的场景、对白和动作。
 whenToUse: Studio Workflow 激活拍摄脚本制作阶段时使用。
 user-invocable: true
 disable-model-invocation: true
@@ -14,7 +14,7 @@ disable-model-invocation: true
 
 ## 输入
 
-已确认的内容分析与用户补充的剧情、对白、时长及制作要求。
+有上游交接时使用正式内容分析和用户补充的制作要求。短剧生产从本阶段开始时使用用户提供的剧本、故事或创作要求。
 
 ## 工作步骤
 

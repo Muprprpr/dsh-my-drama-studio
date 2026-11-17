@@ -348,6 +348,25 @@ async function verify(ctx, signal) {
     for (const [index, id] of ids.entries()) await select(id, index === 1 ? replace : inHistory)
     const [{ ticket: a1 }, { ticket: a2 }, { ticket: b1 }] = await Promise.all(ids.map(init))
     for (const ticket of [a1, a2, b1]) await ok(await op(ticket, 'bind'), 'bind')
+    // Exercise the production Legacy graph before testing activation and snapshots in its later stages.
+    for (const project of [projectA, projectB]) {
+      const { sessionId } = await ctx.sessionController.create({ workspaceId: project.id })
+      await select(sessionId, inHistory)
+      const { ticket } = await init(sessionId)
+      for (const stageId of ['content-analysis', 'shooting-script', alpha]) {
+        await activate(ticket, stageId)
+        const drafted = await chat(sessionId, 'Save the prerequisite for ' + stageId, [{
+          call: { name: 'drama_save_artifact', args: {
+            operationId: randomUUID(), title: 'Fixture ' + stageId, content: 'Approved material for ' + stageId,
+          } },
+        }])
+        assert.equal((await ended(drafted)).data.reason.kind, 'completed')
+        await ready(ticket)
+        const preview = await ok(await op(ticket, 'workflow_handoff_preview', { stageId }), 'Preview prerequisite')
+        await ok(await op(ticket, 'workflow_handoff_confirm', { handoffId: preview.handoffId }), 'Confirm prerequisite')
+        await ready(ticket)
+      }
+    }
     const beforeActivation = await ctx.sessionController.resolveAgent(id2)
     const unmountComplete = beforeActivation.agent.ctx.systemPrompt.section({
       name: 'fixture-complete-prompt', order: 0, complete: true, text: 'Standalone preset rules',

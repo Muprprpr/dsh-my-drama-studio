@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -24,6 +25,7 @@ type workflowHandoff struct {
 	WorkflowDefinitionVersion int64                    `json:"workflowDefinitionVersion,omitempty"`
 	SourceRevision            int64                    `json:"sourceRevision,omitempty"`
 	PreviewBaseline           *workflowPreviewBaseline `json:"previewBaseline,omitempty"`
+	ReuseReviews              []workflowReuseReview    `json:"reuseReviews,omitempty"`
 	Artifacts                 []workflowArtifact       `json:"artifacts"`
 	Summary                   string                   `json:"summary"`
 	ConfirmedDecisions        []string                 `json:"confirmedDecisions"`
@@ -37,6 +39,19 @@ type workflowPreviewBaseline struct {
 	PriorHandoffID string           `json:"priorHandoffId,omitempty"`
 	InputKey       string           `json:"inputKey,omitempty"`
 	ArtifactHeads  map[string]int64 `json:"artifactHeads"`
+}
+
+type workflowReuseReview struct {
+	workflowArtifactRef
+	ReusedFrom     workflowArtifactRef  `json:"reusedFrom"`
+	PreviousInputs []workflowReuseInput `json:"previousInputs"`
+	CurrentInputs  []workflowReuseInput `json:"currentInputs"`
+}
+
+type workflowReuseInput struct {
+	HandoffID      string `json:"handoffId"`
+	SourceStageID  string `json:"sourceStageId"`
+	SourceRevision int64  `json:"sourceRevision"`
 }
 
 type workflowPreviewArgs struct {
@@ -224,13 +239,28 @@ func workflowInputKey(inputs []workflowHandoff) string {
 	return ids.String()
 }
 
+func workflowInputIDs(key string) ([]string, error) {
+	ids := []string{}
+	for key != "" {
+		length, tail, ok := strings.Cut(key, ":")
+		size, err := strconv.Atoi(length)
+		if !ok || err != nil || size <= 0 || size > len(tail) {
+			return nil, errors.New("invalid workflow input key")
+		}
+		ids = append(ids, tail[:size])
+		key = tail[size:]
+	}
+	return ids, nil
+}
+
 func (p *workflowProfile) requireWorkflowInputs(latest map[string]workflowHandoff, index int) error {
-	for _, stage := range p.Stages[:index] {
-		handoff, exists := latest[stage.ID]
+	for _, id := range p.Stages[index].Requires {
+		stage := p.Stages[p.stageIndex(id)]
+		handoff, exists := latest[id]
 		if handoff.Stale {
 			return &requestError{http.StatusConflict, fmt.Sprintf("上游阶段「%s」的正式交接已过期，请先更新", stage.Name)}
 		}
-		if !exists && slices.Contains(p.Stages[index].Requires, stage.ID) {
+		if !exists {
 			return &requestError{http.StatusConflict, fmt.Sprintf("请先确认上游阶段「%s」的正式交接", stage.Name)}
 		}
 	}
@@ -282,11 +312,13 @@ func (p *project) previewWorkflowHandoff(ctx context.Context, r Request, args wo
 		if err := profile.requireWorkflowInputs(latest, index); err != nil {
 			return nil, err
 		}
-		artifacts, err := selectWorkflowArtifacts(ctx, tx, r.SessionID, session.ActiveStageID, args.Artifacts)
+		inputs := profile.inputs(latest, index)
+		inputKey := workflowInputKey(inputs)
+		artifacts, err := selectWorkflowArtifacts(ctx, tx, r.SessionID, session.ActiveStageID, inputKey, args.Artifacts)
 		if err != nil {
 			return nil, err
 		}
-		inputKey := workflowInputKey(profile.inputs(latest, index))
+		selected := artifacts
 		baseline := workflowPreviewBaseline{
 			PriorHandoffID: latest[session.ActiveStageID].HandoffID,
 			InputKey:       inputKey,
@@ -331,12 +363,16 @@ func (p *project) previewWorkflowHandoff(ctx context.Context, r Request, args wo
 		if previous, ok := latest[session.ActiveStageID]; ok && !previous.Stale && sameWorkflowArtifacts(previous.Artifacts, artifacts) {
 			return nil, &requestError{http.StatusConflict, "这些版本已正式交接，请选择更新的产物"}
 		}
+		reuse, err := readWorkflowReuseReviews(ctx, tx, selected, inputs)
+		if err != nil {
+			return nil, err
+		}
 		handoff := workflowHandoff{
 			workflowFileVersions: session.workflowFileVersions,
 			HandoffID:            uuid.NewString(), SourceStageID: session.ActiveStageID, TargetStageID: profile.nextStage(index),
 			WorkspaceID: status.WorkspaceID, SourceSessionID: r.SessionID,
 			WorkflowProfileID: profile.ID, WorkflowDefinitionVersion: profile.Version, PreviewBaseline: &baseline,
-			Artifacts: artifacts, CreatedAt: workflowNow(), ConfirmedDecisions: []string{}, Constraints: []string{},
+			Artifacts: artifacts, ReuseReviews: reuse, CreatedAt: workflowNow(), ConfirmedDecisions: []string{}, Constraints: []string{},
 		}
 		fillWorkflowHandoffSummary(&handoff)
 		body, err := json.Marshal(handoff)
@@ -350,9 +386,9 @@ func (p *project) previewWorkflowHandoff(ctx context.Context, r Request, args wo
 	})
 }
 
-func selectWorkflowArtifacts(ctx context.Context, tx *sql.Tx, sessionID, stageID string, refs []workflowArtifactRef) ([]workflowArtifact, error) {
+func selectWorkflowArtifacts(ctx context.Context, tx *sql.Tx, sessionID, stageID, inputKey string, refs []workflowArtifactRef) ([]workflowArtifact, error) {
 	if refs == nil {
-		return readOwnWorkflowArtifacts(ctx, tx, sessionID, stageID, true)
+		return readCurrentWorkflowDrafts(ctx, tx, sessionID, stageID, inputKey)
 	}
 	out := make([]workflowArtifact, 0, len(refs))
 	seen := make(map[string]bool, len(refs))
@@ -372,6 +408,44 @@ func selectWorkflowArtifacts(ctx context.Context, tx *sql.Tx, sessionID, stageID
 		out = append(out, item)
 	}
 	return out, nil
+}
+
+func readWorkflowReuseReviews(ctx context.Context, tx *sql.Tx, artifacts []workflowArtifact, inputs []workflowHandoff) ([]workflowReuseReview, error) {
+	current := make([]workflowReuseInput, 0, len(inputs))
+	for _, input := range inputs {
+		current = append(current, workflowReuseInput{
+			HandoffID: input.HandoffID, SourceStageID: input.SourceStageID, SourceRevision: input.SourceRevision,
+		})
+	}
+	var reviews []workflowReuseReview
+	for _, artifact := range artifacts {
+		from := artifact.ReusedFrom
+		if from == nil {
+			continue
+		}
+		var oldKey string
+		if err := tx.QueryRowContext(ctx, `SELECT input_key FROM workflow_artifacts WHERE id=? AND version=?`,
+			from.ArtifactID, from.Version).Scan(&oldKey); err != nil {
+			return nil, err
+		}
+		ids, err := workflowInputIDs(oldKey)
+		if err != nil {
+			return nil, err
+		}
+		review := workflowReuseReview{workflowArtifactRef: artifact.workflowArtifactRef, ReusedFrom: *from,
+			PreviousInputs: make([]workflowReuseInput, 0, len(ids)), CurrentInputs: current}
+		for _, id := range ids {
+			input := workflowReuseInput{HandoffID: id}
+			if err := tx.QueryRowContext(ctx, `SELECT stage_id,revision
+				FROM workflow_handoffs WHERE id=? AND revision IS NOT NULL`, id).
+				Scan(&input.SourceStageID, &input.SourceRevision); err != nil {
+				return nil, err
+			}
+			review.PreviousInputs = append(review.PreviousInputs, input)
+		}
+		reviews = append(reviews, review)
+	}
+	return reviews, nil
 }
 
 func sameWorkflowArtifacts(left, right []workflowArtifact) bool {
@@ -573,6 +647,9 @@ func (p *project) confirmWorkflowHandoff(ctx context.Context, r Request, args wo
 				downstream.ID); err != nil {
 				return nil, err
 			}
+		}
+		if _, err := expireWorkflowKickoffs(ctx, tx, ""); err != nil {
+			return nil, err
 		}
 		if _, err := addEvent(ctx, tx, "workflow", []string{handoff.SourceStageID}); err != nil {
 			return nil, err

@@ -78,7 +78,7 @@ async function verify(ctx, signal) {
   const { renderSkillContent } = await import(pathToFileURL(lib.resolve('@deepseek-ai/dsh-skill')).href)
   const { LlmAdapter } = await import(pathToFileURL(lib.resolve('@deepseek-ai/dsh-llm')).href)
   const requests = []
-  let pendingRead
+  let pendingRead, pendingDraft
   ctx.llm.registerAdapter([provider], new class extends LlmAdapter {
     async listModels() {
       return [{ provider, id: model, name: model }]
@@ -87,11 +87,13 @@ async function verify(ctx, signal) {
     async * stream(options) {
       if (!options.purpose || options.purpose === 'agent') {
         requests.push(options.messages)
-        if (pendingRead) {
-          const file_path = pendingRead
+        if (pendingRead || pendingDraft) {
+          const name = pendingRead ? 'read' : 'drama_save_artifact'
+          const args = pendingRead ? { file_path: pendingRead } : pendingDraft
           pendingRead = undefined
-          assert.ok(options.tools?.some(tool => tool.name === 'read'))
-          const block = { type: 'tool-call', id: randomUUID(), name: 'read', arguments: JSON.stringify({ file_path }) }
+          pendingDraft = undefined
+          assert.ok(options.tools?.some(tool => tool.name === name))
+          const block = { type: 'tool-call', id: randomUUID(), name, arguments: JSON.stringify(args) }
           yield { type: 'block-start', index: 0, blockType: 'tool-call' }
           yield { type: 'block-end', index: 0, block }
           yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } }
@@ -160,6 +162,7 @@ async function verify(ctx, signal) {
 
   async function chat(file) {
     pendingRead = file
+    const usesTool = Boolean(file || pendingDraft)
     const previous = agent.session.snapshotEvents().at(-1)?.seq ?? -1
     const index = requests.length
     const accepted = await sessions.prompt({
@@ -169,8 +172,20 @@ async function verify(ctx, signal) {
     const end = await until(() => agent.session.snapshotEvents().find(event =>
       event.seq > previous && event.type === 'turn/end'), signal, 'native chat turn')
     assert.equal(end.data.reason.kind, 'completed', JSON.stringify(end))
-    assert.equal(requests.length, index + (file ? 2 : 1))
+    assert.equal(requests.length, index + (usesTool ? 2 : 1))
     return JSON.stringify(requests.at(-1))
+  }
+
+  async function prepareStoryboard() {
+    for (const stageId of ['content-analysis', 'shooting-script']) {
+      await ok(await activate(stageId), 'activate prerequisite')
+      pendingDraft = { operationId: randomUUID(), title: 'Fixture ' + stageId, content: 'Approved material for ' + stageId }
+      await chat()
+      await until(async () => !(await read()).session.transitionPending, signal, 'settled prerequisite')
+      const preview = await ok(await op('workflow_handoff_preview', { operationId: randomUUID(), stageId }), 'preview prerequisite')
+      await ok(await op('workflow_handoff_confirm', { operationId: randomUUID(), handoffId: preview.handoffId }), 'confirm prerequisite')
+      await until(async () => !(await read()).session.transitionPending, signal, 'settled prerequisite handoff')
+    }
   }
 
   async function readSkillResources(definition) {
@@ -254,6 +269,7 @@ async function verify(ctx, signal) {
   if (scenario === 'user-owned') {
     assert.equal(stageFiles(view).skillAsset.status, 'user-owned')
     assert.match(official.content, /USER_OWNED_RULES/u)
+    await prepareStoryboard()
     await ok(await activate(storyboard), 'activate user-owned stage Skill')
     assert.match(await chat(), /USER_OWNED_RULES/u)
     await assert.rejects(access(join(home, skillPath(imported))), { code: 'ENOENT' })
@@ -282,6 +298,7 @@ async function verify(ctx, signal) {
     const catalog = await ok(await library('list'), 'packed Skill Library')
     assert.deepEqual(catalog.skills.filter(skill => skill.builtIn && skill.bindable).map(skill => skill.id).sort(),
       managedStages.map(id => 'drama-' + id).sort())
+    await prepareStoryboard()
     await ok(await activate(storyboard), 'activate packed stage Skill')
     const turn = await chat(paths[0])
     assert.match(turn, /\[Drama Studio Workflow Stage\]/u)
@@ -343,6 +360,7 @@ async function verify(ctx, signal) {
   log('PASS native Skill resourceBase resolved and read references, templates and script contents')
   await put(join(home, skillPath(ordinary)), skillText(ordinary, 'ORDINARY_RULES'))
   await verifyLibrary(signal, home, library, native, readSkillResources)
+  await prepareStoryboard()
   await ok(await activate(storyboard), 'activate with bundled defaults')
   const frozen = (await read()).session
   assert.ok(frozen.snapshotId)

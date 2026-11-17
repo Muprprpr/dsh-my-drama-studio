@@ -68,7 +68,7 @@ func TestWorkflowHandoffPreviewScope(t *testing.T) {
 	if peerPreview.PreviewBaseline.InputKey != workflowInputKey([]workflowHandoff{first}) {
 		t.Fatalf("preview lost the upstream formal handoff reference: %+v", peerPreview)
 	}
-	if item := f.call("b", "workflow", "workflow_artifact_get", document.workflowArtifactRef).(workflowArtifact); item.Content != document.Content {
+	if item := f.call("b", "human", "workflow_artifact_get", document.workflowArtifactRef).(workflowArtifact); item.Content != document.Content {
 		t.Fatalf("next stage read the wrong handoff document: %+v", item)
 	}
 	f.activate("a", topic)
@@ -150,7 +150,7 @@ func TestWorkflowHandoffChecksDefinitionActivationAndPermission(t *testing.T) {
 
 func TestWorkflowHandoffConcurrentReplayDoesNotDispatchTwice(t *testing.T) {
 	f := newWorkflowTest(t, nil)
-	const stage = "storyboard"
+	const stage = "content-analysis"
 	f.activate("a", stage)
 	turn := f.start("a", stage, "")
 	f.draft("a", turn.Session.RunID, "选定分镜", workflowArtifact{})

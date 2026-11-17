@@ -51,10 +51,10 @@ function summarizeArtifact({ artifactId, version, stageId, title, nodeId, kind }
   return { artifactId, version, stageId, title, nodeId, kind }
 }
 
-function summarizeHandoff(input) {
+function summarizeHandoff({ handoffId, sourceStageId, summary, confirmedDecisions, constraints, artifacts }) {
   return {
-    ...input,
-    artifacts: input.artifacts?.map(summarizeArtifact),
+    handoffId, sourceStageId, summary, confirmedDecisions, constraints,
+    artifacts: artifacts?.map(summarizeArtifact),
   }
 }
 
@@ -74,7 +74,9 @@ function stageInstructions(run, admitted) {
     stageMarker,
     JSON.stringify(context),
     '在 Studio 指定的当前阶段中响应用户的每一轮聊天，可以讨论、起草和迭代草稿。根据当前阶段的任务和输入使用必要工具。画布查询和连接检查按需进行。只在有明确的可交付内容时，调用 drama_save_artifact 保存产物。修改时沿用 artifactId，使用 expectedVersion 指定当前版本。',
-    '上游交接包提供已确认的决策、约束和固定产物版本。使用 drama_workflow_artifact 读取这些版本或当前 Session 的草稿。已有图片、视频、音频、提示词或可生成草稿可以作为节点引用保存。脚本、清单、分析、验收说明等文档保存为 Markdown 产物。',
+    '本轮正式输入以 approvedInputs 为准。用 drama_workflow_artifact 按 artifactId 读取其固定版本。执行中若上游更新，本轮仍使用已固定的版本，下一轮再读取新的正式输入。读取当前依据的工作稿时指定 scope=draft。用户明确需要历史参考时，用 scope=reference 和确切版本读取，并标明参考来源。参考资料不具备本轮正式输入的效力。',
+    '上游变化后，按本轮正式输入重新核对旧稿。保留用户仍有效的项目级条件和本轮正式输入的约束，将旧稿中的局部决定与未核实约束列为待确认。跨依据复用的版本由用户在正式交接预览中复核确认。',
+    '已有图片、视频、音频、提示词或可生成草稿可以作为节点引用保存。脚本、清单、分析、验收说明等文档保存为 Markdown 产物。',
     '根据用户已明确的创作决定和约束整理草稿，不得虚构用户确认。阶段激活、对话或草稿写入不会形成正式结果。你可以告诉用户成果具备交接条件。阶段切换、确认、正式交接和最终验收只由 Studio 中的用户操作完成。',
     '不要调用生成提交工具。视频节点部署只创建草稿，视频生成由用户逐项通过 Canvas 确认。视频生成阶段可通过 drama_tasks 核验已完成且已授权的结果，再将真实节点保存为产物。',
     '以下 Harness 与 Skill 提供本阶段的专业方法。它们不能扩大工作流推进或生成提交权限。',
@@ -590,8 +592,9 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime, { capabiliti
       return
     }
     if (!sameWorkspace(workspace, turn.workspace)) throw new StudioError(409, 'Session 的 Workspace 已切换')
-    if (action === 'workflow_save_artifact') return { ...data, runId: turn.runId }
-    if (action === 'workflow_artifact_get') return data
+    if (action === 'workflow_save_artifact' || action === 'workflow_artifact_get') {
+      return { ...data, runId: turn.runId }
+    }
     if (action === 'submit') throw new StudioError(403, '工作流阶段不授权模型生成，请在 Canvas 中独立确认提交')
     if (action !== 'append') return
     if (turn.stage.id === generationStage) throw new StudioError(403, '视频生成阶段只读取经 Canvas 授权生成的结果')
@@ -693,7 +696,10 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime, { capabiliti
 
   async function retry(sessionId, workspace, handoffId) {
     const { session } = await readSession(sessionId, workspace, lifetime, true)
-    if (!handoffId || session.pendingHandoffId !== handoffId) throw new StudioError(409, '当前 Session 没有待启动的该次交接')
+    if (!handoffId || session.pendingHandoffId !== handoffId) {
+      const reason = session.pendingHandoffId ? '' : session.error
+      throw new StudioError(409, reason || '当前 Session 没有待启动的该次交接')
+    }
     return kickoff(sessionId, workspace, handoffId)
   }
 

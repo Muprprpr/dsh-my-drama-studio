@@ -253,6 +253,13 @@ func (s *Service) executeWorkflow(ctx context.Context, r Request) (any, error) {
 		}
 		return p.saveWorkflowArtifact(ctx, r, args)
 	case "workflow_artifact_get":
+		if r.Actor == "workflow" {
+			var args workflowArtifactReadArgs
+			if err := decodeData(r.Data, &args); err != nil {
+				return nil, err
+			}
+			return p.getWorkflowRunArtifact(ctx, r.SessionID, args)
+		}
 		var ref workflowArtifactRef
 		if err := decodeData(r.Data, &ref); err != nil {
 			return nil, err
@@ -429,12 +436,17 @@ func readWorkflowView(ctx context.Context, tx *sql.Tx, workspace, sessionID stri
 	if index := profile.stageIndex(session.ActiveStageID); index >= 0 {
 		view.Inputs = profile.inputs(latest, index)
 	}
-	drafts, err := readOwnWorkflowArtifacts(ctx, tx, sessionID, "", false)
+	drafts, err := readOwnWorkflowArtifacts(ctx, tx, sessionID)
 	if err != nil {
 		return view, err
 	}
 	artifacts := make(map[workflowArtifactRef]int, len(drafts))
+	inputKeys := make(map[string]string, len(view.Stages))
+	for index, stage := range view.Stages {
+		inputKeys[stage.ID] = workflowInputKey(profile.inputs(latest, index))
+	}
 	for _, artifact := range drafts {
+		artifact.InputOutdated = artifact.inputKey != inputKeys[artifact.StageID]
 		artifacts[artifact.workflowArtifactRef] = len(view.Artifacts)
 		view.Artifacts = append(view.Artifacts, artifact)
 	}

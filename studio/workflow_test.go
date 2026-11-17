@@ -145,10 +145,23 @@ func (f *workflowTest) reopen(providers providerRegistry) {
 	f.s = New(providers)
 }
 
+func (f *workflowTest) seedLegacyBefore(target string) {
+	f.t.Helper()
+	const session = "prerequisite-fixture"
+	stages := legacyWorkflowProfile.Stages[:legacyWorkflowProfile.stageIndex(target)]
+	f.activate(session, stages[0].ID)
+	for _, stage := range stages {
+		turn := f.start(session, stage.ID, f.view(session).Session.PendingHandoffID)
+		f.draft(session, turn.Session.RunID, stage.Name+" 前置夹具", workflowArtifact{})
+		f.finish(session, turn.Session.RunID, "")
+		f.confirm(session, f.preview(session))
+	}
+}
+
 func TestWorkflowSessionDraftsAndExplicitHandoff(t *testing.T) {
 	f := newWorkflowTest(t, nil)
-	const stage = "storyboard"
-	const target = "asset-binding"
+	const stage = "content-analysis"
+	const target = "shooting-script"
 	idx := workflowStageIndex(stage)
 	if v := f.view("normal"); v.Session.Status != "normal" || !v.ProfileSelectionRequired || len(v.Stages) != 0 {
 		t.Fatalf("initial workflow: %+v", v)
@@ -173,7 +186,9 @@ func TestWorkflowSessionDraftsAndExplicitHandoff(t *testing.T) {
 	b1 := f.draft("b", turnB.Session.RunID, "B 的不共享草稿", workflowArtifact{})
 	f.check("a", "workflow", "workflow_save_artifact", workflowSaveArtifactArgs{
 		operation: workflowOp(), RunID: turnB.Session.RunID, Title: "越权", Content: "无效"}, http.StatusForbidden)
-	f.check("b", "workflow", "workflow_artifact_get", a1.workflowArtifactRef, http.StatusNotFound)
+	f.check("b", "workflow", "workflow_artifact_get", map[string]any{
+		"artifactId": a1.ArtifactID, "version": a1.Version, "runId": turnB.Session.RunID, "scope": "reference",
+	}, http.StatusNotFound)
 	f.finish("a", turnA.Session.RunID, "")
 	f.finish("b", turnB.Session.RunID, "")
 	{
@@ -282,9 +297,12 @@ func TestWorkflowSessionDraftsAndExplicitHandoff(t *testing.T) {
 func TestWorkflowWorkspaceIsolationAndAbandonedTurnRecovery(t *testing.T) {
 	f := newWorkflowTest(t, nil)
 	other := newWorkflowTest(t, nil)
-	f.activate("one", "storyboard")
-	other.activate("one", "content-analysis")
-	turn := f.start("one", "storyboard", "")
+	f.activate("one", "content-analysis")
+	other.call("one", "human", "workflow_profile_select", workflowProfileArgs{
+		operation: workflowOp(), WorkflowProfileID: "short-drama",
+	})
+	other.activate("one", "shooting-script")
+	turn := f.start("one", "content-analysis", "")
 	f.draft("one", turn.Session.RunID, "工作区 A", workflowArtifact{})
 	peer := New(nil)
 	defer peer.Close()
@@ -292,21 +310,22 @@ func TestWorkflowWorkspaceIsolationAndAbandonedTurnRecovery(t *testing.T) {
 	if err != nil || value.(workflowSessionResult).Session.Status != workflowRunning {
 		t.Fatalf("second kernel marked the live native turn abandoned: %v %v", value, err)
 	}
-	if v := other.view("one"); v.Session.ActiveStageID != "content-analysis" || len(v.Artifacts) != 0 {
+	if v := other.view("one"); v.Session.ActiveStageID != "shooting-script" || len(v.Artifacts) != 0 {
 		t.Fatalf("cross-workspace state leak: %+v", v)
 	}
 	f.reopen(nil)
-	if v := f.view("one"); v.Session.Status != workflowFailed || v.Session.ActiveStageID != "storyboard" ||
+	if v := f.view("one"); v.Session.Status != workflowFailed || v.Session.ActiveStageID != "content-analysis" ||
 		len(v.Artifacts) != 1 || len(v.Handoffs) != 0 {
 		t.Fatalf("interrupted native run changed active stage, drafts or formal progress: %+v", v)
 	}
-	resumed := f.start("one", "storyboard", "")
-	f.check("one", "human", "workflow_activate", f.activation("one", "content-analysis", "V1"), http.StatusConflict)
+	resumed := f.start("one", "content-analysis", "")
+	f.check("one", "human", "workflow_activate", f.activation("one", "shooting-script", "V1"), http.StatusConflict)
 	f.check("one", "human", "workflow_activate", f.activation("one", "", ""), http.StatusConflict)
 	if peerSession := f.activate("peer", "content-analysis").Session; peerSession.ActiveStageID != "content-analysis" {
 		t.Fatalf("running Session blocked a peer's activation: %+v", peerSession)
 	}
 	f.finish("one", resumed.Session.RunID, "Old turn failed")
+	f.activate("one", "")
 	f.activate("one", "content-analysis")
 	if v := f.view("one"); v.Session.Status != "active" || v.Session.ActiveStageID != "content-analysis" || len(v.Artifacts) != 1 {
 		t.Fatalf("old attempt overwrote the new activation: %+v", v)
@@ -318,7 +337,7 @@ func TestWorkflowWorkspaceIsolationAndAbandonedTurnRecovery(t *testing.T) {
 
 func TestWorkflowFrozenSnapshotAndExactTransition(t *testing.T) {
 	f := newWorkflowTest(t, nil)
-	const stage = "storyboard"
+	const stage = "content-analysis"
 	v1 := f.activate("a", stage)
 	if v1.Snapshot != nil || v1.Session.SnapshotID == "" || v1.Session.Activation != 1 ||
 		v1.Session.ActivatedAt == "" || !v1.Session.TransitionPending {
@@ -408,6 +427,7 @@ func TestWorkflowFrozenSnapshotAndExactTransition(t *testing.T) {
 
 func TestWorkflowConcurrentStageSwitchAndTurnAdmission(t *testing.T) {
 	f := newWorkflowTest(t, nil)
+	f.seedLegacyBefore("asset-binding")
 	initial := f.activate("session", "storyboard").Session
 	admission := f.admission("session", "storyboard", "")
 	switchStage := f.activation("session", "asset-binding", "V1")
@@ -451,10 +471,10 @@ func TestWorkflowActivationRollsBackStagedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bad := f.activation("session", "storyboard", "V1")
+	bad := f.activation("session", "content-analysis", "V1")
 	bad.Snapshot.SkillPath = "skills/../other.md"
 	f.check("session", "human", "workflow_activate", bad, http.StatusBadRequest)
-	bad = f.activation("session", "storyboard", "V1")
+	bad = f.activation("session", "content-analysis", "V1")
 	bad.Snapshot.SkillBody += " altered"
 	f.check("session", "human", "workflow_activate", bad, http.StatusBadRequest)
 
@@ -463,7 +483,7 @@ func TestWorkflowActivationRollsBackStagedSnapshot(t *testing.T) {
 		WHEN NEW.type='workflow' BEGIN SELECT RAISE(ABORT, 'interrupted activation fixture'); END`); err != nil {
 		t.Fatal(err)
 	}
-	activation := f.activation("session", "storyboard", "V1")
+	activation := f.activation("session", "content-analysis", "V1")
 	if _, err := editCall(f.s, f.dir, "session", "human", "workflow_activate", activation); err == nil ||
 		!strings.Contains(err.Error(), "interrupted activation fixture") {
 		t.Fatalf("expected a failed activation transaction: %v", err)
@@ -527,7 +547,7 @@ func TestWorkflowActivationMigrationRetainsLegacyMetadata(t *testing.T) {
 	if exit.Session.Activation != 4 || !exit.Session.TransitionPending {
 		t.Fatalf("legacy exit did not start a new protected generation: %+v", exit.Session)
 	}
-	active := f.activate("legacy", "storyboard")
+	active := f.activate("legacy", "content-analysis")
 	if active.Session.Activation != 5 || active.Session.SnapshotID == "" || active.Session.LegacyActivation {
 		t.Fatalf("legacy Session could not explicitly adopt a new snapshot: %+v", active.Session)
 	}
@@ -537,8 +557,8 @@ func TestWorkflowConcurrentConfirmation(t *testing.T) {
 	f := newWorkflowTest(t, nil)
 	previews := make(map[string]workflowHandoff)
 	for _, session := range []string{"a", "b"} {
-		f.activate(session, "storyboard")
-		run := f.start(session, "storyboard", "")
+		f.activate(session, "content-analysis")
+		run := f.start(session, "content-analysis", "")
 		f.draft(session, run.Session.RunID, session, workflowArtifact{})
 		f.finish(session, run.Session.RunID, "")
 		previews[session] = f.preview(session)
@@ -611,6 +631,7 @@ func TestWorkflowLegacyApprovalMigration(t *testing.T) {
 func TestWorkflowVideoUsesAuthorizedExactResults(t *testing.T) {
 	ctx := context.Background()
 	f := newWorkflowTest(t, providerFixture{})
+	f.seedLegacyBefore(workflowDeployment)
 	bindSession(t, f.s, f.dir, "active")
 	bindSession(t, f.s, f.dir, "human")
 	p, err := f.s.open(ctx, f.dir, false)
@@ -691,7 +712,8 @@ func TestWorkflowVideoUsesAuthorizedExactResults(t *testing.T) {
 		t.Fatalf("formal generated video not shared: %+v", item)
 	}
 	final := f.start("active", "final-review", generated.HandoffID)
-	if len(final.Inputs) != 2 || final.Inputs[1].Artifacts[0].NodeID != manual.ResultNodeID {
+	if len(final.Inputs) != workflowStageIndex("final-review") ||
+		final.Inputs[len(final.Inputs)-1].Artifacts[0].NodeID != manual.ResultNodeID {
 		t.Fatalf("final review lost verified output: %+v", final.Inputs)
 	}
 	f.draft("active", final.Session.RunID, "接受成片", workflowArtifact{})

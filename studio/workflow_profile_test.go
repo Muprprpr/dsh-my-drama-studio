@@ -78,6 +78,7 @@ func TestWorkflowProfilesStartAtTheirOwnFirstStageAndKeepExplicitHandoffs(t *tes
 func TestWorkflowProfileMigrationKeepsOriginalSnapshotHash(t *testing.T) {
 	ctx := context.Background()
 	f := newWorkflowTest(t, nil)
+	f.seedLegacyBefore("storyboard")
 	activation := f.activation("legacy", "storyboard", "V1")
 	activation.Snapshot.SkillID = "custom-storyboard"
 	activation.Snapshot.SkillPath = "skills/custom-storyboard/SKILL.md"

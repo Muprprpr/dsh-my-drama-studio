@@ -638,6 +638,36 @@ async function sendNative(page, text) {
   await page.getByRole('button', { name: 'Send message', exact: true }).click()
 }
 
+async function seedLegacyPrerequisites(page, record, home, target) {
+  await openWorkflow(page, record)
+  const ticket = await ticketFor(page, record.sessionId)
+  const get = () => operate(page, ticket, 'workflow_get', {})
+  const op = (action, data) => operate(page, ticket, action, { operationId: randomUUID(), ...data })
+  const queue = (...steps) => nativeActivity(home, record, 'workflow-queue', undefined, steps)
+  const stages = fixedWorkflowIds.slice(0, fixedWorkflowIds.indexOf(target))
+  for (const stageId of stages) {
+    await op('workflow_activate', { stageId })
+    const title = 'Fixture prerequisite ' + stageId
+    await queue(...workflowCalls(workflowArtifact(title, 'Approved material for ' + stageId)))
+    await sendNative(page, 'Save ' + title)
+    const artifact = await poll(async () => {
+      const view = await get()
+      return view.session.status === 'active' && view.artifacts.find(item => item.stageId === stageId && item.title === title)
+    }, 'Save official prerequisite ' + stageId)
+    const preview = await op('workflow_handoff_preview', {
+      stageId, artifacts: [{ artifactId: artifact.artifactId, version: artifact.version }],
+    })
+    await queue({})
+    await op('workflow_handoff_confirm', { handoffId: preview.handoffId })
+    await poll(async () => {
+      const { session } = await get()
+      return session.status === 'active' && !session.transitionPending && !session.pendingHandoffId
+    }, 'Settle prerequisite handoff ' + stageId)
+  }
+  await op('workflow_activate', { stageId: '' })
+  return stages.length
+}
+
 async function installTestStages(home) {
   for (const [index, id] of fixedWorkflowIds.entries()) {
     await installWorkflowFiles(home, id, 'STUDIO-HARNESS-' + id + '\n仅处理当前阶段。文档使用 drama_save_artifact 保存。',
@@ -957,7 +987,7 @@ test('Short Video handoff preserves review and starts with pinned artifacts', { 
 
 test('Workflow dock iterates, previews, and explicitly hands off in the native composer', { timeout: 100_000 }, async () => {
   await withWeb(async ({ page, records, home }) => {
-    const [a] = records
+    const [a, , seed] = records
     const pane = await openWorkflow(page, a)
     const ticket = await ticketFor(page, a.sessionId)
     const get = () => operate(page, ticket, 'workflow_get', {})
@@ -982,6 +1012,8 @@ test('Workflow dock iterates, previews, and explicitly hands off in the native c
     await poll(async () => (await get()).stages.slice(2, 4).every(stage => stage.files.skillReady && stage.files.harnessReady),
       'Native Skill catalog did not discover global files', 20_000)
 
+    const prerequisiteCount = await seedLegacyPrerequisites(page, seed, home, 'storyboard')
+    await openWorkflow(page, a)
     const turnsBefore = (await nativeActivity(home, a, 'workflow-transcript')).filter(event => event.type === 'turn/end').length
     await pane.getByRole('button', { name: '分镜制作', exact: true }).click()
     await poll(async () => (await get()).session.activeStageId === 'storyboard', 'Storyboard was not activated')
@@ -1006,12 +1038,13 @@ test('Workflow dock iterates, previews, and explicitly hands off in the native c
       await sendNative(page, message)
       const view = await poll(async () => {
         const current = await get()
-        return current.session.status === 'active' && current.artifacts.some(item => item.version === index + 1) && current
+        return current.session.status === 'active' &&
+          current.artifacts.some(item => item.stageId === 'storyboard' && item.version === index + 1) && current
       }, 'Did not save and settle version ' + (index + 1))
-      artifactId = view.artifacts.find(item => item.version === index + 1).artifactId
+      artifactId = view.artifacts.find(item => item.stageId === 'storyboard' && item.version === index + 1).artifactId
       assert.equal(view.session.activeStageId, 'storyboard')
       assert.equal(view.stages[2].status, 'draft_available')
-      assert.equal(view.handoffs.length, 0)
+      assert.equal(view.handoffs.length, prerequisiteCount)
       const native = await nativeActivity(home, a, 'workflow-model-input')
       const prompt = native.messages.filter(message => message.role === 'system').map(message => message.text).join('\n')
       assert.match(prompt, workflowMarker)
@@ -1036,7 +1069,7 @@ test('Workflow dock iterates, previews, and explicitly hands off in the native c
     await pane.getByTestId('drama-workflow-action').click()
     const preview = sidebar.getByTestId('drama-workflow-preview')
     await preview.getByText('保留车票和倒影的焦点转换', { exact: true }).waitFor()
-    assert.equal((await get()).handoffs.length, 0)
+    assert.equal((await get()).handoffs.length, prerequisiteCount)
     await screenshot(page, '04-workflow-handoff-preview.png')
     await queue(...workflowCalls(workflowArtifact('素材指引', '已收到《末班车》分镜交接。优先准备旧车票和店面玻璃。')))
     await sidebar.getByTestId('drama-workflow-confirm').click()
@@ -1047,7 +1080,7 @@ test('Workflow dock iterates, previews, and explicitly hands off in the native c
     }, 'Confirmed handoff did not start the target stage')
     assert.equal(ready.stages[2].status, 'handed_off')
     assert.equal(ready.stages[3].status, 'draft_available')
-    assert.equal(ready.handoffs.length, 1)
+    assert.equal(ready.handoffs.length, prerequisiteCount + 1)
     const [handoff] = ready.handoffs
     assert.equal(handoff.sourceSessionId, a.sessionId)
     assert.equal(handoff.targetStageId, 'asset-binding')
@@ -1079,7 +1112,7 @@ test('Workflow dock iterates, previews, and explicitly hands off in the native c
       'Ordinary native turn was not sent after exit')
     const after = await nativeActivity(home, a, 'workflow-model-input')
     assert.doesNotMatch(after.messages.filter(item => item.role === 'system').map(item => item.text).join('\n'), workflowMarker)
-    assert.equal((await get()).handoffs.length, 1)
+    assert.equal((await get()).handoffs.length, prerequisiteCount + 1)
     assert.equal((await operate(page, ticket, 'tasks', {})).tasks.length, 0)
   }, { workflowFixture: true })
 })
@@ -1091,6 +1124,7 @@ test('Workflow dock isolates Sessions and rejects conflicting Workspace handoffs
     const localShadow = join(home, other.workspaceName, '.dsh', 'skills', 'drama-content-analysis')
     await mkdir(localShadow, { recursive: true })
     await writeFile(join(localShadow, 'SKILL.md'), '---\nname: drama-content-analysis\ndescription: Shadow fixture\n---\nWORKSPACE-SHADOW-MUST-NOT-LOAD')
+    const prerequisiteCount = await seedLegacyPrerequisites(page, c, home, 'shooting-script')
     await openWorkflow(page, a)
     const tickets = new Map(await Promise.all(records.map(async record => [record, await ticketFor(page, record.sessionId)])))
     const read = record => operate(page, tickets.get(record), 'workflow_get', {})
@@ -1127,8 +1161,8 @@ test('Workflow dock isolates Sessions and rejects conflicting Workspace handoffs
       assert.equal(blocked.body.error, waitMessage)
     }
     assert.equal((await read(a)).session.activeStageId, 'shooting-script')
-    await write(c, 'workflow_activate', { stageId: 'storyboard' })
-    assert.equal((await read(c)).session.activeStageId, 'storyboard')
+    await write(c, 'workflow_activate', { stageId: 'shooting-script' })
+    assert.equal((await read(c)).session.activeStageId, 'shooting-script')
     await write(c, 'workflow_activate', { stageId: '' })
     for (const record of [a, b]) {
       await poll(() => nativeActivity(home, record, 'workflow-held'), 'The native turn did not reach the scripted hold')
@@ -1141,7 +1175,7 @@ test('Workflow dock isolates Sessions and rejects conflicting Workspace handoffs
     assert.deepEqual(drafts.map(item => item.title), ['Session A script', 'Session B script', 'Other workspace analysis'])
     await poll(async () => await switchStage.isEnabled() && await exitStage.isEnabled(),
       'Did not enable stage changes when the native turn settled')
-    assert.deepEqual((await read(c)).artifacts, [])
+    assert.ok((await read(c)).artifacts.every(artifact => artifact.handedOff && artifact.stageId === 'content-analysis'))
     assert.equal((await read(other)).stages[1].status, 'not_started')
     const modelInput = await nativeActivity(home, other, 'workflow-model-input')
     assert.match(JSON.stringify(modelInput.messages), /STUDIO-SKILL-content-analysis/u)
@@ -1160,7 +1194,7 @@ test('Workflow dock isolates Sessions and rejects conflicting Workspace handoffs
     const official = await read(c)
     assert.equal(official.session.status, 'normal')
     assert.equal(official.stages[1].status, 'handed_off')
-    assert.equal(official.handoffs.length, 1)
+    assert.equal(official.handoffs.length, prerequisiteCount + 1)
     assert.equal(official.handoffs[0].sourceSessionId, winner.sessionId)
     assert.equal((await read(loser)).session.activeStageId, 'shooting-script')
     assert.equal((await read(other)).handoffs.length, 0)
@@ -1169,8 +1203,12 @@ test('Workflow dock isolates Sessions and rejects conflicting Workspace handoffs
       assert.equal(result.status, 400, action)
     }
     await poll(async () => (await read(a)).session.status === 'active', 'The stage did not return to active')
-    await write(a, 'workflow_activate', { stageId: 'asset-binding' })
-    assert.equal((await read(a)).session.activeStageId, 'asset-binding')
+    const missingStoryboard = await request(page, 'operation', {
+      ticket: tickets.get(a), action: 'workflow_activate',
+      data: { operationId: randomUUID(), stageId: 'asset-binding' },
+    })
+    assert.equal(missingStoryboard.status, 409)
+    assert.match(missingStoryboard.body.error, /分镜制作/u)
   }, { workflowFixture: true })
 })
 
@@ -1178,7 +1216,7 @@ test('Workflow dock exercises DeepSeek on successive native Agent turns and hand
   timeout: 240_000, skip: process.env.DRAMA_REAL_WORKFLOW !== '1',
 }, async () => {
   await withWeb(async ({ page, records, home }) => {
-    const [a] = records
+    const [a, , seed] = records
     const title = 'Late bus storyboard'
     const stage = 'storyboard'
     await installWorkflowFiles(home, stage,
@@ -1186,6 +1224,7 @@ test('Workflow dock exercises DeepSeek on successive native Agent turns and hand
       'REAL-SKILL-STORYBOARD. Use drama_save_artifact to deliver Markdown draft versions; never advance workflow.')
     await installWorkflowFiles(home, 'asset-binding', 'REAL-HARNESS-ASSETS. On the initial task, make one asset brief.',
       'REAL-SKILL-ASSETS. Read the confirmed storyboard using drama_workflow_artifact and the artifactId and version from approvedInputs. Then call drama_save_artifact with a unique operationId, title "Late bus assets", and content copying the exact storyboard marker returned by the tool. Stop after saving.')
+    const prerequisiteCount = await seedLegacyPrerequisites(page, seed, home, stage)
     const pane = await openWorkflow(page, a)
     const ticket = await ticketFor(page, a.sessionId)
     const get = () => operate(page, ticket, 'workflow_get', {})
@@ -1203,7 +1242,7 @@ test('Workflow dock exercises DeepSeek on successive native Agent turns and hand
       }, 'DeepSeek did not finish draft version ' + (index + 1), 55_000)
       artifactId = artifact.artifactId
     }
-    assert.equal((await get()).handoffs.length, 0)
+    assert.equal((await get()).handoffs.length, prerequisiteCount)
     await pane.getByTestId('drama-workflow-action').click()
     const sidebar = page.getByTestId('drama-workflow-artifacts')
     await sidebar.getByTestId('drama-workflow-confirm').click()
@@ -1261,9 +1300,10 @@ test('Workflow dock exercises DeepSeek on successive native Agent turns and hand
 
 test('Workflow dock separates Canvas video authorization from final film approval', { timeout: 160_000, skip: !hasVideo }, async () => {
   await withWeb(async ({ page, records, home }) => {
-    const [record] = records
+    const [record, , seed] = records
     await configureVideoFixture(page)
     await installTestStages(home)
+    const prerequisiteCount = await seedLegacyPrerequisites(page, seed, home, 'video-deployment')
     const pane = await openWorkflow(page, record)
     await open(page, record)
     const ticket = await ticketFor(page, record.sessionId)
@@ -1340,7 +1380,7 @@ test('Workflow dock separates Canvas video authorization from final film approva
       const view = await get()
       return view.stages[6].status === 'handed_off' && view
     }, 'The final handoff was not recorded')
-    assert.equal(closed.handoffs.length, 3)
+    assert.equal(closed.handoffs.length, prerequisiteCount + 3)
     const final = closed.handoffs.find(item => item.sourceStageId === 'final-review')
     assert.ok(!final.targetStageId)
     assert.ok(final.artifacts.some(item => item.nodeId === task.resultNodeId))

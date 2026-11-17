@@ -34,9 +34,10 @@ export function registerTools(ctx, workspaceFor, kernel, keys, workflow) {
       expectedVersion: { type: 'integer', minimum: 1 }, summary: string,
       confirmedDecisions: { type: 'array', items: string }, constraints: { type: 'array', items: string },
     }, ['operationId', 'title']), 'drama_save_artifact'],
-    ['workflow_artifact_get', 'Read an exact version of an available stage artifact using the artifactId supplied in the stage instructions or by the save tool.', object({
+    ['workflow_artifact_get', 'Read a stage artifact. Default scope input resolves the version approved for this run by artifactId. Use scope draft for a current working draft. Use scope reference with an exact version for explicitly requested historical material.', object({
       artifactId: string, version: { type: 'integer', minimum: 1 },
-    }, ['artifactId', 'version']), 'drama_workflow_artifact'],
+      scope: { type: 'string', enum: ['input', 'draft', 'reference'] },
+    }, ['artifactId']), 'drama_workflow_artifact'],
   ]) {
     ctx.tools.register({
       name,

@@ -17,6 +17,13 @@ type workflowArtifactRef struct {
 	Version    int64  `json:"version"`
 }
 
+type workflowArtifactReadArgs struct {
+	ArtifactID string          `json:"artifactId"`
+	Version    json.RawMessage `json:"version,omitempty"`
+	RunID      string          `json:"runId"`
+	Scope      string          `json:"scope,omitempty"`
+}
+
 type workflowArtifactNotes struct {
 	Summary            string   `json:"summary,omitempty"`
 	ConfirmedDecisions []string `json:"confirmedDecisions,omitempty"`
@@ -27,16 +34,21 @@ type workflowArtifact struct {
 	workflowArtifactRef
 	workflowArtifactNotes
 	workflowFileVersions
-	StageID   string `json:"stageId"`
-	SessionID string `json:"sessionId"`
-	Title     string `json:"title"`
-	Kind      string `json:"kind"`
-	Content   string `json:"content,omitempty"`
-	NodeID    string `json:"nodeId,omitempty"`
-	Node      *Node  `json:"node,omitempty"`
-	CreatedAt string `json:"createdAt"`
-	HandedOff bool   `json:"handedOff,omitempty"`
-	inputKey  string
+	StageID       string               `json:"stageId"`
+	SessionID     string               `json:"sessionId"`
+	Title         string               `json:"title"`
+	Kind          string               `json:"kind"`
+	Content       string               `json:"content,omitempty"`
+	NodeID        string               `json:"nodeId,omitempty"`
+	Node          *Node                `json:"node,omitempty"`
+	CreatedAt     string               `json:"createdAt"`
+	HandedOff     bool                 `json:"handedOff,omitempty"`
+	ReadScope     string               `json:"scope,omitempty"`
+	HandoffID     string               `json:"handoffId,omitempty"`
+	HandoffStatus string               `json:"handoffStatus,omitempty"`
+	ReusedFrom    *workflowArtifactRef `json:"reusedFrom,omitempty"`
+	InputOutdated bool                 `json:"inputOutdated,omitempty"`
+	inputKey      string
 }
 
 type workflowSaveArtifactArgs struct {
@@ -64,6 +76,27 @@ func (a workflowArtifactNotes) valid() bool {
 	return true
 }
 
+func (p *project) activeWorkflowTurn(ctx context.Context, tx *sql.Tx, sessionID, runID string) (workflowTurn, error) {
+	turn, err := readWorkflowTurn(ctx, tx, runID)
+	if errors.Is(err, sql.ErrNoRows) || err == nil && (turn.sessionID != sessionID || turn.status != workflowRunning) {
+		return turn, workflowForbidden
+	}
+	if err != nil {
+		return turn, err
+	}
+	if !p.ownsWorkflowTurn(turn.id) {
+		return turn, workflowChanged
+	}
+	session, err := readWorkflowSession(ctx, tx, sessionID)
+	if err != nil {
+		return turn, err
+	}
+	if turn.activation != session.Activation || turn.snapshotID == "" || turn.snapshotID != session.SnapshotID {
+		return turn, workflowChanged
+	}
+	return turn, nil
+}
+
 func (p *project) saveWorkflowArtifact(ctx context.Context, r Request, args workflowSaveArtifactArgs) (any, error) {
 	title, content := strings.TrimSpace(args.Title), strings.TrimSpace(args.Content)
 	if args.RunID == "" || title == "" || utf8.RuneCountInString(title) > 160 ||
@@ -72,22 +105,9 @@ func (p *project) saveWorkflowArtifact(ctx context.Context, r Request, args work
 		return nil, invalid("阶段产物需要标题、非空文档或单个 Canvas 引用，以及有效的版本和摘要")
 	}
 	return p.write(ctx, r, args.operation.ID, func(tx *sql.Tx, status Status) (any, error) {
-		turn, err := readWorkflowTurn(ctx, tx, args.RunID)
-		if errors.Is(err, sql.ErrNoRows) || err == nil && (turn.sessionID != r.SessionID || turn.status != workflowRunning) {
-			return nil, workflowForbidden
-		}
+		turn, err := p.activeWorkflowTurn(ctx, tx, r.SessionID, args.RunID)
 		if err != nil {
 			return nil, err
-		}
-		if !p.ownsWorkflowTurn(turn.id) {
-			return nil, workflowChanged
-		}
-		session, err := readWorkflowSession(ctx, tx, r.SessionID)
-		if err != nil {
-			return nil, err
-		}
-		if turn.activation != session.Activation || turn.snapshotID == "" || turn.snapshotID != session.SnapshotID {
-			return nil, workflowChanged
 		}
 		artifact := workflowArtifact{workflowArtifactNotes: args.workflowArtifactNotes, workflowFileVersions: turn.workflowFileVersions,
 			StageID: turn.stageID, SessionID: r.SessionID, Title: title, Kind: "document", Content: content,
@@ -117,11 +137,16 @@ func (p *project) saveWorkflowArtifact(ctx context.Context, r Request, args work
 			if args.ExpectedVersion != 0 && args.ExpectedVersion != prior.Version {
 				return nil, workflowChanged
 			}
-			if artifact.ConfirmedDecisions == nil {
-				artifact.ConfirmedDecisions = prior.ConfirmedDecisions
-			}
-			if artifact.Constraints == nil {
-				artifact.Constraints = prior.Constraints
+			if prior.inputKey == turn.inputKey {
+				artifact.ReusedFrom = prior.ReusedFrom
+				if artifact.ConfirmedDecisions == nil {
+					artifact.ConfirmedDecisions = prior.ConfirmedDecisions
+				}
+				if artifact.Constraints == nil {
+					artifact.Constraints = prior.Constraints
+				}
+			} else {
+				artifact.ReusedFrom = &prior.workflowArtifactRef
 			}
 			artifact.ArtifactID, artifact.Version = args.ArtifactID, prior.Version+1
 		} else {
@@ -184,12 +209,20 @@ func scanWorkflowArtifact(row interface{ Scan(...any) error }) (workflowArtifact
 	return artifact, json.Unmarshal([]byte(body), &artifact)
 }
 
-func readOwnWorkflowArtifacts(ctx context.Context, tx *sql.Tx, sessionID, stageID string, latestOnly bool) ([]workflowArtifact, error) {
-	query := `SELECT record,input_key FROM workflow_artifacts AS a WHERE session_id=? AND (?='' OR stage_id=?)`
-	if latestOnly {
-		query += ` AND version=(SELECT MAX(version) FROM workflow_artifacts WHERE id=a.id)`
-	}
-	rows, err := tx.QueryContext(ctx, query+" ORDER BY rowid DESC", sessionID, stageID, stageID)
+func readOwnWorkflowArtifacts(ctx context.Context, tx *sql.Tx, sessionID string) ([]workflowArtifact, error) {
+	return readWorkflowArtifactRows(ctx, tx, `SELECT record,input_key FROM workflow_artifacts
+		WHERE session_id=? ORDER BY rowid DESC`, sessionID)
+}
+
+func readCurrentWorkflowDrafts(ctx context.Context, tx *sql.Tx, sessionID, stageID, inputKey string) ([]workflowArtifact, error) {
+	return readWorkflowArtifactRows(ctx, tx, `SELECT record,input_key FROM workflow_artifacts AS a
+		WHERE session_id=? AND stage_id=? AND input_key=?
+		AND version=(SELECT MAX(version) FROM workflow_artifacts WHERE id=a.id)
+		ORDER BY rowid DESC`, sessionID, stageID, inputKey)
+}
+
+func readWorkflowArtifactRows(ctx context.Context, tx *sql.Tx, query string, args ...any) ([]workflowArtifact, error) {
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -214,28 +247,126 @@ func (p *project) getWorkflowArtifact(ctx context.Context, sessionID string, ref
 		return workflowArtifact{}, err
 	}
 	defer tx.Rollback()
-	var record string
-	var pinned bool
-	err = tx.QueryRowContext(ctx, `SELECT a.value,h.revision IS NOT NULL FROM workflow_handoffs h, json_each(h.record,'$.artifacts') AS a
-		WHERE (h.revision IS NOT NULL OR h.session_id=?) AND json_extract(a.value,'$.artifactId')=? AND json_extract(a.value,'$.version')=?
-		ORDER BY h.revision DESC LIMIT 1`, sessionID, ref.ArtifactID, ref.Version).Scan(&record, &pinned)
-	if err == nil {
-		var item workflowArtifact
-		if err := json.Unmarshal([]byte(record), &item); err != nil {
-			return item, err
-		}
-		item.HandedOff = pinned
-		return item, nil
+	return readWorkflowArtifactReference(ctx, tx, sessionID, ref)
+}
+
+func (p *project) getWorkflowRunArtifact(ctx context.Context, sessionID string, args workflowArtifactReadArgs) (workflowArtifact, error) {
+	ref := workflowArtifactRef{ArtifactID: args.ArtifactID}
+	if ref.ArtifactID == "" {
+		return workflowArtifact{}, invalid("需要产物 ID")
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
+	if len(args.Version) != 0 {
+		if err := json.Unmarshal(args.Version, &ref.Version); err != nil || ref.Version < 1 {
+			return workflowArtifact{}, invalid("产物版本必须为正整数")
+		}
+	}
+	if args.Scope == "" {
+		args.Scope = "input"
+	}
+	if args.Scope == "reference" && ref.Version == 0 {
+		return workflowArtifact{}, invalid("读取历史参考需要明确的产物版本")
+	}
+	tx, err := p.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
 		return workflowArtifact{}, err
 	}
-	item, err := scanWorkflowArtifact(tx.QueryRowContext(ctx, `SELECT record,input_key FROM workflow_artifacts
+	defer tx.Rollback()
+	turn, err := p.activeWorkflowTurn(ctx, tx, sessionID, args.RunID)
+	if err != nil {
+		return workflowArtifact{}, err
+	}
+	var item workflowArtifact
+	switch args.Scope {
+	case "input":
+		ids, err := workflowInputIDs(turn.inputKey)
+		if err != nil {
+			return item, err
+		}
+		item, err = readWorkflowHandoffArtifact(ctx, tx, sessionID, ref, ids)
+		if errors.Is(err, sql.ErrNoRows) {
+			return item, &requestError{http.StatusNotFound, "指定产物或版本不属于本轮正式输入"}
+		}
+		if err != nil {
+			return item, err
+		}
+	case "draft":
+		item, err = scanWorkflowArtifact(tx.QueryRowContext(ctx, `SELECT record,input_key FROM workflow_artifacts
+			WHERE id=? AND session_id=? AND stage_id=? AND input_key=?
+			AND version=CASE WHEN ?=0 THEN (SELECT MAX(version) FROM workflow_artifacts WHERE id=?) ELSE ? END`,
+			ref.ArtifactID, sessionID, turn.stageID, turn.inputKey, ref.Version, ref.ArtifactID, ref.Version))
+		if errors.Is(err, sql.ErrNoRows) {
+			return item, &requestError{http.StatusNotFound, "指定产物或版本不属于本轮输入下的当前阶段草稿"}
+		}
+		if err != nil {
+			return item, err
+		}
+		history, err := readWorkflowHandoffArtifact(ctx, tx, sessionID, item.workflowArtifactRef, nil)
+		switch {
+		case err == nil:
+			item.HandedOff, item.HandoffID, item.HandoffStatus = history.HandedOff, history.HandoffID, history.HandoffStatus
+		case errors.Is(err, sql.ErrNoRows):
+			item.HandoffStatus = "draft"
+		default:
+			return item, err
+		}
+	case "reference":
+		item, err = readWorkflowArtifactReference(ctx, tx, sessionID, ref)
+	default:
+		return item, invalid("产物读取范围必须为 input、draft 或 reference")
+	}
+	item.ReadScope = args.Scope
+	return item, err
+}
+
+func readWorkflowArtifactReference(ctx context.Context, tx *sql.Tx, sessionID string, ref workflowArtifactRef) (workflowArtifact, error) {
+	item, err := readWorkflowHandoffArtifact(ctx, tx, sessionID, ref, nil)
+	if !errors.Is(err, sql.ErrNoRows) {
+		return item, err
+	}
+	item, err = scanWorkflowArtifact(tx.QueryRowContext(ctx, `SELECT record,input_key FROM workflow_artifacts
 		WHERE session_id=? AND id=? AND version=?`, sessionID, ref.ArtifactID, ref.Version))
 	if errors.Is(err, sql.ErrNoRows) {
 		return item, &requestError{http.StatusNotFound, "当前 Session 无权查看该草稿或版本不存在"}
 	}
+	if err == nil {
+		item.HandoffStatus = "draft"
+	}
 	return item, err
+}
+
+// A nil list allows historical reads. A non-nil list limits the lookup to the
+// exact handoffs captured by the running turn, including an empty input set.
+func readWorkflowHandoffArtifact(ctx context.Context, tx *sql.Tx, sessionID string, ref workflowArtifactRef, inputIDs []string) (workflowArtifact, error) {
+	var item workflowArtifact
+	var handoffID, status, record string
+	var handedOff bool
+	query := `SELECT a.value,h.id,h.revision IS NOT NULL,
+		CASE WHEN h.revision IS NULL THEN 'preview' WHEN h.stale THEN 'stale'
+		WHEN EXISTS(SELECT 1 FROM workflow_handoffs newer WHERE newer.stage_id=h.stage_id AND newer.revision>h.revision)
+		THEN 'superseded' ELSE 'current' END
+		FROM workflow_handoffs h,json_each(h.record,'$.artifacts') AS a
+		WHERE json_extract(a.value,'$.artifactId')=? AND (?=0 OR json_extract(a.value,'$.version')=?)`
+	values := []any{ref.ArtifactID, ref.Version, ref.Version}
+	if inputIDs == nil {
+		query += ` AND (h.revision IS NOT NULL OR h.session_id=?)`
+		values = append(values, sessionID)
+	} else {
+		idsJSON, err := json.Marshal(inputIDs)
+		if err != nil {
+			return item, err
+		}
+		query += ` AND h.revision IS NOT NULL AND h.id IN (SELECT value FROM json_each(?))`
+		values = append(values, string(idsJSON))
+	}
+	err := tx.QueryRowContext(ctx, query+` ORDER BY h.revision DESC,h.rowid DESC LIMIT 1`, values...).Scan(&record, &handoffID, &handedOff, &status)
+	if err != nil {
+		return item, err
+	}
+	if err := json.Unmarshal([]byte(record), &item); err != nil {
+		return item, err
+	}
+	item.HandedOff, item.HandoffID, item.HandoffStatus = handedOff, handoffID, status
+	return item, nil
 }
 
 func workflowMediaRefs(artifacts []workflowArtifact) []workflowRef {

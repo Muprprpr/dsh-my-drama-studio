@@ -115,10 +115,8 @@ func (p *project) startWorkflowTurn(ctx context.Context, r Request, args workflo
 		if err != nil {
 			return nil, err
 		}
-		if len(profile.Stages[stageIndex].Requires) != 0 {
-			if err := profile.requireWorkflowInputs(latest, stageIndex); err != nil {
-				return nil, err
-			}
+		if err := profile.requireWorkflowInputs(latest, stageIndex); err != nil {
+			return nil, err
 		}
 		inputs := profile.inputs(latest, stageIndex)
 		if args.HandoffID != "" {
@@ -128,7 +126,8 @@ func (p *project) startWorkflowTurn(ctx context.Context, r Request, args workflo
 			}
 		}
 		out := workflowTurnResult{Inputs: inputs}
-		out.Artifacts, err = readOwnWorkflowArtifacts(ctx, tx, r.SessionID, args.StageID, true)
+		inputKey := workflowInputKey(inputs)
+		out.Artifacts, err = readCurrentWorkflowDrafts(ctx, tx, r.SessionID, args.StageID, inputKey)
 		if err != nil {
 			return nil, err
 		}
@@ -143,7 +142,7 @@ func (p *project) startWorkflowTurn(ctx context.Context, r Request, args workflo
 		locked = true
 		if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_turns(id,session_id,stage_id,activation,status,input_key,skill_sha,harness_sha,started_at,snapshot_id)
 			VALUES(?,?,?,?,'running',?,?,?,?,?)`, args.RunID, r.SessionID, args.StageID, session.Activation,
-			workflowInputKey(inputs), session.SkillSHA256, session.HarnessSHA256, workflowNow(), session.SnapshotID); err != nil {
+			inputKey, session.SkillSHA256, session.HarnessSHA256, workflowNow(), session.SnapshotID); err != nil {
 			return nil, err
 		}
 		if args.HandoffID != "" {
@@ -290,6 +289,37 @@ func (p *project) releaseWorkflowTurns() {
 	}
 }
 
+const workflowKickoffSuperseded = "待启动的交接已被更新的正式交接取代，无法重试。可在当前阶段按最新输入继续。"
+
+const invalidWorkflowKickoff = `pending_handoff<>'' AND (?='' OR session_id=?) AND NOT EXISTS (
+	SELECT 1 FROM workflow_handoffs h WHERE h.id=workflow_sessions.pending_handoff
+		AND h.revision IS NOT NULL AND h.stale=0
+		AND json_extract(h.record,'$.targetStageId')=workflow_sessions.stage_id
+		AND h.revision=(SELECT MAX(revision) FROM workflow_handoffs WHERE stage_id=h.stage_id)
+)`
+
+func expireWorkflowKickoffs(ctx context.Context, tx *sql.Tx, sessionID string) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `UPDATE workflow_sessions SET pending_handoff='',error=? WHERE `+
+		invalidWorkflowKickoff+` RETURNING session_id`, workflowKickoffSuperseded, sessionID, sessionID)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	var expired []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return false, err
+		}
+		expired = append(expired, id)
+	}
+	if err := rows.Err(); err != nil || len(expired) == 0 {
+		return false, err
+	}
+	_, err = addEvent(ctx, tx, "workflow", expired)
+	return err == nil, err
+}
+
 func (p *project) recoverWorkflow(ctx context.Context, sessionID string) error {
 	const running = `SELECT id FROM workflow_turns WHERE status='running' AND (?='' OR session_id=?)`
 	rows, err := p.db.QueryContext(ctx, running, sessionID, sessionID)
@@ -309,8 +339,15 @@ func (p *project) recoverWorkflow(ctx context.Context, sessionID string) error {
 	}
 	err = rows.Err()
 	rows.Close()
-	if err != nil || len(candidates) == 0 {
+	if err != nil {
 		return err
+	}
+	if len(candidates) == 0 {
+		var expired bool
+		if err := p.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM workflow_sessions WHERE `+
+			invalidWorkflowKickoff+`)`, sessionID, sessionID).Scan(&expired); err != nil || !expired {
+			return err
+		}
 	}
 
 	tx, err := p.db.BeginTx(ctx, nil)
@@ -340,7 +377,11 @@ func (p *project) recoverWorkflow(ctx context.Context, sessionID string) error {
 		}
 		recovered = true
 	}
-	if recovered {
+	expired, err := expireWorkflowKickoffs(ctx, tx, sessionID)
+	if err != nil {
+		return err
+	}
+	if recovered || expired {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
