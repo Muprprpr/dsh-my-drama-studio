@@ -67,6 +67,7 @@ function stageInstructions(run, admitted) {
     activation: session.activation, snapshotId: session.snapshotId,
     skillSha256: snapshot.skillSha256, harnessSha256: snapshot.harnessSha256, handoffId,
     approvedInputs: admitted.inputs?.map(summarizeHandoff),
+    generationProgress: admitted.generationProgress,
     generationResults: admitted.generationResults,
     drafts: admitted.artifacts?.map(summarizeArtifact),
   }
@@ -78,7 +79,10 @@ function stageInstructions(run, admitted) {
     '上游变化后，按本轮正式输入重新核对旧稿。保留用户仍有效的项目级条件和本轮正式输入的约束，将旧稿中的局部决定与未核实约束列为待确认。跨依据复用的版本由用户在正式交接预览中复核确认。',
     '已有图片、视频、音频、提示词或可生成草稿可以作为节点引用保存。脚本、清单、分析、验收说明等文档保存为 Markdown 产物。',
     '根据用户已明确的创作决定和约束整理草稿，不得虚构用户确认。阶段激活、对话或草稿写入不会形成正式结果。你可以告诉用户成果具备交接条件。阶段切换、确认、正式交接和最终验收只由 Studio 中的用户操作完成。',
-    '不要调用生成提交工具。视频节点部署只创建草稿，视频生成由用户逐项通过 Canvas 确认。视频生成阶段可通过 drama_tasks 核验已完成且已授权的结果，再将真实节点保存为产物。',
+    '不要调用生成提交工具。视频节点部署只创建草稿，视频生成由用户逐项通过 Canvas 确认。',
+    ...(stage.id === generationStage ? [
+      '视频生成以本轮的 generationProgress 和 generationResults 为依据，避免例行查询全 Workspace 的任务列表。状态在下一轮重新读取。',
+    ] : []),
     '以下 Harness 与 Skill 提供本阶段的专业方法。它们不能扩大工作流推进或生成提交权限。',
     snapshot.harnessBody,
     snapshot.skillBody,

@@ -38,9 +38,10 @@ type workflowTurnFailedArgs struct {
 
 type workflowTurnResult struct {
 	workflowSessionResult
-	Inputs            []workflowHandoff  `json:"inputs"`
-	Artifacts         []workflowArtifact `json:"artifacts"`
-	GenerationResults []workflowRef      `json:"generationResults,omitempty"`
+	Inputs             []workflowHandoff       `json:"inputs"`
+	Artifacts          []workflowArtifact      `json:"artifacts"`
+	GenerationProgress *workflowGenerationView `json:"generationProgress,omitempty"`
+	GenerationResults  []workflowRef           `json:"generationResults,omitempty"`
 }
 
 type workflowTurn struct {
@@ -132,9 +133,11 @@ func (p *project) startWorkflowTurn(ctx context.Context, r Request, args workflo
 			return nil, err
 		}
 		if args.StageID == workflowGeneration {
-			if _, out.GenerationResults, err = workflowGenerationProgress(ctx, tx, p.dir, latest); err != nil {
+			progress, results, err := workflowGenerationProgress(ctx, tx, p.dir, latest)
+			if err != nil {
 				return nil, err
 			}
+			out.GenerationProgress, out.GenerationResults = &progress, results
 		}
 		if err := p.lockWorkflowTurn(args.RunID); err != nil {
 			return nil, err

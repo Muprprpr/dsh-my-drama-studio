@@ -1300,9 +1300,8 @@ test('Workflow dock exercises DeepSeek on successive native Agent turns and hand
 
 test('Workflow dock separates Canvas video authorization from final film approval', { timeout: 160_000, skip: !hasVideo }, async () => {
   await withWeb(async ({ page, records, home }) => {
-    const [record, , seed] = records
+    const [record, peer, seed] = records
     await configureVideoFixture(page)
-    await installTestStages(home)
     const prerequisiteCount = await seedLegacyPrerequisites(page, seed, home, 'video-deployment')
     const pane = await openWorkflow(page, record)
     await open(page, record)
@@ -1312,11 +1311,40 @@ test('Workflow dock separates Canvas video authorization from final film approva
     const action = pane.getByTestId('drama-workflow-action')
     const confirm = page.getByTestId('drama-workflow-confirm')
     const draftId = randomUUID()
+    const unrelatedNodeId = randomUUID()
+    const unrelatedTaskId = randomUUID()
+    const readNativeInput = () => nativeActivity(home, record, 'workflow-model-input')
+    function generationContext(input) {
+      const text = input?.messages.find(message => message.role === 'system' && workflowMarker.test(message.text))?.text
+      if (!text) return
+      const context = JSON.parse(text.split(/\r?\n/u).find(line => line.startsWith('{"workflowId":')))
+      if (context.stageId !== 'video-generation') return
+      assert.doesNotMatch(text, /drama_tasks/u, 'Stage instruction requested the shared workspace task list')
+      assert.ok(input.tools.includes('drama_tasks'), 'Existing global task tool should remain available')
+      return context
+    }
+    async function observeGeneration(label) {
+      await queue({})
+      await sendNative(page, label)
+      const input = await poll(async () => {
+        const input = await readNativeInput()
+        if (input?.messages.some(message => message.role === 'user' && message.text === label) &&
+            (await get()).session.status === 'active') return input
+      }, 'Native generation request ' + label)
+      assert.ok(!JSON.stringify(input.messages).includes(unrelatedTaskId), 'Unrelated task leaked into the native request')
+      const context = generationContext(input)
+      assert.ok(context, 'Missing video-generation context in native request')
+      return context
+    }
     await pane.getByRole('button', { name: '视频节点部署', exact: true }).click()
     await poll(async () => (await get()).session.activeStageId === 'video-deployment', 'Deployment activation')
     await queue(...workflowCalls(
-      { name: 'drama_append', args: { operationId: randomUUID(), nodes: [{ id: draftId, type: 'video',
-        content: { title: 'Workflow fixture video', mode: 't2v', prompt: '固定中景。人物推开餐厅门，在门口停顿。', params: { duration: 8 } } }] } },
+      { name: 'drama_append', args: { operationId: randomUUID(), nodes: [
+        { id: draftId, type: 'video',
+          content: { title: 'Workflow fixture video', mode: 't2v', prompt: '固定中景。人物推开餐厅门，在门口停顿。', params: { duration: 8 } } },
+        { id: unrelatedNodeId, type: 'video',
+          content: { title: 'Unrelated workspace video', mode: 't2v', prompt: 'A separate studio shot.' } },
+      ] } },
       { name: 'drama_save_artifact', args: { operationId: randomUUID(), title: '待生成镜头', nodeId: draftId } },
     ))
     await sendNative(page, '为这个镜头准备视频节点草稿。')
@@ -1331,6 +1359,11 @@ test('Workflow dock separates Canvas video authorization from final film approva
       (await get()).session.status === 'active', 'Generation stage did not receive the deployment handoff')
     assert.equal((await get()).stages[5].generation.state, 'waiting')
     assert.equal((await operate(page, ticket, 'tasks', {})).tasks.length, 0)
+    const waiting = await poll(async () => generationContext(await readNativeInput()), 'Waiting generation kickoff reached the native model')
+    assert.equal(waiting.generationProgress.state, 'waiting')
+    assert.match(waiting.generationProgress.message, /单独授权生成/u)
+    assert.deepEqual(waiting.generationProgress.taskIds ?? [], [])
+    assert.deepEqual(waiting.generationResults ?? [], [])
 
     await open(page, record)
     const source = card(page, draftId)
@@ -1340,11 +1373,46 @@ test('Workflow dock separates Canvas video authorization from final film approva
     await page.getByRole('dialog', { name: '确认生成', exact: true })
       .getByRole('button', { name: '确认提交', exact: true }).click()
     await poll(async () => (await get()).stages[5].generation.state === 'processing', 'Generation did not track the Canvas task')
+    const { tasks: [approvedTask] } = await operate(page, ticket, 'tasks', {})
+    assert.equal(approvedTask.nodeId, draftId)
+    // A terminal peer task in the same isolated workspace gives the scoping check a
+    // real competing ID without scheduling any additional provider work.
+    const db = new DatabaseSync(join(home, record.workspaceName, '.drama-studio', 'studio.db'))
+    try {
+      db.exec('PRAGMA busy_timeout=5000')
+      const added = db.prepare(`INSERT INTO tasks(id,node_id,session_id,type,status,input,created_at,updated_at,completed_at)
+        SELECT ?,?,?,'video','cancelled',input,created_at,updated_at,updated_at FROM tasks WHERE id=?`)
+        .run(unrelatedTaskId, unrelatedNodeId, peer.sessionId, approvedTask.id)
+      assert.equal(added.changes, 1)
+    } finally {
+      db.close()
+    }
+    const { tasks: shared } = await operate(page, ticket, 'tasks', {})
+    assert.ok(shared.some(task => task.id === unrelatedTaskId && task.createdBySession === peer.sessionId))
+    const processing = await observeGeneration('检查当前已批准的视频草稿生成进度。')
+    assert.equal(processing.generationProgress.state, 'processing')
+    assert.match(processing.generationProgress.message, /正在生成/u)
+    assert.deepEqual(processing.generationProgress.taskIds, [approvedTask.id])
+    assert.deepEqual(processing.generationResults ?? [], [])
+
     await writeFile(join(home, 'allow-fixture-result'), '')
     const task = await poll(async () => {
       const { tasks } = await operate(page, ticket, 'tasks', {})
       return (await get()).stages[5].generation.state === 'ready' && tasks.find(item => item.status === 'completed')
     }, 'Download did not reach generation result readiness', 25_000)
+    const [resultNode] = (await query(page, ticket, { id: task.resultNodeId })).nodes
+    const ready = await observeGeneration('核对当前已批准的视频生成结果。')
+    assert.equal(ready.generationProgress.state, 'ready')
+    assert.equal(ready.generationProgress.message ?? '', '')
+    assert.deepEqual(ready.generationProgress.taskIds, [approvedTask.id])
+    assert.deepEqual(ready.generationResults, [{ id: task.resultNodeId, revision: resultNode.revision }])
+    console.info('Native generation context: ' + JSON.stringify({
+      waiting: waiting.generationProgress,
+      processing: processing.generationProgress,
+      ready: ready.generationProgress,
+      results: ready.generationResults,
+      excludedPeerTask: unrelatedTaskId,
+    }))
     assert.match(task.outputPath, /^assets\/native-results\/[^/]+\.mp4$/u)
     const downloaded = join(home, record.workspaceName, task.outputPath)
     await rename(downloaded, downloaded + '.held')
@@ -1384,7 +1452,8 @@ test('Workflow dock separates Canvas video authorization from final film approva
     const final = closed.handoffs.find(item => item.sourceStageId === 'final-review')
     assert.ok(!final.targetStageId)
     assert.ok(final.artifacts.some(item => item.nodeId === task.resultNodeId))
-    assert.equal((await operate(page, ticket, 'tasks', {})).tasks.length, 1)
+    const { tasks: finalTasks } = await operate(page, ticket, 'tasks', {})
+    assert.deepEqual(finalTasks.map(item => item.id).sort(), [approvedTask.id, unrelatedTaskId].sort())
   }, { providerFixture: true, workflowFixture: true })
 })
 

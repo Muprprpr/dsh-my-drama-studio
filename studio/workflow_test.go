@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -638,11 +639,16 @@ func TestWorkflowVideoUsesAuthorizedExactResults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	node := mustCall(t, f.s, f.dir, "active", "append", appendArgs{operation: workflowOp(), Nodes: []NodeInput{
+	nodes := mustCall(t, f.s, f.dir, "active", "append", appendArgs{operation: workflowOp(), Nodes: []NodeInput{
 		{Type: "video", Content: json.RawMessage(`{"mode":"t2v","prompt":"Evening light in the courtyard."}`)},
-	}}).(appendResult).IDs[0]
+		{Type: "video", Content: json.RawMessage(`{"mode":"t2v","prompt":"Morning light on a mountain."}`)},
+	}}).(appendResult).IDs
+	node, unrelatedNode := nodes[0], nodes[1]
 	f.activate("active", workflowDeployment)
 	run := f.start("active", workflowDeployment, "")
+	if run.GenerationProgress != nil || len(run.GenerationResults) != 0 {
+		t.Fatalf("deployment received generation data: %+v", run)
+	}
 	mustCall(t, f.s, f.dir, "active", "permission", map[string]any{"operationId": uuid.NewString(), "enabled": true})
 	f.check("active", "agent", "submit", map[string]any{"operationId": uuid.NewString(), "nodeId": node}, http.StatusForbidden)
 	f.call("active", "workflow", "workflow_save_artifact", workflowSaveArtifactArgs{
@@ -653,20 +659,38 @@ func TestWorkflowVideoUsesAuthorizedExactResults(t *testing.T) {
 	if deployment.TargetStageID != workflowGeneration || len(tasksIn(t, f.s, f.dir, "active")) != 0 {
 		t.Fatalf("deployment confirmation submitted a paid task: %+v", deployment)
 	}
-	kickoff := f.start("active", workflowGeneration, deployment.HandoffID)
-	if len(kickoff.GenerationResults) != 0 {
-		t.Fatalf("generation kickoff read a nonexistent output: %+v", kickoff.GenerationResults)
+	assertProgress := func(handoffID string, want workflowGenerationView, results ...workflowRef) {
+		t.Helper()
+		turn := f.start("active", workflowGeneration, handoffID)
+		got := turn.GenerationProgress
+		if got == nil || got.State != want.State || got.Message != want.Message || !slices.Equal(got.TaskIDs, want.TaskIDs) ||
+			!slices.Equal(turn.GenerationResults, results) {
+			t.Fatalf("generation turn: progress=%+v results=%+v, want progress=%+v results=%+v", got, turn.GenerationResults, want, results)
+		}
+		f.finish("active", turn.Session.RunID, "")
 	}
-	f.finish("active", kickoff.Session.RunID, "")
+	waiting := workflowGenerationView{State: "waiting", Message: "请在 Canvas 对已确认的视频草稿单独授权生成"}
+	assertProgress(deployment.HandoffID, waiting)
 	f.check("active", "human", "workflow_handoff_preview", workflowPreviewArgs{operation: workflowOp()}, http.StatusConflict)
 
-	submit := func(manual bool) Task {
+	submit := func(nodeID string, manual bool) Task {
 		if manual {
-			mustCall(t, f.s, f.dir, "human", "generateT2V", map[string]any{"operationId": uuid.NewString(), "nodeId": node, "confirmed": true})
+			mustCall(t, f.s, f.dir, "human", "generateT2V", map[string]any{"operationId": uuid.NewString(), "nodeId": nodeID, "confirmed": true})
 		} else {
-			mustCall(t, f.s, f.dir, "active", "submit", map[string]any{"operationId": uuid.NewString(), "nodeId": node})
+			mustCall(t, f.s, f.dir, "active", "submit", map[string]any{"operationId": uuid.NewString(), "nodeId": nodeID})
 		}
-		task := tasksIn(t, f.s, f.dir, "active")[0]
+		return tasksIn(t, f.s, f.dir, "active")[0]
+	}
+	lookupTask := func(id string) Task {
+		for _, task := range tasksIn(t, f.s, f.dir, "active") {
+			if task.ID == id {
+				return task
+			}
+		}
+		t.Fatalf("missing fixture task %s", id)
+		return Task{}
+	}
+	complete := func(task Task) Task {
 		path := "assets/videos/" + task.ID + ".mp4"
 		absolute := filepath.Join(f.dir, filepath.FromSlash(path))
 		if err := os.MkdirAll(filepath.Dir(absolute), 0o700); err != nil {
@@ -678,20 +702,25 @@ func TestWorkflowVideoUsesAuthorizedExactResults(t *testing.T) {
 		if err := p.transition(ctx, task, "polling", "fixture-provider-"+task.ID, ""); err != nil {
 			t.Fatal(err)
 		}
-		running := tasksIn(t, f.s, f.dir, "active")[0]
-		if err := p.complete(ctx, running, path, nil); err != nil {
+		if err := p.complete(ctx, lookupTask(task.ID), path, nil); err != nil {
 			t.Fatal(err)
 		}
-		return tasksIn(t, f.s, f.dir, "active")[0]
+		return lookupTask(task.ID)
 	}
-	automatic := submit(false)
+	automatic := complete(submit(node, false))
+	unrelated := complete(submit(unrelatedNode, true))
+	assertProgress("", waiting)
 	if got := f.view("active").Stages[workflowStageIndex(workflowGeneration)].Generation; got.State != "waiting" {
 		t.Fatalf("ordinary auto-authorized output was accepted: %+v", got)
 	}
-	manual := submit(true)
+	manual := submit(node, true)
+	assertProgress("", workflowGenerationView{State: "processing", Message: "已授权的视频正在生成，请在 Canvas 查看任务", TaskIDs: []string{manual.ID}})
+	manual = complete(manual)
+	assertProgress("", workflowGenerationView{State: "ready", TaskIDs: []string{manual.ID}}, workflowRef{ID: manual.ResultNodeID, Revision: 1})
 	playablePath := filepath.Join(f.dir, filepath.FromSlash(manual.OutputPath))
 	review := f.preview("active")
-	if len(review.Artifacts) != 1 || review.Artifacts[0].NodeID != manual.ResultNodeID || review.Artifacts[0].NodeID == automatic.ResultNodeID {
+	if len(review.Artifacts) != 1 || review.Artifacts[0].NodeID != manual.ResultNodeID ||
+		review.Artifacts[0].NodeID == automatic.ResultNodeID || review.Artifacts[0].NodeID == unrelated.ResultNodeID {
 		t.Fatalf("preview did not snapshot the independently authorized video: %+v", review)
 	}
 	ref := review.Artifacts[0].workflowArtifactRef
@@ -712,6 +741,9 @@ func TestWorkflowVideoUsesAuthorizedExactResults(t *testing.T) {
 		t.Fatalf("formal generated video not shared: %+v", item)
 	}
 	final := f.start("active", "final-review", generated.HandoffID)
+	if final.GenerationProgress != nil || len(final.GenerationResults) != 0 {
+		t.Fatalf("final review received generation data: %+v", final)
+	}
 	if len(final.Inputs) != workflowStageIndex("final-review") ||
 		final.Inputs[len(final.Inputs)-1].Artifacts[0].NodeID != manual.ResultNodeID {
 		t.Fatalf("final review lost verified output: %+v", final.Inputs)

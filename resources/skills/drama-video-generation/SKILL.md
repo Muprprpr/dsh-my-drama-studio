@@ -1,6 +1,6 @@
 ---
 name: drama-video-generation
-description: 预检已部署的视频节点和独立授权，查询任务并核对可交接的生成结果。
+description: 预检已部署的视频节点和独立授权，核对本轮匹配的任务状态和可交接结果。
 whenToUse: Studio Workflow 激活视频生成阶段时使用。
 user-invocable: true
 disable-model-invocation: true
@@ -14,14 +14,14 @@ disable-model-invocation: true
 
 ## 输入
 
-已交接的节点版本、Canvas 中的实际连接和模型配置、独立生成确认及任务记录。
+已交接的节点版本、Canvas 中的实际连接和模型配置，以及本轮提供的 `generationProgress` 与 `generationResults`。
 
 ## 工作步骤
 
 1. 按交接节点核对模型和方式、时长、画幅、分辨率及实际媒体输入。逐节点回读，确认节点提示词完整、无上游文本，`textList` 为空或不存在，`mixedListOrder` 和提示词引用仅对应已连接媒体。
 2. 将预检结果、节点版本和需要确认的项目告诉用户。每个视频任务由用户通过 Canvas 中的生成确认独立授权并提交。
-3. 查询任务状态和输出。记录来源节点版本、任务 ID、授权结果、失败或未完成原因。
-4. 核对成功任务对应实际已下载的视频节点。只登记符合当前阶段授权和来源要求的可播放结果。
+3. 从 `generationProgress` 读取状态、说明和相关任务 ID。结果未就绪时说明原因，需要更新状态时以新一轮提供的数据为准。
+4. 就绪后按 `generationResults` 中的节点 ID 和版本定向核对实际下载结果。只登记符合当前阶段授权和来源要求的可播放视频。
 
 ## 输出与检查
 
