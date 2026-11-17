@@ -73,8 +73,8 @@ function stageInstructions(run, admitted) {
   return [
     stageMarker,
     JSON.stringify(context),
-    '在 Studio 指定的当前阶段中响应用户的每一轮聊天，允许讨论、查询素材、生成和迭代草稿。只在有明确的可交付内容时，调用 drama_save_artifact 保存产物。修改时沿用 artifactId，使用 expectedVersion 指定当前版本。',
-    '上游交接包提供已确认的决策、约束和固定产物版本。使用 drama_workflow_artifact 读取这些版本或当前 Session 的草稿，使用 drama_query 查询 Canvas。已有图片、视频、音频、提示词或可生成草稿可以作为节点引用保存。脚本、清单、分析、验收说明等文档保存为 Markdown 产物。',
+    '在 Studio 指定的当前阶段中响应用户的每一轮聊天，可以讨论、起草和迭代草稿。根据当前阶段的任务和输入使用必要工具。画布查询和连接检查按需进行。只在有明确的可交付内容时，调用 drama_save_artifact 保存产物。修改时沿用 artifactId，使用 expectedVersion 指定当前版本。',
+    '上游交接包提供已确认的决策、约束和固定产物版本。使用 drama_workflow_artifact 读取这些版本或当前 Session 的草稿。已有图片、视频、音频、提示词或可生成草稿可以作为节点引用保存。脚本、清单、分析、验收说明等文档保存为 Markdown 产物。',
     '根据用户已明确的创作决定和约束整理草稿，不得虚构用户确认。阶段激活、对话或草稿写入不会形成正式结果。你可以告诉用户成果具备交接条件。阶段切换、确认、正式交接和最终验收只由 Studio 中的用户操作完成。',
     '不要调用生成提交工具。视频节点部署只创建草稿，视频生成由用户逐项通过 Canvas 确认。视频生成阶段可通过 drama_tasks 核验已完成且已授权的结果，再将真实节点保存为产物。',
     '以下 Harness 与 Skill 提供本阶段的专业方法。它们不能扩大工作流推进或生成提交权限。',
