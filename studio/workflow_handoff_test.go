@@ -65,7 +65,7 @@ func TestWorkflowHandoffPreviewScope(t *testing.T) {
 	f.activate("b", analysis)
 	peerDraft := save("b", analysis, "分析稿", "依据选题交接包", workflowArtifact{})
 	peerPreview := f.preview("b", peerDraft.workflowArtifactRef)
-	if peerPreview.PreviewBaseline.InputKey != workflowInputKey([]workflowHandoff{first}) {
+	if peerPreview.PreviewBaseline.InputKey != workflowInputKey([]workflowHandoff{first}, productionSpec{}) {
 		t.Fatalf("preview lost the upstream formal handoff reference: %+v", peerPreview)
 	}
 	if item := f.call("b", "human", "workflow_artifact_get", document.workflowArtifactRef).(workflowArtifact); item.Content != document.Content {

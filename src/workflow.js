@@ -66,6 +66,7 @@ function stageInstructions(run, admitted) {
     skillId: snapshot.skillId,
     activation: session.activation, snapshotId: session.snapshotId,
     skillSha256: snapshot.skillSha256, harnessSha256: snapshot.harnessSha256, handoffId,
+    productionSpec: admitted.productionSpec,
     approvedInputs: admitted.inputs?.map(summarizeHandoff),
     generationProgress: admitted.generationProgress,
     generationResults: admitted.generationResults,
@@ -75,8 +76,9 @@ function stageInstructions(run, admitted) {
     stageMarker,
     JSON.stringify(context),
     '在 Studio 指定的当前阶段中响应用户的每一轮聊天，可以讨论、起草和迭代草稿。根据当前阶段的任务和输入使用必要工具。画布查询和连接检查按需进行。只在有明确的可交付内容时，调用 drama_save_artifact 保存产物。修改时沿用 artifactId，使用 expectedVersion 指定当前版本。',
+    'productionSpec 是本轮固定的 Workspace 成片规格，可直接用于选题和后续规划。根据成片画幅安排构图和动作，根据目标成片时长分配全片节奏。aspectRatio 为空或 targetDurationSeconds 为 null 时，相应规格尚未设定，规划中的建议值仍待用户确认。成片时长与单次生成片段时长分别规划。三视图、分镜板和参考资产按各自用途选用比例。新建视频节点默认继承已设置的成片画幅，只有明确需要覆盖时才填写 params.aspectRatio。',
     '本轮正式输入以 approvedInputs 为准。用 drama_workflow_artifact 按 artifactId 读取其固定版本。执行中若上游更新，本轮仍使用已固定的版本，下一轮再读取新的正式输入。读取当前依据的工作稿时指定 scope=draft。用户明确需要历史参考时，用 scope=reference 和确切版本读取，并标明参考来源。参考资料不具备本轮正式输入的效力。',
-    '上游变化后，按本轮正式输入重新核对旧稿。保留用户仍有效的项目级条件和本轮正式输入的约束，将旧稿中的局部决定与未核实约束列为待确认。跨依据复用的版本由用户在正式交接预览中复核确认。',
+    '制作规格或上游变化后，按本轮制作规格和正式输入重新核对旧稿。保留用户仍有效的项目级条件和本轮正式输入的约束，将旧稿中的局部决定与未核实约束列为待确认。跨依据复用的版本由用户在正式交接预览中复核确认。',
     '已有图片、视频、音频、提示词或可生成草稿可以作为节点引用保存。脚本、清单、分析、验收说明等文档保存为 Markdown 产物。',
     '根据用户已明确的创作决定和约束整理草稿，不得虚构用户确认。阶段激活、对话或草稿写入不会形成正式结果。你可以告诉用户成果具备交接条件。阶段切换、确认、正式交接和最终验收只由 Studio 中的用户操作完成。',
     '不要调用生成提交工具。视频节点部署只创建草稿，视频生成由用户逐项通过 Canvas 确认。',
@@ -609,6 +611,7 @@ export function workflowBridge(ctx, kernel, workspaceFor, lifetime, { capabiliti
     if (data.edges?.some(edge => !additions.has(edge.target) && !turn.nodeIds.has(edge.target))) {
       throw new StudioError(403, '当前工作流阶段的连线只允许指向本轮新建节点')
     }
+    return { ...data, runId: turn.runId }
   }
 
   function trackToolResult(agent, action, result) {

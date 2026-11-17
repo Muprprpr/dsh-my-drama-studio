@@ -7,7 +7,7 @@ import {
 const gap = 6
 const margin = 12
 
-export function NodeParameterPopover({ label, value, open, onToggle, onClose, disabled, children }) {
+export function NodeParameterPopover({ label, value, title, open, onToggle, onClose, disabled, children }) {
   const id = useId()
   const titleId = id + '-title'
   const triggerRef = useRef(null)
@@ -78,7 +78,7 @@ export function NodeParameterPopover({ label, value, open, onToggle, onClose, di
   }, [open, onClose])
 
   return <>
-    <Button ref={triggerRef} size="sm" className="drama-focus-param-chip" aria-label={label}
+    <Button ref={triggerRef} size="sm" className="drama-focus-param-chip" aria-label={label} title={title}
       aria-haspopup="dialog" aria-expanded={open} aria-controls={open ? id : undefined}
       disabled={disabled} onClick={onToggle}>{value}</Button>
     {open && createPortal(

@@ -137,7 +137,7 @@ func (p *project) saveWorkflowArtifact(ctx context.Context, r Request, args work
 			if args.ExpectedVersion != 0 && args.ExpectedVersion != prior.Version {
 				return nil, workflowChanged
 			}
-			if prior.inputKey == turn.inputKey {
+			if workflowInputKeysEqual(prior.inputKey, turn.inputKey) {
 				artifact.ReusedFrom = prior.ReusedFrom
 				if artifact.ConfirmedDecisions == nil {
 					artifact.ConfirmedDecisions = prior.ConfirmedDecisions
@@ -216,9 +216,9 @@ func readOwnWorkflowArtifacts(ctx context.Context, tx *sql.Tx, sessionID string)
 
 func readCurrentWorkflowDrafts(ctx context.Context, tx *sql.Tx, sessionID, stageID, inputKey string) ([]workflowArtifact, error) {
 	return readWorkflowArtifactRows(ctx, tx, `SELECT record,input_key FROM workflow_artifacts AS a
-		WHERE session_id=? AND stage_id=? AND input_key=?
+		WHERE session_id=? AND stage_id=? AND input_key IN (?,?)
 		AND version=(SELECT MAX(version) FROM workflow_artifacts WHERE id=a.id)
-		ORDER BY rowid DESC`, sessionID, stageID, inputKey)
+		ORDER BY rowid DESC`, sessionID, stageID, inputKey, workflowLegacyInputKey(inputKey))
 }
 
 func readWorkflowArtifactRows(ctx context.Context, tx *sql.Tx, query string, args ...any) ([]workflowArtifact, error) {
@@ -291,9 +291,9 @@ func (p *project) getWorkflowRunArtifact(ctx context.Context, sessionID string, 
 		}
 	case "draft":
 		item, err = scanWorkflowArtifact(tx.QueryRowContext(ctx, `SELECT record,input_key FROM workflow_artifacts
-			WHERE id=? AND session_id=? AND stage_id=? AND input_key=?
+			WHERE id=? AND session_id=? AND stage_id=? AND input_key IN (?,?)
 			AND version=CASE WHEN ?=0 THEN (SELECT MAX(version) FROM workflow_artifacts WHERE id=?) ELSE ? END`,
-			ref.ArtifactID, sessionID, turn.stageID, turn.inputKey, ref.Version, ref.ArtifactID, ref.Version))
+			ref.ArtifactID, sessionID, turn.stageID, turn.inputKey, workflowLegacyInputKey(turn.inputKey), ref.Version, ref.ArtifactID, ref.Version))
 		if errors.Is(err, sql.ErrNoRows) {
 			return item, &requestError{http.StatusNotFound, "指定产物或版本不属于本轮输入下的当前阶段草稿"}
 		}

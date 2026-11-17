@@ -43,9 +43,11 @@ type workflowPreviewBaseline struct {
 
 type workflowReuseReview struct {
 	workflowArtifactRef
-	ReusedFrom     workflowArtifactRef  `json:"reusedFrom"`
-	PreviousInputs []workflowReuseInput `json:"previousInputs"`
-	CurrentInputs  []workflowReuseInput `json:"currentInputs"`
+	ReusedFrom             workflowArtifactRef  `json:"reusedFrom"`
+	PreviousInputs         []workflowReuseInput `json:"previousInputs"`
+	CurrentInputs          []workflowReuseInput `json:"currentInputs"`
+	PreviousProductionSpec *productionSpec      `json:"previousProductionSpec,omitempty"`
+	CurrentProductionSpec  *productionSpec      `json:"currentProductionSpec,omitempty"`
 }
 
 type workflowReuseInput struct {
@@ -231,15 +233,60 @@ func hasWorkflowInput(inputs []workflowHandoff, id string) bool {
 	return slices.ContainsFunc(inputs, func(input workflowHandoff) bool { return input.HandoffID == id })
 }
 
-func workflowInputKey(inputs []workflowHandoff) string {
+func workflowSpecPrefix(spec productionSpec) string {
+	seconds := int64(0)
+	if spec.TargetDurationSeconds != nil {
+		seconds = *spec.TargetDurationSeconds
+	}
+	return fmt.Sprintf("@%s/%d|", spec.AspectRatio, seconds)
+}
+
+func workflowInputKey(inputs []workflowHandoff, spec productionSpec) string {
 	var ids strings.Builder
+	ids.WriteString(workflowSpecPrefix(spec))
 	for _, input := range inputs {
 		fmt.Fprintf(&ids, "%d:%s", len(input.HandoffID), input.HandoffID)
 	}
 	return ids.String()
 }
 
+func workflowLegacyInputKey(key string) string {
+	// A legacy key did not record any project specification.
+	return strings.TrimPrefix(key, workflowSpecPrefix(productionSpec{}))
+}
+
+func workflowInputKeysEqual(a, b string) bool {
+	return workflowLegacyInputKey(a) == workflowLegacyInputKey(b)
+}
+
+func splitWorkflowInputKey(key string) (productionSpec, string, error) {
+	var spec productionSpec
+	if !strings.HasPrefix(key, "@") {
+		return spec, key, nil
+	}
+	prefix, tail, separated := strings.Cut(key[1:], "|")
+	ratio, duration, hasDuration := strings.Cut(prefix, "/")
+	seconds, err := strconv.ParseInt(duration, 10, 64)
+	spec.AspectRatio = ratio
+	if seconds != 0 {
+		spec.TargetDurationSeconds = &seconds
+	}
+	if !separated || !hasDuration || err != nil || !spec.valid() {
+		return productionSpec{}, "", errors.New("invalid workflow production spec")
+	}
+	return spec, tail, nil
+}
+
+func productionSpecFromInputKey(key string) (productionSpec, error) {
+	spec, _, err := splitWorkflowInputKey(key)
+	return spec, err
+}
+
 func workflowInputIDs(key string) ([]string, error) {
+	_, key, err := splitWorkflowInputKey(key)
+	if err != nil {
+		return nil, err
+	}
 	ids := []string{}
 	for key != "" {
 		length, tail, ok := strings.Cut(key, ":")
@@ -313,7 +360,11 @@ func (p *project) previewWorkflowHandoff(ctx context.Context, r Request, args wo
 			return nil, err
 		}
 		inputs := profile.inputs(latest, index)
-		inputKey := workflowInputKey(inputs)
+		spec, err := readProductionSpec(ctx, tx)
+		if err != nil {
+			return nil, err
+		}
+		inputKey := workflowInputKey(inputs, spec)
 		artifacts, err := selectWorkflowArtifacts(ctx, tx, r.SessionID, session.ActiveStageID, inputKey, args.Artifacts)
 		if err != nil {
 			return nil, err
@@ -343,8 +394,8 @@ func (p *project) previewWorkflowHandoff(ctx context.Context, r Request, args wo
 			return nil, invalid("交接需要 1–%d 项有效阶段产物", maxWorkflowOutputs)
 		}
 		for _, artifact := range artifacts {
-			if artifact.inputKey != inputKey {
-				return nil, &requestError{http.StatusConflict, "草稿使用的上游交接已更新，请在当前阶段保存基于最新交接的版本"}
+			if !workflowInputKeysEqual(artifact.inputKey, inputKey) {
+				return nil, &requestError{http.StatusConflict, "草稿的制作规格或上游交接已更新，请重核后保存新版本"}
 			}
 		}
 		if session.ActiveStageID == workflowFinalReview && !slices.ContainsFunc(artifacts, isWorkflowVideo) {
@@ -363,7 +414,7 @@ func (p *project) previewWorkflowHandoff(ctx context.Context, r Request, args wo
 		if previous, ok := latest[session.ActiveStageID]; ok && !previous.Stale && sameWorkflowArtifacts(previous.Artifacts, artifacts) {
 			return nil, &requestError{http.StatusConflict, "这些版本已正式交接，请选择更新的产物"}
 		}
-		reuse, err := readWorkflowReuseReviews(ctx, tx, selected, inputs)
+		reuse, err := readWorkflowReuseReviews(ctx, tx, selected, inputs, spec)
 		if err != nil {
 			return nil, err
 		}
@@ -410,7 +461,7 @@ func selectWorkflowArtifacts(ctx context.Context, tx *sql.Tx, sessionID, stageID
 	return out, nil
 }
 
-func readWorkflowReuseReviews(ctx context.Context, tx *sql.Tx, artifacts []workflowArtifact, inputs []workflowHandoff) ([]workflowReuseReview, error) {
+func readWorkflowReuseReviews(ctx context.Context, tx *sql.Tx, artifacts []workflowArtifact, inputs []workflowHandoff, spec productionSpec) ([]workflowReuseReview, error) {
 	current := make([]workflowReuseInput, 0, len(inputs))
 	for _, input := range inputs {
 		current = append(current, workflowReuseInput{
@@ -434,6 +485,13 @@ func readWorkflowReuseReviews(ctx context.Context, tx *sql.Tx, artifacts []workf
 		}
 		review := workflowReuseReview{workflowArtifactRef: artifact.workflowArtifactRef, ReusedFrom: *from,
 			PreviousInputs: make([]workflowReuseInput, 0, len(ids)), CurrentInputs: current}
+		previous, err := productionSpecFromInputKey(oldKey)
+		if err != nil {
+			return nil, err
+		}
+		if workflowSpecPrefix(previous) != workflowSpecPrefix(spec) {
+			review.PreviousProductionSpec, review.CurrentProductionSpec = &previous, &spec
+		}
 		for _, id := range ids {
 			input := workflowReuseInput{HandoffID: id}
 			if err := tx.QueryRowContext(ctx, `SELECT stage_id,revision
@@ -591,7 +649,12 @@ func (p *project) confirmWorkflowHandoff(ctx context.Context, r Request, args wo
 			}
 			return nil, workflowHandoffContentChanged
 		}
-		if profile.requireWorkflowInputs(latest, index) != nil || workflowInputKey(profile.inputs(latest, index)) != baseline.InputKey {
+		spec, err := readProductionSpec(ctx, tx)
+		if err != nil {
+			return nil, err
+		}
+		if profile.requireWorkflowInputs(latest, index) != nil ||
+			!workflowInputKeysEqual(workflowInputKey(profile.inputs(latest, index), spec), baseline.InputKey) {
 			return nil, workflowHandoffContentChanged
 		}
 		for _, artifact := range handoff.Artifacts {

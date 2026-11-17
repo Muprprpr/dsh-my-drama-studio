@@ -280,6 +280,7 @@ func resolveMediaNode(ctx context.Context, tx *sql.Tx, source Node) (Node, error
 
 type appendArgs struct {
 	operation
+	RunID string      `json:"runId,omitempty"`
 	Nodes []NodeInput `json:"nodes"`
 	Edges []Edge      `json:"edges"`
 }
@@ -294,6 +295,9 @@ func (s *Service) append(ctx context.Context, p *project, r Request) (any, error
 	if err := decodeData(r.Data, &args); err != nil {
 		return nil, err
 	}
+	if (r.Actor == "workflow") != (args.RunID != "") {
+		return nil, workflowForbidden
+	}
 	human := r.Actor == "human"
 	var affected []string
 	if human {
@@ -307,6 +311,19 @@ func (s *Service) append(ctx context.Context, p *project, r Request) (any, error
 	return p.writeChecked(ctx, r, args.ID, func(tx *sql.Tx, _ Status) (any, error) {
 		if len(args.Nodes)+len(args.Edges) == 0 {
 			return nil, invalid("需要至少一个新节点或引用")
+		}
+		var turn workflowTurn
+		if args.RunID != "" {
+			var err error
+			turn, err = p.activeWorkflowTurn(ctx, tx, r.SessionID, args.RunID)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if slices.ContainsFunc(args.Nodes, func(node NodeInput) bool { return node.Type == "video" }) {
+			if err := pinVideoProductionDefaults(ctx, tx, turn, args.Nodes); err != nil {
+				return nil, err
+			}
 		}
 		return appendNodes(ctx, tx, r.SessionID, args.Nodes, args.Edges, human)
 	}, func(tx *sql.Tx) error {

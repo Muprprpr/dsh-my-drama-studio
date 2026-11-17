@@ -442,11 +442,15 @@ func readWorkflowView(ctx context.Context, tx *sql.Tx, workspace, sessionID stri
 	}
 	artifacts := make(map[workflowArtifactRef]int, len(drafts))
 	inputKeys := make(map[string]string, len(view.Stages))
+	spec, err := readProductionSpec(ctx, tx)
+	if err != nil {
+		return view, err
+	}
 	for index, stage := range view.Stages {
-		inputKeys[stage.ID] = workflowInputKey(profile.inputs(latest, index))
+		inputKeys[stage.ID] = workflowInputKey(profile.inputs(latest, index), spec)
 	}
 	for _, artifact := range drafts {
-		artifact.InputOutdated = artifact.inputKey != inputKeys[artifact.StageID]
+		artifact.InputOutdated = !workflowInputKeysEqual(artifact.inputKey, inputKeys[artifact.StageID])
 		artifacts[artifact.workflowArtifactRef] = len(view.Artifacts)
 		view.Artifacts = append(view.Artifacts, artifact)
 	}

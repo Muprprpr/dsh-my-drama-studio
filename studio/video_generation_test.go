@@ -3,6 +3,10 @@ package studio
 import (
 	"context"
 	"encoding/json"
+	"image"
+	"image/png"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -168,5 +172,75 @@ func TestMiniMaxI2VInheritsFirstFrameRatio(t *testing.T) {
 	}
 	if profile.Defaults.AspectRatio != "16:9" || len(profile.Limits.AspectRatios) != 2 {
 		t.Fatal("mode-specific ratio resolution modified the shared preset")
+	}
+}
+
+func TestProjectVideoAspectResolution(t *testing.T) {
+	channel := VideoChannel{Protocol: "new-api"}
+	profile := ProviderProfile{Provider: channel.Protocol, Channel: &channel,
+		Defaults: VideoParams{Duration: 5, Resolution: "720p"}}
+	input := GenerationInput{Mode: "t2v", productionAspectRatio: "9:16"}
+	if err := prepareVideoGeneration(&input, &profile, VideoParams{AspectRatio: "16:9"}); err != nil {
+		t.Fatal(err)
+	}
+	adapter := newVideoProvider(profile, "", nil).(*videoProvider)
+	_, _, mapped := adapter.submitRequest(input, nil)
+	if mapped["width"] != 720 || mapped["height"] != 1280 || mapped["aspect_ratio"] != nil ||
+		input.Params.Duration != 5 {
+		t.Fatalf("unexpected channel payload for project default: %+v", mapped)
+	}
+
+	limited := ProviderProfile{Provider: "custom-rest",
+		Channel:  &VideoChannel{Protocol: "custom-rest", Advanced: &CustomREST{Fields: map[string]string{"aspectRatio": "format"}}},
+		Defaults: VideoParams{AspectRatio: "16:9"},
+		Limits:   VideoLimits{AspectRatios: []string{"16:9"}}}
+	input = GenerationInput{Mode: "t2v", productionAspectRatio: "9:16"}
+	if err := prepareVideoGeneration(&input, &limited, VideoParams{}); err == nil || !strings.Contains(err.Error(), "画幅") {
+		t.Fatalf("unsupported project ratio must be rejected, got %v", err)
+	}
+	input.Params.AspectRatio = "16:9"
+	if err := prepareVideoGeneration(&input, &limited, VideoParams{}); err != nil || input.Params.AspectRatio != "16:9" {
+		t.Fatalf("explicit node ratio should override project default: %+v, %v", input.Params, err)
+	}
+}
+
+func TestProjectVideoAspectFromFirstFrame(t *testing.T) {
+	profile := ProviderProfile{Provider: minimaxH3Protocol, Channel: &VideoChannel{Protocol: minimaxH3Protocol},
+		Defaults: VideoParams{Duration: 4, Resolution: "768P", AspectRatio: "16:9"}}
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "assets", "images"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	const frame = "assets/images/portrait.png"
+	file, err := os.Create(filepath.Join(dir, frame))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = png.Encode(file, image.NewRGBA(image.Rect(0, 0, 90, 160))); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	input := GenerationInput{Mode: "i2v", WorkspacePath: dir, productionAspectRatio: "9:16",
+		References: []GenerationReference{{Type: "image", Path: frame}}}
+	if err := prepareVideoGeneration(&input, &profile, VideoParams{AspectRatio: "16:9"}); err != nil || input.Params.AspectRatio != "" {
+		t.Fatalf("adapter should inherit the verified project ratio from its frame: %+v, %v", input.Params, err)
+	}
+	input.productionAspectRatio = "16:9"
+	if err := prepareVideoGeneration(&input, &profile, VideoParams{}); err == nil || !strings.Contains(err.Error(), "16:9") {
+		t.Fatalf("landscape target with portrait frame must be rejected: %v", err)
+	}
+	ark := ProviderProfile{Provider: "ark", Model: "doubao-seedance-2-5-260628",
+		Limits: VideoLimits{AspectRatios: []string{"16:9", "9:16", "adaptive"}}}
+	input.productionAspectRatio = "9:16"
+	input.Params = VideoParams{}
+	if err := prepareVideoGeneration(&input, &ark, VideoParams{AspectRatio: "16:9"}); err != nil || input.Params.AspectRatio != "" {
+		t.Fatalf("Seedance 2.5 I2V should omit unrelated global ratio: %+v, %v", input.Params, err)
+	}
+	input.Params.AspectRatio = "adaptive"
+	if err := prepareVideoGeneration(&input, &ark, VideoParams{}); err != nil || input.Params.AspectRatio != "adaptive" {
+		t.Fatalf("explicit adaptive should retain the existing override: %+v, %v", input.Params, err)
 	}
 }

@@ -25,15 +25,16 @@ type Provider interface {
 }
 
 type GenerationInput struct {
-	Type            string                `json:"type"`
-	Prompt          string                `json:"prompt"`
-	Mode            string                `json:"mode,omitempty"`
-	Profile         ProviderProfile       `json:"profile,omitzero"`
-	WorkspacePath   string                `json:"-"`
-	References      []GenerationReference `json:"references,omitempty"`
-	Params          VideoParams           `json:"params,omitzero"`
-	OutputDirectory string                `json:"outputDirectory,omitempty"`
-	providerVersion string                // Checked at admission and omitted from the stored job.
+	Type                  string                `json:"type"`
+	Prompt                string                `json:"prompt"`
+	Mode                  string                `json:"mode,omitempty"`
+	Profile               ProviderProfile       `json:"profile,omitzero"`
+	WorkspacePath         string                `json:"-"`
+	References            []GenerationReference `json:"references,omitempty"`
+	Params                VideoParams           `json:"params,omitzero"`
+	OutputDirectory       string                `json:"outputDirectory,omitempty"`
+	providerVersion       string                // Checked at admission and omitted from the stored job.
+	productionAspectRatio string                // Resolved at admission into provider-specific parameters.
 }
 
 type sourceGroup struct {

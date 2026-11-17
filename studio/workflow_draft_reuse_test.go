@@ -61,7 +61,7 @@ func TestWorkflowDraftReuseKeepsInputProvenanceThroughConfirmation(t *testing.T)
 	}
 	reused := save("writer", turn.Session.RunID, historic.Content, historic.workflowArtifactRef, workflowArtifactNotes{})
 	if reused.ReusedFrom == nil || *reused.ReusedFrom != stable.workflowArtifactRef ||
-		reused.inputKey != workflowInputKey(turn.Inputs) || len(reused.Constraints) != 0 || len(reused.ConfirmedDecisions) != 0 {
+		reused.inputKey != workflowInputKey(turn.Inputs, turn.ProductionSpec) || len(reused.Constraints) != 0 || len(reused.ConfirmedDecisions) != 0 {
 		t.Fatalf("cross-input save lost provenance or inherited stale notes: %+v", reused)
 	}
 	// A second save on the current input does not certify that the draft was reviewed.

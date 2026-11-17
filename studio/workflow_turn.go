@@ -38,6 +38,7 @@ type workflowTurnFailedArgs struct {
 
 type workflowTurnResult struct {
 	workflowSessionResult
+	ProductionSpec     productionSpec          `json:"productionSpec"`
 	Inputs             []workflowHandoff       `json:"inputs"`
 	Artifacts          []workflowArtifact      `json:"artifacts"`
 	GenerationProgress *workflowGenerationView `json:"generationProgress,omitempty"`
@@ -126,8 +127,12 @@ func (p *project) startWorkflowTurn(ctx context.Context, r Request, args workflo
 				return nil, &requestError{http.StatusConflict, "交接的初始任务已启动或交接版本已更新"}
 			}
 		}
-		out := workflowTurnResult{Inputs: inputs}
-		inputKey := workflowInputKey(inputs)
+		spec, err := readProductionSpec(ctx, tx)
+		if err != nil {
+			return nil, err
+		}
+		out := workflowTurnResult{Inputs: inputs, ProductionSpec: spec}
+		inputKey := workflowInputKey(inputs, spec)
 		out.Artifacts, err = readCurrentWorkflowDrafts(ctx, tx, r.SessionID, args.StageID, inputKey)
 		if err != nil {
 			return nil, err

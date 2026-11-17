@@ -37,14 +37,7 @@ func (p *project) permission(ctx context.Context, r Request) (any, error) {
 		if status.AutoGenerate == *args.Enabled {
 			return mutationResult{EventSeq: status.EventSeq}, nil
 		}
-		statement := "DELETE FROM temp.session_permission WHERE session_id=?"
-		if *args.Enabled {
-			statement = "INSERT INTO temp.session_permission VALUES(?)"
-		}
-		if _, err := tx.ExecContext(ctx, statement, r.SessionID); err != nil {
-			return nil, err
-		}
-		seq, err := addEvent(ctx, tx, "permission", []string{r.SessionID})
+		seq, err := setAutomaticPermission(ctx, tx, r.SessionID, *args.Enabled)
 		return mutationResult{EventSeq: seq}, err
 	})
 }
@@ -94,6 +87,11 @@ func (p *project) submit(ctx context.Context, r Request, providers providerRegis
 			return nil, err
 		}
 		if kind == "video" {
+			if r.Action == "submit" {
+				if err := checkAutomaticVideoDraft(ctx, tx, snapshot, workflowRef{ID: args.NodeID, Revision: revision}); err != nil {
+					return nil, err
+				}
+			}
 			if err := validateVideo(ctx, tx, args.NodeID, true); err != nil {
 				return nil, err
 			}
@@ -330,17 +328,21 @@ func (p *project) controlTask(ctx context.Context, r Request) (any, error) {
 
 func generationInput(ctx context.Context, tx *sql.Tx, workspace, id, kind, snapshot string) (GenerationInput, string, []string, error) {
 	var content struct {
-		Prompt    string          `json:"prompt"`
-		PromptDoc json.RawMessage `json:"promptDoc"`
-		Order     []string        `json:"mixedListOrder"`
-		Mode      string          `json:"mode"`
-		ProfileID string          `json:"profileId"`
-		Params    json.RawMessage `json:"params"`
+		Prompt                string          `json:"prompt"`
+		PromptDoc             json.RawMessage `json:"promptDoc"`
+		Order                 []string        `json:"mixedListOrder"`
+		Mode                  string          `json:"mode"`
+		ProfileID             string          `json:"profileId"`
+		Params                json.RawMessage `json:"params"`
+		ProductionAspectRatio string          `json:"productionAspectRatio"`
 	}
 	if err := json.Unmarshal([]byte(snapshot), &content); err != nil {
 		return GenerationInput{}, "", nil, invalid("生成节点格式无效")
 	}
-	input := GenerationInput{Type: kind, Prompt: content.Prompt, Mode: content.Mode}
+	input := GenerationInput{Type: kind, Prompt: content.Prompt, Mode: content.Mode, WorkspacePath: workspace}
+	if kind == "video" {
+		input.productionAspectRatio = content.ProductionAspectRatio
+	}
 	params, err := decodeVideoParams(content.Params)
 	if err != nil {
 		return GenerationInput{}, "", nil, err

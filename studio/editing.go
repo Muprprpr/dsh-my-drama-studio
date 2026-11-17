@@ -221,6 +221,10 @@ func updateNode(ctx context.Context, tx *sql.Tx, args updateNodeArgs) (editResul
 		return editResult{}, invalid("节点 content 必须是 JSON 对象")
 	}
 	preserveContentField(content, previous, "providerTaskId")
+	if kind == "video" {
+		preserveContentField(content, previous, "productionAspectRatio")
+		preserveContentField(content, previous, "workflowDeploymentDraft")
+	}
 	if len(content["promptDoc"]) > 0 && bytes.Equal(previous["promptDoc"], content["promptDoc"]) {
 		var oldPrompt, newPrompt string
 		if kind == "prompt" {

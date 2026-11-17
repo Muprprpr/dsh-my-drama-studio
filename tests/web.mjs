@@ -43,6 +43,24 @@ export async function apply(ctx) {
   const workflowTools = new Map()
   const workflowHolds = new Map()
   const workflowInputs = new Map()
+  const realPlanningRequests = new Map()
+  if (process.env.DRAMA_REAL_WORKFLOW === '1') {
+    ctx.on('llm/stream', (request, next) => {
+      const newline = String.fromCharCode(10)
+      const system = [request.system, ...request.messages.filter(message => message.role === 'system')
+        .flatMap(message => message.content.filter(block => block.type === 'text').map(block => block.text))]
+        .filter(text => typeof text === 'string').join(newline)
+      const marker = '[Drama Studio Workflow Stage]'
+      const line = system.slice(system.lastIndexOf(marker) + marker.length).trimStart().split(newline)[0]
+      if (system.includes(marker) && line.startsWith('{')) {
+        const context = JSON.parse(line)
+        if (context.stageId === 'topic-selection' && !realPlanningRequests.has(request.sessionId)) {
+          realPlanningRequests.set(request.sessionId, { provider: request.provider, model: request.model, context })
+        }
+      }
+      return next()
+    })
+  }
   ctx.llm.registerAdapter([provider], new class extends LlmAdapter {
     async listModels() {
       return [model, ...fixtureModels].map(id => ({ provider, id, name: id }))
@@ -142,6 +160,8 @@ export async function apply(ctx) {
       if (!result.accepted) throw new Error('Native steer fixture was rejected')
     } else if (action === 'workflow-model-input') {
       return { status: workflowInputs.get(sessionModels.get(sessionId)) }
+    } else if (action === 'real-planning-request') {
+      return { status: realPlanningRequests.get(sessionId) }
     } else if (action === 'workflow-transcript') {
       return agent.session.snapshotEvents().flatMap(event => {
         const { type, data } = event
@@ -248,7 +268,7 @@ export async function apply(ctx) {
       session.append('step/end', { turn: 1, step: 1 })
       session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
       await ctx.sessionController.rename({ sessionId, title: name })
-      if (workspaceName === 'Studio Shared' && process.env.DRAMA_REAL_WORKFLOW === '1') {
+      if (process.env.DRAMA_REAL_WORKFLOW === '1') {
         const provider = 'deepseek-official'
         const available = await ctx.llm.listModels(provider)
         const selected = available.find(item => item.id === 'deepseek-chat')
@@ -337,8 +357,11 @@ async function withWeb(run, { providerFixture = false, realWorkflow = false, wor
     DRAMA_DSH_CLI: dshCLI, DRAMA_REAL_WORKFLOW: realWorkflow ? '1' : '',
     DRAMA_TEST_NEW_WORKSPACES: newWorkspaces ? '1' : '',
     DEEPSEEK_API_KEY: realWorkflow ? process.env.DEEPSEEK_API_KEY : '' }
+  const credentialsFile = realWorkflow && process.env.DRAMA_DEEPSEEK_CREDENTIALS_FILE
   if (realWorkflow) {
-    assert.ok(env.DEEPSEEK_API_KEY, 'Set DEEPSEEK_API_KEY for the real Workflow acceptance run')
+    assert.ok(env.DEEPSEEK_API_KEY || credentialsFile,
+      'Set DEEPSEEK_API_KEY or DRAMA_DEEPSEEK_CREDENTIALS_FILE for the real Workflow acceptance run')
+    if (credentialsFile) assert.ok(existsSync(credentialsFile), 'Configured DeepSeek credentials file does not exist')
     delete env.DEEPSEEK_BASE_URL
   }
   const isolatedPlugin = providerFixture || studioExecutable || dshCLI
@@ -358,7 +381,12 @@ async function withWeb(run, { providerFixture = false, realWorkflow = false, wor
       env.DRAMA_UIUX_PROVIDER_FIXTURE = resolve(videoAsset)
     } else await copyFile(studioExecutable ?? join(root, 'dist', 'studio.exe'), executable)
   } else await symlink(root, entryRoot, 'junction')
-  await writeFile(join(profile, 'cordis.patch.yml'), `- id: ui-settings-models
+  const credentialsPatch = credentialsFile ? `- id: credentials
+  config:
+    path: ${JSON.stringify(resolve(credentialsFile))}
+    watch: false
+` : ''
+  await writeFile(join(profile, 'cordis.patch.yml'), `${credentialsPatch}- id: ui-settings-models
   config:
     credentialOnboarding: false
 - insert:
@@ -430,7 +458,8 @@ async function withWebHost(run, { cwd, env, home, shell, args, realWorkflow, res
   } catch (error) {
     await page?.screenshot({ path: join(home, 'failure.png'), animations: 'disabled' }).catch(() => {})
     const diagnostics = `${error.stack}\nTest profile: ${home}\nBrowser errors:\n${[...pageErrors, ...consoleErrors].join('\n')}\nDSH output:\n${output.split(/\r?\n/u).slice(0, 25).join('\n')}`
-    throw new Error(redact(realWorkflow ? diagnostics.replaceAll(env.DEEPSEEK_API_KEY, '[redacted]') : diagnostics))
+    throw new Error(redact(realWorkflow && env.DEEPSEEK_API_KEY
+      ? diagnostics.replaceAll(env.DEEPSEEK_API_KEY, '[redacted]') : diagnostics))
   } finally {
     const closingBrowser = browser?.close()
     const pid = output.match(/\[drama-web-fixture\] PID (\d+)/u)?.[1]
@@ -469,7 +498,8 @@ const card = (page, id) => flow(page).locator(`article[data-drama-node-id="${id}
 const graphEdge = (page, source, target) =>
   flow(page).locator('.react-flow__edge[data-id=' + JSON.stringify(JSON.stringify([source, target])) + ']')
 const draftCard = page => flow(page).locator('article[data-drama-draft="true"]')
-const menu = page => page.getByRole('button', { name: 'Drama 设置', exact: true })
+const productionEntry = page => page.getByRole('button', { name: '制作设置', exact: true })
+const productionDialog = page => page.getByRole('dialog', { name: '制作设置', exact: true })
 const sidebarMode = (page, mode) => page.locator(`[data-sidebar-right-mode="${mode}"]`).first()
 
 async function select(page, record) {
@@ -576,13 +606,15 @@ async function assertCanvasLayout(page) {
 
 async function setPermission(page, enabled) {
   const status = page.getByTestId('drama-permission')
-  await menu(page).click()
-  const toggle = page.getByRole('switch', { name: '自动执行生成', exact: true })
+  await productionEntry(page).click()
+  const dialog = productionDialog(page)
+  const toggle = dialog.getByRole('switch', { name: '自动执行生成', exact: true })
   await toggle.waitFor()
   assert.equal(await toggle.getAttribute('aria-checked'), String(!enabled))
   await toggle.click()
+  await poll(async () => await toggle.getAttribute('aria-checked') === String(enabled), 'generation switch did not update')
+  await dialog.getByRole('button', { name: '关闭制作设置', exact: true }).click()
   await poll(async () => (await status.textContent())?.includes(enabled ? '自动' : '手动'), 'permission pill did not update')
-  if (await toggle.isVisible()) await page.keyboard.press('Escape')
 }
 
 async function openWorkflow(page, record) {
@@ -590,6 +622,24 @@ async function openWorkflow(page, record) {
   const pane = page.getByTestId('drama-workflow').and(page.locator('[data-session-id="' + record.sessionId + '"]'))
   await pane.waitFor()
   return pane
+}
+
+async function openProductionSettings(page) {
+  await productionEntry(page).click()
+  const dialog = productionDialog(page)
+  await dialog.getByRole('radio', { name: '竖屏 9:16', exact: true }).waitFor()
+  return dialog
+}
+
+async function saveProductionSpec(page, ticket, dialog, label, aspectRatio, targetDurationSeconds) {
+  await dialog.getByRole('radio', { name: label, exact: true }).check()
+  await dialog.getByLabel('目标成片时长（秒）', { exact: true }).fill(String(targetDurationSeconds))
+  await dialog.getByRole('button', { name: '保存制作规格', exact: true }).click()
+  await dialog.getByText('制作规格已保存。', { exact: true }).waitFor()
+  await poll(async () => {
+    const { productionSpec } = await operate(page, ticket, 'production_settings_get', {})
+    return productionSpec.aspectRatio === aspectRatio && productionSpec.targetDurationSeconds === targetDurationSeconds
+  }, 'Production settings were not saved')
 }
 
 async function openSettingsSection(page, name) {
@@ -1298,6 +1348,103 @@ test('Workflow dock exercises DeepSeek on successive native Agent turns and hand
   }, { realWorkflow: true, workflowFixture: true })
 })
 
+test('Workspace production settings open before activation and persist across Sessions and reload', { timeout: 90_000 }, async () => {
+  await withWeb(async ({ page, records }) => {
+    const [a, b, , other] = records
+    await select(page, a)
+    const ticket = await ticketFor(page, a.sessionId)
+    const summary = page.getByTestId('drama-production-summary')
+    await summary.filter({ hasText: /画幅未设置.*时长未设/u }).waitFor()
+    assert.equal((await operate(page, ticket, 'context', {})).connected, false)
+    assert.equal((await operate(page, ticket, 'workflow_get', {})).session.status, 'normal')
+    let dialog = await openProductionSettings(page)
+    assert.equal(await dialog.getByRole('radio', { name: '暂不指定', exact: true }).isChecked(), true)
+    assert.equal(await dialog.getByLabel('目标成片时长（秒）', { exact: true }).inputValue(), '')
+    await saveProductionSpec(page, ticket, dialog, '竖屏 9:16', '9:16', 28)
+    const toggle = dialog.getByRole('switch', { name: '自动执行生成', exact: true })
+    await toggle.click()
+    await dialog.getByText('已开启自动生成。', { exact: true }).waitFor()
+    await poll(async () => (await operate(page, ticket, 'production_settings_get', {})).autoGenerate, 'Early toggle did not save')
+    await dialog.getByRole('button', { name: '关闭制作设置', exact: true }).click()
+    await summary.filter({ hasText: /9:16.*28/u }).waitFor()
+    assert.equal((await operate(page, ticket, 'context', {})).connected, false)
+    assert.equal((await operate(page, ticket, 'workflow_get', {})).session.status, 'normal')
+
+    await page.reload({ waitUntil: 'domcontentloaded' })
+    await select(page, a)
+    dialog = await openProductionSettings(page)
+    assert.equal(await dialog.getByRole('radio', { name: '竖屏 9:16', exact: true }).isChecked(), true)
+    assert.equal(await dialog.getByLabel('目标成片时长（秒）', { exact: true }).inputValue(), '28')
+    assert.equal(await dialog.getByRole('switch', { name: '自动执行生成', exact: true }).getAttribute('aria-checked'), 'true')
+    await dialog.getByRole('button', { name: '关闭制作设置', exact: true }).click()
+
+    await select(page, b)
+    dialog = await openProductionSettings(page)
+    assert.equal(await dialog.getByRole('radio', { name: '竖屏 9:16', exact: true }).isChecked(), true)
+    assert.equal(await dialog.getByLabel('目标成片时长（秒）', { exact: true }).inputValue(), '28')
+    assert.equal(await dialog.getByRole('switch', { name: '自动执行生成', exact: true }).getAttribute('aria-checked'), 'false')
+    await dialog.getByRole('button', { name: '关闭制作设置', exact: true }).click()
+
+    await select(page, other)
+    dialog = await openProductionSettings(page)
+    assert.equal(await dialog.getByRole('radio', { name: '暂不指定', exact: true }).isChecked(), true)
+    assert.equal(await dialog.getByLabel('目标成片时长（秒）', { exact: true }).inputValue(), '')
+  }, { newWorkspaces: true, workflowFixture: true })
+})
+
+test('Workspace production settings guide real DeepSeek topic plans in landscape and portrait', {
+  timeout: 240_000, skip: process.env.DRAMA_REAL_WORKFLOW !== '1',
+}, async () => {
+  await withWeb(async ({ page, records, home }) => {
+    const [a, , , other] = records
+    const topic = '用末班公交站台的一张旧车票做短视频选题。保存一份简短的选题简报，写明成片规格、三个叙事节拍各占几秒，以及如何利用画幅安排人物、车票和站台。'
+    const targetDurationSeconds = 24
+    const plans = []
+    for (const [record, label, aspectRatio] of [[a, '横屏 16:9', '16:9'], [other, '竖屏 9:16', '9:16']]) {
+      const pane = await openWorkflow(page, record)
+      const ticket = await ticketFor(page, record.sessionId)
+      const dialog = await openProductionSettings(page)
+      await saveProductionSpec(page, ticket, dialog, label, aspectRatio, targetDurationSeconds)
+      await dialog.getByRole('switch', { name: '自动执行生成', exact: true }).click()
+      await dialog.getByText('已开启自动生成。', { exact: true }).waitFor()
+      await poll(async () => (await operate(page, ticket, 'production_settings_get', {})).autoGenerate, 'Early automatic generation preference did not save')
+      await dialog.getByRole('button', { name: '关闭制作设置', exact: true }).click()
+      const picker = pane.getByTestId('drama-workflow-profile-picker')
+      await picker.locator('input[value="short-video"]').check()
+      await picker.getByRole('button', { name: '确认生产模式', exact: true }).click()
+      await pane.getByRole('button', { name: '选题策划', exact: true }).click()
+      await pane.locator('[data-active-stage-id="topic-selection"]').waitFor()
+      await sendNative(page, topic)
+      const artifact = await poll(async () => {
+        const view = await operate(page, ticket, 'workflow_get', {})
+        if (view.session.status === 'failed') assert.fail(view.session.error)
+        return view.artifacts.find(item => item.stageId === 'topic-selection' && item.content)
+      }, 'DeepSeek did not save the ' + aspectRatio + ' plan', 85_000)
+      const native = await nativeActivity(home, record, 'real-planning-request')
+      assert.equal(native.provider, 'deepseek-official')
+      assert.deepEqual(native.context.approvedInputs ?? [], [])
+      assert.deepEqual(native.context.productionSpec, { aspectRatio, targetDurationSeconds })
+      const transcript = await nativeActivity(home, record, 'workflow-transcript')
+      assert.equal(transcript.filter(event => event.type === 'user/message' && event.source?.kind === 'user').at(-1).text, topic)
+      assert.ok(transcript.some(event => event.type === 'assistant/message' && event.source?.provider === native.provider))
+      const calls = transcript.filter(event => event.type === 'tool/call').map(event => event.name)
+      assert.ok(calls.includes('drama_save_artifact'))
+      assert.ok(calls.every(name => !['drama_context', 'drama_query'].includes(name)), calls.join(', '))
+      assert.match(artifact.content, new RegExp(aspectRatio.replace(':', '[:：]'), 'u'))
+      assert.match(artifact.content, /24\s*(?:秒|s\b)/u)
+      assert.match(artifact.content, aspectRatio === '16:9' ? /横屏|横向|横幅/u : /竖屏|纵向|竖幅/u)
+      assert.equal((await operate(page, ticket, 'context', {})).connected, false)
+      await operate(page, ticket, 'bind', { operationId: randomUUID() })
+      assert.equal((await query(page, ticket)).nodes.length, 0)
+      assert.equal((await operate(page, ticket, 'tasks', {})).tasks.length, 0)
+      plans.push({ model: native.model, productionSpec: native.context.productionSpec, calls, content: artifact.content })
+    }
+    const report = { topic, provider: 'deepseek-official', plans, canvasNodes: 0, videoTasks: 0 }
+    if (process.env.DRAMA_WORKFLOW_REAL_EVIDENCE) await writeFile(process.env.DRAMA_WORKFLOW_REAL_EVIDENCE, JSON.stringify(report, null, 2) + '\n')
+    console.info('Native topic plans saved with injected specs: ' + plans.map(plan => plan.model + ' ' + plan.productionSpec.aspectRatio).join(', ') + '; no Canvas lookup or video tasks')
+  }, { newWorkspaces: true, realWorkflow: true, workflowFixture: true })
+})
+
 test('Workflow dock separates Canvas video authorization from final film approval', { timeout: 160_000, skip: !hasVideo }, async () => {
   await withWeb(async ({ page, records, home }) => {
     const [record, peer, seed] = records
@@ -1457,14 +1604,16 @@ test('Workflow dock separates Canvas video authorization from final film approva
   }, { providerFixture: true, workflowFixture: true })
 })
 
-test('U1 native composer menu and Canvas shell', { timeout: 75_000 }, async () => {
+test('U1 native composer settings and Canvas shell', { timeout: 75_000 }, async () => {
   await withWeb(async ({ page, records, home }) => {
     const [a] = records
     await select(page, a)
-    await menu(page).click()
-    await page.getByText('打开项目画布', { exact: true }).waitFor()
-    await screenshot(page, '10-after-composer-menu.png')
-    await page.getByText('打开项目画布', { exact: true }).click()
+    await productionEntry(page).click()
+    const production = productionDialog(page)
+    await production.waitFor()
+    await screenshot(page, '10-after-composer-settings.png')
+    await production.getByRole('button', { name: '关闭制作设置', exact: true }).click()
+    await drama(page).click()
     await panel(page).waitFor()
     await flow(page).waitFor()
     await assertCanvasLayout(page)
@@ -2794,6 +2943,63 @@ async function configureVideoFixture(page) {
   })
   return { settings, configured }
 }
+
+test('Canvas displays saved project aspect and explicit node overrides without rewriting prior drafts', {
+  timeout: 75_000,
+}, async () => {
+  await withWeb(async ({ page, records }) => {
+    const [record] = records
+    const settings = (action, data) => ok(page, 'providers', { action, data })
+    const channels = await settings('channel_save', {
+      channel: { name: '画幅测试渠道', protocol: 'openai-video', baseUrl: 'https://video.invalid' },
+      apiKey: 'fixture-only',
+    })
+    const { profiles: [profile] } = await settings('provider_save', {
+      revision: channels.revision,
+      profile: {
+        name: '画幅测试预设', channelId: channels.channels[0].id, model: 'fixture-video', modes: ['t2v'],
+        defaults: { aspectRatio: '16:9' }, limits: { aspectRatios: ['16:9', '9:16'] },
+      },
+    })
+    await select(page, record)
+    await open(page, record)
+    const ticket = await ticketFor(page, record.sessionId)
+    const save = aspectRatio => operate(page, ticket, 'production_settings_save', {
+      operationId: randomUUID(), productionSpec: { aspectRatio, targetDurationSeconds: 45 },
+    })
+    const draft = (title, params) => ({
+      id: randomUUID(), type: 'video', content: {
+        title, mode: 't2v', profileId: profile.id, prompt: '夜班店员捡到一张旧车票，抬头望向窗外。', params,
+      },
+    })
+    const historical = draft('原有视频节点', { aspectRatio: '16:9' })
+    await append(page, ticket, [historical])
+    await save('9:16')
+    const inherited = draft('沿用项目画幅')
+    const overridden = draft('覆盖项目画幅', { aspectRatio: '16:9' })
+    await append(page, ticket, [inherited, overridden])
+    await save('16:9')
+    const nodes = new Map((await query(page, ticket)).nodes.map(node => [node.id, node]))
+    assert.equal(nodes.get(historical.id).content.productionAspectRatio, undefined)
+    assert.equal(nodes.get(historical.id).content.params.aspectRatio, '16:9')
+    assert.equal(nodes.get(inherited.id).content.productionAspectRatio, '9:16')
+    assert.equal(nodes.get(inherited.id).content.params?.aspectRatio, undefined)
+    assert.equal(nodes.get(overridden.id).content.productionAspectRatio, '9:16')
+    assert.equal(nodes.get(overridden.id).content.params.aspectRatio, '16:9')
+
+    for (const [node, note] of [[inherited, '项目默认 9:16'], [overridden, '节点覆盖 16:9']]) {
+      await card(page, node.id).locator('.drama-node-titlebar').click()
+      const editor = nodeEditor(page, node.id)
+      const aspect = editor.getByRole('button', { name: '画幅', exact: true })
+      await poll(async () => (await aspect.getAttribute('title')) === note, '画幅来源未正确显示')
+      await editor.getByRole('button', { name: '生成…', exact: true }).click()
+      const dialog = page.getByRole('dialog', { name: '确认生成', exact: true })
+      await dialog.getByText(new RegExp(note, 'u')).waitFor()
+      await dialog.getByRole('button', { name: '取消', exact: true }).click()
+    }
+    assert.deepEqual((await operate(page, ticket, 'tasks', {})).tasks, [])
+  })
+})
 
 test('Open Canvas confirmation requires fresh approval after a provider change in another page', {
   timeout: 120_000, skip: !hasVideo,

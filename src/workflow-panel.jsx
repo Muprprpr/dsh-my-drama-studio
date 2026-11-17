@@ -549,7 +549,7 @@ function Package({ packageData, handoffHistory = [], stageLabel, sessionLabel, t
       <dt>来源会话</dt><dd title={sourceSessionId}>{sessionLabel(sourceSessionId)}</dd>
       {confirmedAt && sourceRevision !== undefined && <><dt>正式交接版本</dt><dd>{sourceRevision}</dd></>}
       {confirmedAt && <><dt>确认时间</dt><dd>{formatDate(confirmedAt)}</dd></>}
-      {packageData.stale && <><dt>状态</dt><dd>上游已更新，此交接已过期</dd></>}
+      {packageData.stale && <><dt>状态</dt><dd>制作规格或上游依据已变更，请重新核对交接。</dd></>}
     </dl>
     {summary && <div className="drama-handoff-block">
       <h4>摘要</h4><MarkdownText text={summary} labels={markdownLabels} />
@@ -579,6 +579,10 @@ function Package({ packageData, handoffHistory = [], stageLabel, sessionLabel, t
           <dl className="drama-handoff-metadata">
             <dt>原稿依据</dt><dd><HandoffBasis inputs={review.previousInputs} history={handoffHistory} stageLabel={stageLabel} /></dd>
             <dt>当前依据</dt><dd><HandoffBasis inputs={review.currentInputs} history={handoffHistory} stageLabel={stageLabel} /></dd>
+            {review.previousProductionSpec && review.currentProductionSpec && <>
+              <dt>原稿制作规格</dt><dd>{formatProductionSpec(review.previousProductionSpec)}</dd>
+              <dt>当前制作规格</dt><dd>{formatProductionSpec(review.currentProductionSpec)}</dd>
+            </>}
           </dl>
         </section>
       })}
@@ -594,6 +598,10 @@ function Package({ packageData, handoffHistory = [], stageLabel, sessionLabel, t
       </dl>
     </details>
   </>
+}
+
+function formatProductionSpec({ aspectRatio, targetDurationSeconds }) {
+  return (aspectRatio || '画幅未设置') + ' · ' + (targetDurationSeconds ? targetDurationSeconds + ' 秒' : '时长未设')
 }
 
 function HandoffBasis({ inputs, history, stageLabel }) {

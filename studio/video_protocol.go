@@ -138,7 +138,7 @@ func videoDimensions(params VideoParams) (int, int, error) {
 		return 0, 0, errors.New("该协议需要明确的输出画幅，例如 16:9")
 	}
 	if width, height, ok := splitDimensions(resolution, "x"); ok && width <= 8192 && height <= 8192 {
-		if hasRatio && (width*ratioH*100 < height*ratioW*98 || width*ratioH*100 > height*ratioW*102) {
+		if hasRatio && !videoRatioMatches(width, height, ratioW, ratioH) {
 			return 0, 0, errors.New("配置的画幅与分辨率不匹配")
 		}
 		return width, height, nil
@@ -158,6 +158,10 @@ func videoDimensions(params VideoParams) (int, int, error) {
 		}
 	}
 	return 0, 0, errors.New("该协议的分辨率需为 WIDTHxHEIGHT，或与明确画幅一起填写，例如 720p 和 16:9")
+}
+
+func videoRatioMatches(width, height, ratioW, ratioH int) bool {
+	return width > 0 && height > 0 && width*ratioH*100 >= height*ratioW*98 && width*ratioH*100 <= height*ratioW*102
 }
 
 func splitDimensions(raw, separator string) (int, int, bool) {

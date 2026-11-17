@@ -217,13 +217,32 @@ function inheritsFirstFrameRatio(profile, mode) {
   return profile?.provider === 'minimax-h3' && mode === 'i2v'
 }
 
-function paramSummary(profile, generationDefaults, overrides, mode) {
+function productionRatioUsesFirstFrame(profile, mode) {
+  if (inheritsFirstFrameRatio(profile, mode)) return true
+  if (mode !== 'i2v' || !['ark', 'byteplus'].includes(profile?.provider)) return false
+  const model = (profile.provider === 'ark' ? 'doubao-' : 'dreamina-') + 'seedance-2-5-260628'
+  return profile.arkFamily === 'seedance-2.5' || profile.model === model
+}
+
+function aspectSummary(profile, generationDefaults, override, mode, productionRatio) {
+  const target = productionRatio ? '项目目标 ' + productionRatio : ''
+  if (productionRatioUsesFirstFrame(profile, mode)) {
+    if (override === 'adaptive' && !inheritsFirstFrameRatio(profile, mode)) return '继承首帧画幅 · 节点覆盖'
+    if (inheritsFirstFrameRatio(profile, mode) || !override) {
+      return ['继承首帧画幅', target].filter(Boolean).join(' · ')
+    }
+  }
+  if (override) return '节点覆盖 ' + override
+  if (productionRatio) return '项目默认 ' + productionRatio
+  return modelValue(profile, 'aspectRatio', generationDefaults) ?? profile?.aspectRatio
+}
+
+function paramSummary(profile, generationDefaults, overrides, mode, productionRatio) {
   const duration = overrides?.duration ?? modelValue(profile, 'duration', generationDefaults) ?? profile?.duration
   const audio = overrides?.generateAudio ?? modelValue(profile, 'generateAudio', generationDefaults)
   return [
     overrides?.resolution ?? modelValue(profile, 'resolution', generationDefaults),
-    inheritsFirstFrameRatio(profile, mode) ? '继承首帧画幅' :
-      overrides?.aspectRatio ?? modelValue(profile, 'aspectRatio', generationDefaults) ?? profile?.aspectRatio,
+    aspectSummary(profile, generationDefaults, overrides?.aspectRatio, mode, productionRatio),
     duration === -1 ? '自动时长' : duration > 0 ? duration + ' 秒' : '',
     audio == null ? '' : audio ? '生成音频' : '关闭音频生成',
   ].filter(Boolean)
@@ -275,7 +294,7 @@ function GenerateControl({ node, profile, generationDefaults, providerVersion, p
       </>}>
       {!stale && profile && <>
         <p className="drama-node-dialog-summary">{[profile.name, profile.model,
-          ...paramSummary(profile, generationDefaults, node.content.params, mode)].join(' · ')}</p>
+          ...paramSummary(profile, generationDefaults, node.content.params, mode, node.content.productionAspectRatio)].join(' · ')}</p>
         {profile.channelLabel && <p className="drama-node-caption" data-testid="drama-generation-channel">{profile.channelLabel}</p>}
       </>}
       {stale && <p className="drama-node-form-error" role="alert">本次生成确认已失效，请关闭后重新确认。</p>}
@@ -484,28 +503,37 @@ function inlineReferenceIssue(prompt, kinds) {
   return ''
 }
 
-function generationParameters(value, profile, generationDefaults, mode) {
+function generationParameters(value, profile, generationDefaults, mode, productionRatio) {
   const choices = { duration: profile?.limits?.durations, resolution: profile?.limits?.resolutions,
     aspectRatio: profile?.limits?.aspectRatios, generateAudio: ['true', 'false'] }
   return Object.entries(generationFields).flatMap(([key, label]) => {
     const selected = value[key] ?? ''
     if (!profile?.parameters?.includes(key)) return []
-    const fixed = key === 'aspectRatio' && inheritsFirstFrameRatio(profile, mode)
-    const inherited = modelValue(profile, key, generationDefaults)
+    const firstFrame = key === 'aspectRatio' && productionRatioUsesFirstFrame(profile, mode)
+    const fixed = firstFrame && (inheritsFirstFrameRatio(profile, mode) ||
+      choices.aspectRatio?.length && !choices.aspectRatio.includes('adaptive'))
+    const projectDefault = key === 'aspectRatio' && productionRatio
+    const inherited = projectDefault || modelValue(profile, key, generationDefaults)
     const format = entry => key === 'generateAudio' ? (String(entry) === 'true' ? '音频开' : '音频关') :
-      key === 'duration' ? (String(entry) === '-1' ? '自动时长' : entry + ' 秒') : String(entry)
-    const placeholder = inherited == null ? '模型默认' : '默认 · ' + format(inherited)
+      key === 'duration' ? (String(entry) === '-1' ? '自动时长' : entry + ' 秒') :
+        firstFrame && entry === 'adaptive' ? '继承首帧画幅' : String(entry)
+    const placeholder = projectDefault ? '项目默认 · ' + format(inherited)
+      : inherited == null ? '模型默认' : '默认 · ' + format(inherited)
     const effective = selected || inherited
-    const summary = fixed ? '继承首帧画幅' : effective == null || effective === ''
+    const summary = firstFrame && (fixed || !selected || selected === 'adaptive')
+      ? aspectSummary(profile, generationDefaults, selected, mode, productionRatio) : effective == null || effective === ''
       ? label + ' · 默认' : format(effective)
+    const detail = key === 'aspectRatio' && (selected || projectDefault)
+      ? aspectSummary(profile, generationDefaults, selected, mode, productionRatio) : undefined
     const numeric = key === 'duration'
     const durationStops = numeric ? [...new Set((choices.duration ?? []).filter(item => durationAllowed(profile, item)))]
       .sort((a, b) => a - b) : []
-    const options = (numeric ? durationStops : choices[key] ?? []).map(item => ({ id: String(item), label: format(item) }))
-    if (selected && options.length && !options.some(item => item.id === selected)) {
+    const options = (numeric ? durationStops : firstFrame ? ['adaptive'] : choices[key] ?? [])
+      .map(item => ({ id: String(item), label: format(item) }))
+    if (!firstFrame && selected && options.length && !options.some(item => item.id === selected)) {
       options.push({ id: selected, label: format(selected) })
     }
-    return [{ key, label, selected, inherited, placeholder, summary, fixed, numeric, options, durationStops,
+    return [{ key, label, selected, inherited, placeholder, summary, detail, fixed, numeric, options, durationStops,
       hasDurationStops: numeric && Boolean(choices.duration?.length),
       acceptDuration: numeric ? value => durationAllowed(profile, value) : undefined,
       min: numeric ? profile.limits?.durationMin || (['ark', 'byteplus'].includes(profile.provider) ? -1 : 1) : undefined,
@@ -513,8 +541,8 @@ function generationParameters(value, profile, generationDefaults, mode) {
   })
 }
 
-function GenerationParams({ value, update, profile, generationDefaults, mode }) {
-  return generationParameters(value, profile, generationDefaults, mode).filter(param => !param.fixed).map(param =>
+function GenerationParams({ value, update, profile, generationDefaults, mode, productionRatio }) {
+  return generationParameters(value, profile, generationDefaults, mode, productionRatio).filter(param => !param.fixed).map(param =>
     param.numeric ? <div key={param.key} className="drama-node-field"><span>{param.label}</span>
       <DurationControl param={param} update={next => update(param.key, next)} />
     </div> : param.options.length ? <MenuSelect key={param.key} label={param.label} value={param.selected}
@@ -712,7 +740,8 @@ function NodeEditor({
   const referenceMode = type === 'image' ? 't2i' : type === 'video' ? mode : ''
   const currentProfiles = profileCandidates(generationProfiles, referenceMode)
   const activeProfile = resolveProfile(currentProfiles, profileId)
-  const parameters = generationParameters(overrides, activeProfile, generationDefaults, mode)
+  const productionRatio = edit && type === 'video' ? content.productionAspectRatio : undefined
+  const parameters = generationParameters(overrides, activeProfile, generationDefaults, mode, productionRatio)
   const formLabel = edit ? '编辑节点' : duplicate ? '复制为新节点' : base ? '另存为新版本' : '新建节点'
   const choices = [{ id: '', label: '使用默认预设' },
     ...(profileId && !currentProfiles.some(item => item.id === profileId) ? [{ id: profileId, label: '原预设不可用' }] : []),
@@ -1073,10 +1102,15 @@ function NodeEditor({
                   title: activeProfile?.model }, ...choices.slice(1)]}
                 onChange={changeProfile} />
             </div>
-            {parameters.length > 0 && <div className="drama-node-parameter-chips" role="group" aria-label="有效生成参数">
+            {(parameters.length > 0 || productionRatio) && <div className="drama-node-parameter-chips" role="group" aria-label="有效生成参数">
+              {productionRatio && !parameters.some(param => param.key === 'aspectRatio') &&
+                <span className="drama-focus-param-chip is-fixed">
+                  {aspectSummary(activeProfile, generationDefaults, overrides.aspectRatio, mode, productionRatio)}
+                </span>}
               {parameters.map(param => param.fixed
                 ? <span className="drama-focus-param-chip is-fixed" key={param.key} title={param.label}>{param.summary}</span>
-                : <NodeParameterPopover key={param.key} label={param.label} value={param.summary} disabled={blocked}
+                : <NodeParameterPopover key={param.key} label={param.label} value={param.summary} title={param.detail}
+                  disabled={blocked}
                   open={!blocked && openParameter === param.key} onToggle={() => setOpenParameter(current => current === param.key ? '' : param.key)}
                   onClose={() => setOpenParameter(current => current === param.key ? '' : current)}>
                   {param.numeric ? <DurationControl param={param} update={next => updateParam(param.key, next)} />
@@ -1201,10 +1235,12 @@ function NodeEditor({
           <MenuSelect label="生成预设" value={profileId} onChange={changeProfile} items={choices}
             disabled={type === 'video' && !mode} />
           {activeProfile && <span className="drama-node-caption">
-            {[activeProfile.model, ...paramSummary(activeProfile, generationDefaults, undefined, mode)].join(' · ')}
+            {[activeProfile.model, ...paramSummary(activeProfile, generationDefaults,
+              { aspectRatio: overrides.aspectRatio }, mode, productionRatio)].join(' · ')}
           </span>}
           <div className="drama-node-parameter-fields">
             <GenerationParams value={overrides} profile={activeProfile} generationDefaults={generationDefaults} mode={mode}
+              productionRatio={productionRatio}
               update={(key, value) => { setDirty(true); setOverrides(current => ({ ...current, [key]: value })) }} />
           </div>
         </>}

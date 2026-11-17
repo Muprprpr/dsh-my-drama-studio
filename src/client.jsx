@@ -2,10 +2,11 @@ import React, { useCallback, useEffect, useMemo, useState, useSyncExternalStore 
 import { CanvasViewport } from './canvas.jsx'
 import { videoMode } from './canvas-node.jsx'
 import { ProviderSettings, protocols } from './provider-settings.jsx'
+import { ProductionSettings } from './production-settings.jsx'
 import { SkillsLibrary, WorkflowSkillBindings } from './skill-settings.jsx'
 import { installWorkflowStyle, WorkflowArtifacts, WorkflowProgress } from './workflow-panel.jsx'
 import {
-  Button, IconChevronDownOutlineRegular, IconPanelLeftOutlineRegular, Menu, MenuItemButton, StateDot, Switch, Tooltip,
+  Button, StateDot, Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import shellStyle from './studio-shell.css'
 import { generateT2V, generateI2V, generateR2V, generateV2V, initialize, mediaURL, operation, providerRequest, subscribe, uploadMedia } from './studio-api.js'
@@ -119,11 +120,10 @@ function SessionCanvasControl({ sessionId, sidebar, useWorkspaces }) {
   const { session, error: sessionError } = useStudioSession(sessionId, active)
   const [pending, setPending] = useState(false)
   const [error, setError] = useState('')
-  const [menuOpen, setMenuOpen] = useState(false)
-  const closeMenu = useCallback(() => setMenuOpen(false), [])
   const workspaceTitle = useWorkspaces(snapshot => snapshot.items.find(item => item.workspaceId === session?.status.workspaceId)?.title)
+  const refreshSession = useCallback(() => notify(sessionId), [sessionId])
 
-  async function run(action, enabled) {
+  async function run(action) {
     setPending(true)
     setError('')
     try {
@@ -133,19 +133,13 @@ function SessionCanvasControl({ sessionId, sidebar, useWorkspaces }) {
         notify(sessionId)
         return
       }
-      if (action === 'permission') {
-        await operation(captured.ticket, 'permission', {
-          operationId: crypto.randomUUID(), enabled,
-        })
-        notify(sessionId)
-        return
-      }
       if (!captured.status.connected) {
         await operation(captured.ticket, 'bind', { operationId: crypto.randomUUID() })
         notify(sessionId)
       }
       openStudioTab(sidebar, sessionId, canvasKind)
     } catch (failure) {
+      if (action === 'disconnect') throw failure
       setError(failure.message)
     } finally {
       setPending(false)
@@ -157,36 +151,15 @@ function SessionCanvasControl({ sessionId, sidebar, useWorkspaces }) {
   const mode = connected ? automatic ? '自动' : '手动' : ''
   const issue = error || sessionError
   return <span className="drama-entry">
-    <Menu open={active && menuOpen} onClose={closeMenu} side="top" portal compact
-      listClassName="drama-entry-menu"
-      anchor={<span className="drama-entry-split">
-        <Tooltip portal side="top" label={connected ? '打开项目画布' : '连接并打开项目画布'}>
-          <Button aria-label="Drama" size="sm" disabled={pending} className="drama-entry-main"
-            onClick={() => { closeMenu(); void run('open') }}>
-            Drama{connected && <span className="drama-entry-mode" data-testid="drama-permission"> · {mode}</span>}
-          </Button>
-        </Tooltip>
-        <Tooltip portal side="top" label="Drama 设置">
-          <Button size="sm" aria-label="Drama 设置" aria-haspopup="menu" aria-expanded={active && menuOpen}
-            className="drama-entry-caret" onClick={() => setMenuOpen(value => !value)}>
-            <IconChevronDownOutlineRegular size={12} />
-          </Button>
-        </Tooltip>
-      </span>}
-      items={[{ id: 'workspace', type: 'label', text: workspaceTitle || '项目画布' }]}>
-      <MenuItemButton disabled={pending} icon={<IconPanelLeftOutlineRegular />}
-        onSelect={() => { closeMenu(); void run('open') }}>打开项目画布</MenuItemButton>
-      <div className="drama-entry-permission" role="presentation">
-        <div>
-          <span>自动执行生成</span>
-          <small>{!connected ? '连接后可授权' : automatic ? 'Agent 可以提交生成任务' : '仅允许手动确认生成'}</small>
-        </div>
-        <Switch label="自动执行生成" checked={automatic} disabled={!connected || pending}
-          onChange={next => { void run('permission', next) }} />
-      </div>
-      {connected && <MenuItemButton danger separatorBefore disabled={pending}
-        onSelect={() => { closeMenu(); void run('disconnect') }}>断开当前会话</MenuItemButton>}
-    </Menu>
+    <Tooltip portal side="top" label={connected ? '打开项目画布' : '连接并打开项目画布'}>
+      <Button aria-label="Drama" size="sm" disabled={pending} className="drama-entry-main"
+        onClick={() => { void run('open') }}>
+        Drama{connected && <span className="drama-entry-mode" data-testid="drama-permission"> · {mode}</span>}
+      </Button>
+    </Tooltip>
+    {active && session?.status.workspaceId && <ProductionSettings key={session.ticket}
+      ticket={session.ticket} workspaceTitle={workspaceTitle} onSaved={refreshSession}
+      onDisconnect={connected ? () => run('disconnect') : undefined} />}
     {issue && <span role="alert" className="drama-entry-error" title={issue}>{issue}</span>}
   </span>
 }

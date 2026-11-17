@@ -17,6 +17,16 @@
 | `video-generation` | 视频生成 | `drama-video-generation` | `stages/video-generation/harness.md` |
 | `final-review` | 成片验收 | `drama-final-review` | `stages/final-review/harness.md` |
 
+### 制作设置
+
+选中 Workspace 后，可在原生输入栏打开 **制作设置**。成片画幅支持横屏 16:9 和竖屏 9:16，目标成片时长按秒填写，两项均可留空。制作规格保存在 Workspace 的 `.drama-studio/studio.db`，同项目的 Session 共享。保存规格无需激活阶段、连接 Canvas 或配置视频渠道。
+
+Host 在原生阶段回合准入时固定 `productionSpec` 并注入系统提示，选题等没有前置交接的首阶段也能直接读取。工作稿依据 `input_key` 记录成片画幅、目标成片时长及正式上游交接 ID。只改生成许可或保存相同规格时，工作稿与交接保持有效。规格变化后，已运行的回合仍按原依据读写，下一回合读取新规格。旧稿可回看，正式交接标记为需重核。跨规格复用草稿时，交接预览列出原规格和当前规格。
+
+成片画幅是规划最终影片的依据。三视图、分镜板和参考资产各自选择画幅。已设项目画幅时，新视频节点默认继承创建时使用的画幅，节点可显式覆盖。目标成片时长用于全片节奏，生成模型的片段时长仍在节点和模型预设中安排。渠道在生成任务准入时按原有协议验证和映射参数。已保存节点、提交快照和结果文件保留原记录。
+
+**自动执行生成** 是当前 Session 的临时许可。预设许可不发起工作流或生成任务。已连接 Canvas 的普通聊天可在指定节点范围内自动提交，涉及工作流部署的节点须属于有效的正式部署。工作流阶段仍通过 Canvas 独立授权生成，并以该授权对应的节点版本核验产物。自动提交按入队时的许可检查。关闭后既有任务继续执行，可使用任务列表取消。
+
 ### 全局装填
 
 仓库和 npm 包用 `resources/manifest.json` 分发 `resources/skills/` 及 `resources/workflows/` 中的官方文件。Host 加载插件时，使用原生 Profile 上下文解析出的 Home 装填。全局文件按 Home 共享，Workspace 记录各自的进度、产物、交接和会话。
@@ -113,7 +123,7 @@ node --test --test-name-pattern '^Workflow dock' tests/web.mjs
 node tests/agent-fixture.mjs
 ```
 
-为视频专项设置 `DRAMA_UIUX_VIDEO` 指向本地 MP4。启用 `DRAMA_REAL_WORKFLOW=1` 并在测试进程提供 `DEEPSEEK_API_KEY` 可调用真实模型。设置 `DRAMA_WORKFLOW_REAL_EVIDENCE` 可输出精简轨迹，设置 `DRAMA_UIUX_CAPTURE=1` 与 `DRAMA_UIUX_CAPTURE_DIR` 可输出截图。
+为视频专项设置 `DRAMA_UIUX_VIDEO` 指向本地 MP4。启用 `DRAMA_REAL_WORKFLOW=1` 并在测试进程提供 `DEEPSEEK_API_KEY` 可调用真实模型，也可用 `DRAMA_DEEPSEEK_CREDENTIALS_FILE` 指定本机 DSH 的凭据文件。用 `node --test --test-name-pattern '^Workspace production settings guide real DeepSeek' tests/web.mjs` 单独核验同一选题的横竖屏原生回合。设置 `DRAMA_WORKFLOW_REAL_EVIDENCE` 可输出精简轨迹，设置 `DRAMA_UIUX_CAPTURE=1` 与 `DRAMA_UIUX_CAPTURE_DIR` 可输出截图。
 
 ## 修改文件
 

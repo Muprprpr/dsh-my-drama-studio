@@ -82,9 +82,10 @@ function route(ctx, path, run, method = 'POST', rawBody = false) {
 const humanEdits = new Set(['update_node', 'delete_node', 'update_edge', 'delete_edge', 'canvas_delete', 'canvas_restore'])
 const workflowActions = new Set(['workflow_handoff_preview'])
 const manualSubmissions = new Set(['submit_manual', 'generateT2V', 'generateI2V', 'generateR2V', 'generateV2V'])
+const productionSettingsActions = new Set(['production_settings_get', 'production_settings_save'])
 const browserActions = new Set(['context', 'bind', 'disconnect', 'query', 'append', 'permission', 'tasks',
   'cancel_task', 'resume_task', 'workflow_get', 'workflow_profile_select', 'workflow_activate', 'workflow_handoff_confirm', 'workflow_handoff_retry',
-  ...humanEdits, ...workflowActions, ...manualSubmissions])
+  ...humanEdits, ...workflowActions, ...manualSubmissions, ...productionSettingsActions])
 
 export async function apply(ctx, config) {
   const activity = new EventEmitter().setMaxListeners(0)
@@ -201,7 +202,7 @@ export async function apply(ctx, config) {
     if (action === 'workflow_activate') return workflow.activate(sessionId, workspace, keys(input, 'operationId', 'stageId'))
     if (action === 'workflow_handoff_confirm') return workflow.confirm(sessionId, workspace, keys(input, 'operationId', 'handoffId'))
     if (action === 'workflow_handoff_retry') return workflow.retry(sessionId, workspace, keys(input, 'handoffId').handoffId)
-    if (humanEdits.has(action) || workflowActions.has(action) || action === 'append') {
+    if (humanEdits.has(action) || workflowActions.has(action) || productionSettingsActions.has(action) || action === 'append') {
       return kernel(sessionId, workspace, action, input, undefined, 'human')
     }
     if (manualSubmissions.has(action)) {

@@ -76,6 +76,9 @@ CREATE TABLE IF NOT EXISTS workflow_migrations (name TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS workflow_profile (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), profile_id TEXT NOT NULL, definition_version INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS workspace_production (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1), aspect_ratio TEXT NOT NULL, target_duration_seconds INTEGER
+);
 DROP TRIGGER IF EXISTS nodes_no_update;
 DROP TRIGGER IF EXISTS nodes_no_delete;
 DROP TRIGGER IF EXISTS edges_no_update;
@@ -296,6 +299,9 @@ func (s *Service) Execute(ctx context.Context, r Request) (any, error) {
 	if strings.HasPrefix(r.Action, "workflow_") {
 		return s.executeWorkflow(ctx, r)
 	}
+	if r.Action == "production_settings_get" || r.Action == "production_settings_save" {
+		return s.executeProductionSettings(ctx, r)
+	}
 	var op operation
 	switch r.Action {
 	case "bind", "disconnect":
@@ -394,7 +400,8 @@ func (p *project) writeChecked(ctx context.Context, r Request, opID string, appl
 	if err != nil {
 		return nil, err
 	}
-	if !status.Connected && r.Action != "bind" && r.Action != "disconnect" && !strings.HasPrefix(r.Action, "workflow_") {
+	if !status.Connected && r.Action != "bind" && r.Action != "disconnect" &&
+		r.Action != "production_settings_save" && !strings.HasPrefix(r.Action, "workflow_") {
 		return nil, notBound
 	}
 	var session, action string
