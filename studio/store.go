@@ -111,6 +111,7 @@ type project struct {
 	mu                sync.Mutex
 	changed           chan struct{}
 	workflowTurnLocks map[string]func()
+	hashVideoMedia    func(context.Context, *os.File) (string, error)
 }
 
 var videoActions = map[string]string{
@@ -404,17 +405,8 @@ func (p *project) writeChecked(ctx context.Context, r Request, opID string, appl
 		r.Action != "production_settings_save" && !strings.HasPrefix(r.Action, "workflow_") {
 		return nil, notBound
 	}
-	var session, action string
-	var old string
-	err = tx.QueryRowContext(ctx, "SELECT session_id,action,result FROM operations WHERE id=?", opID).Scan(&session, &action, &old)
-	if err == nil {
-		if session != r.SessionID || action != r.Action {
-			return nil, &requestError{http.StatusConflict, "operationId 已用于另一操作"}
-		}
-		return json.RawMessage(old), nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
+	if old, err := readOperation(ctx, tx, r, opID); err != nil || old != nil {
+		return old, err
 	}
 	result, err := apply(tx, status)
 	if err != nil {
@@ -438,6 +430,21 @@ func (p *project) writeChecked(ctx context.Context, r Request, opID string, appl
 	}
 	p.notify()
 	return result, nil
+}
+
+func readOperation(ctx context.Context, tx *sql.Tx, r Request, opID string) (json.RawMessage, error) {
+	var session, action, old string
+	err := tx.QueryRowContext(ctx, "SELECT session_id,action,result FROM operations WHERE id=?", opID).Scan(&session, &action, &old)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if session != r.SessionID || action != r.Action {
+		return nil, &requestError{http.StatusConflict, "operationId 已用于另一操作"}
+	}
+	return json.RawMessage(old), nil
 }
 
 func (p *project) notify() {

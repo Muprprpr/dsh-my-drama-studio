@@ -46,8 +46,8 @@ func run() error {
 		return err
 	}
 	service := studio.New(providers)
-	defer service.Close()
 	if err := service.ConfigureHostActivity(os.Getenv("DRAMA_STUDIO_ACTIVITY_URL"), token); err != nil {
+		_ = service.Close()
 		return err
 	}
 	workerDone := make(chan struct{})
@@ -55,32 +55,46 @@ func run() error {
 		defer close(workerDone)
 		service.Run(ctx)
 	}()
-	defer func() {
-		stop()
-		<-workerDone
-	}()
 	server := &http.Server{
 		Handler: service.Handler(token), ReadHeaderTimeout: 5 * time.Second,
 		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
-	shutdown := make(chan error, 1)
+	serveDone := make(chan error, 1)
 	go func() {
-		<-ctx.Done()
-		deadline, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		err := server.Shutdown(deadline)
-		if err != nil {
-			_ = server.Close()
-		}
-		shutdown <- err
+		serveDone <- server.Serve(listener)
 	}()
 
 	fmt.Printf("http://%s\n", listener.Addr())
-	err = server.Serve(listener)
-	if errors.Is(err, http.ErrServerClosed) {
-		return <-shutdown
+	var serveErr error
+	select {
+	case <-ctx.Done():
+	case serveErr = <-serveDone:
+		stop()
 	}
-	return err
+	if errors.Is(serveErr, http.ErrServerClosed) {
+		serveErr = nil
+	}
+
+	// HTTP and Worker drain concurrently within the kernel's total budget.
+	drain, cancelDrain := context.WithTimeout(context.Background(), studio.GenerationShutdownTimeout)
+	defer cancelDrain()
+	httpDrain, cancelHTTPDrain := context.WithTimeout(drain, 5*time.Second)
+	shutdownErr := server.Shutdown(httpDrain)
+	cancelHTTPDrain()
+	if shutdownErr != nil {
+		_ = server.Close()
+	}
+	cleanup := make(chan error, 1)
+	go func() {
+		<-workerDone
+		cleanup <- service.Close()
+	}()
+	select {
+	case closeErr := <-cleanup:
+		return errors.Join(serveErr, shutdownErr, closeErr)
+	case <-drain.Done():
+		return errors.Join(serveErr, shutdownErr, errors.New("Studio Go shutdown budget exhausted"))
+	}
 }
 
 func main() {

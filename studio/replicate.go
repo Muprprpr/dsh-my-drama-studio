@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/textproto"
 	"net/url"
+	"os"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -250,7 +251,7 @@ func (p *replicateProvider) Submit(ctx context.Context, input GenerationInput) (
 				references[index] = ref.URL
 				continue
 			}
-			file, mediaType, err := p.openReplicateImage(input, ref)
+			file, mediaType, err := openReplicateImage(p.profile, input, ref, false)
 			if err != nil {
 				return ProviderSubmission{Rejected: true}, fmt.Errorf("参考图 %d: %w", index+1, err)
 			}
@@ -392,13 +393,13 @@ func (p *replicateProvider) Download(ctx context.Context, result ProviderResult,
 	return err
 }
 
-func (p *replicateProvider) openReplicateImage(input GenerationInput, ref GenerationReference) (io.ReadCloser, string, error) {
+func openReplicateImage(profile ProviderProfile, input GenerationInput, ref GenerationReference, stable bool) (*os.File, string, error) {
 	limit := int64(replicateImageLimit)
-	isKling := strings.SplitN(p.profile.Model, ":", 2)[0] == klingOmniModel
+	isKling := strings.SplitN(profile.Model, ":", 2)[0] == klingOmniModel
 	if isKling {
 		limit = klingOmniImageLimit
 	}
-	file, mediaType, err := openImageReference(input, ref, limit)
+	file, mediaType, err := openImageReference(input, ref, limit, stable)
 	if err != nil {
 		return nil, "", err
 	}

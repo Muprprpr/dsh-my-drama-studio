@@ -252,6 +252,12 @@ func validateProfile(profile ProviderProfile) error {
 func (s *ProviderSettings) Prepare(input *GenerationInput, id string) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.prepareLocked(input, id)
+}
+
+// prepareLocked only selects and validates the routed configuration.
+// Workspace media is checked separately, after leaving the database transaction.
+func (s *ProviderSettings) prepareLocked(input *GenerationInput, id string) error {
 	if input.providerVersion != "" && input.providerVersion != s.version {
 		return &requestError{http.StatusConflict, "生成配置已更新，请重新打开生成确认"}
 	}
@@ -308,12 +314,12 @@ func (s *ProviderSettings) execute(ctx context.Context, action string, raw json.
 	return s.view(), nil
 }
 
-func openImageReference(input GenerationInput, ref GenerationReference, limit int64) (io.ReadCloser, string, error) {
+func openImageReference(input GenerationInput, ref GenerationReference, limit int64, stable bool) (*os.File, string, error) {
 	if ref.Type != "image" || !strings.HasPrefix(ref.Path, "assets/images/") ||
 		!filepath.IsLocal(ref.Path) || filepath.ToSlash(filepath.Clean(ref.Path)) != ref.Path {
 		return nil, "", errors.New("Invalid project image reference")
 	}
-	file, err := openProviderReference(input, ref, limit)
+	file, err := openProviderReference(input, ref, limit, stable)
 	if err != nil {
 		return nil, "", err
 	}

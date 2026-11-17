@@ -5,6 +5,10 @@ import { createServer } from 'node:http'
 import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
 
+// The Go kernel allows 10 seconds for its total shutdown, including receipt
+// persistence. Give the Windows child enough time to report its final state.
+const kernelKillTimeoutMs = 12_000
+
 export class StudioError extends Error {
   constructor(status, message) {
     super(message)
@@ -61,7 +65,7 @@ export async function startKernel(ctx, checkHumanWrite) {
   const closed = new Promise(resolve => child.once('close', resolve))
   ctx.effect(() => async () => {
     child.stdin.end()
-    const stop = setTimeout(() => child.kill(), 6000)
+    const stop = setTimeout(() => child.kill(), kernelKillTimeoutMs)
     try {
       await closed
     } finally {

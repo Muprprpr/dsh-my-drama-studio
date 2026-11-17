@@ -1,7 +1,9 @@
 package studio
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -69,68 +71,87 @@ func (p *project) submit(ctx context.Context, r Request, providers providerRegis
 	} else if err := decodeData(r.Data, &args); err != nil {
 		return nil, err
 	}
+	if err := args.operation.validate(); err != nil {
+		return nil, err
+	}
+
+	settings, _ := providers.(*ProviderSettings)
+	plan := func(tx *sql.Tx, status Status) (generationRequest, [sha256.Size]byte, error) {
+		request, err := p.planSubmission(ctx, tx, status, r, args, providers, expectedMode, providerVersion)
+		var credential [sha256.Size]byte
+		if err == nil && settings != nil {
+			credential = sha256.Sum256([]byte(settings.data.Keys[request.Profile.ChannelID]))
+		}
+		return request, credential, err
+	}
+	var request generationRequest
+	var credential [sha256.Size]byte
+	var baseline []byte
+	old, err := func() (json.RawMessage, error) {
+		if settings != nil {
+			settings.mu.RLock()
+			defer settings.mu.RUnlock()
+		}
+		tx, err := p.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+		if err != nil {
+			return nil, err
+		}
+		defer tx.Rollback()
+		status, err := getStatus(ctx, tx, r)
+		if err != nil {
+			return nil, err
+		}
+		if !status.Connected {
+			return nil, notBound
+		}
+		if old, err := readOperation(ctx, tx, r, args.ID); err != nil || old != nil {
+			return old, err
+		}
+		request, credential, err = plan(tx, status)
+		if err == nil {
+			baseline, err = json.Marshal(request)
+		}
+		return nil, err
+	}()
+	if err != nil || old != nil {
+		return old, err
+	}
+	if request.Type == "video" {
+		if err := p.prepareVideoMedia(ctx, args.NodeID, &request.GenerationInput); err != nil {
+			return nil, err
+		}
+	}
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+
+	// The settings lock covers only validation and commit. Media preflight and
+	// hashing above leave both the database and settings available.
+	if settings != nil {
+		settings.mu.RLock()
+		defer settings.mu.RUnlock()
+	}
 	return p.write(ctx, r, args.ID, func(tx *sql.Tx, status Status) (any, error) {
-		if r.Action == "submit" {
-			if !status.AutoGenerate {
-				return nil, automaticDisabled
+		current, currentCredential, err := plan(tx, status)
+		if err != nil {
+			var failure *requestError
+			if errors.As(err, &failure) && (failure.code == http.StatusBadRequest || failure.code == http.StatusServiceUnavailable) {
+				return nil, generationInputChanged
 			}
-			var stageRunning bool
-			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM workflow_turns WHERE session_id=? AND status='running')`,
-				r.SessionID).Scan(&stageRunning); err != nil {
-				return nil, err
-			}
-			if stageRunning {
-				return nil, &requestError{http.StatusForbidden, "工作流阶段需要在 Canvas 手动授权生成"}
-			}
+			return nil, err
 		}
-		kind, snapshot, revision, err := submissionNode(ctx, tx, args.NodeID)
+		currentPlan, err := json.Marshal(current)
 		if err != nil {
 			return nil, err
 		}
-		if args.ExpectedRevision != nil && *args.ExpectedRevision != revision {
-			return nil, revisionConflict
-		}
-		if kind == "video" {
-			if r.Action == "submit" {
-				if err := checkAutomaticVideoDraft(ctx, tx, snapshot, workflowRef{ID: args.NodeID, Revision: revision}); err != nil {
-					return nil, err
-				}
-			}
-		}
-		input, pinned, sourceIDs, err := generationInput(ctx, tx, p.dir, args.NodeID, kind, snapshot)
-		if err != nil {
-			return nil, err
-		}
-		if expectedMode != "" && (input.Type != "video" || input.Mode != expectedMode) {
-			return nil, invalid("当前视频节点的生成方式与请求不匹配")
-		}
-		if providers == nil {
-			return nil, providerUnavailable
-		}
-		if args.ProfileID == "" {
-			args.ProfileID = pinned
-		}
-		input.providerVersion = providerVersion
-		if err := providers.Prepare(&input, args.ProfileID); err != nil {
-			return nil, err
-		}
-		group, err := readSourceGroup(ctx, tx, args.NodeID)
-		if err != nil {
-			return nil, err
-		}
-		request := generationRequest{GenerationInput: input, SourceGroup: &group, SourceNodeIDs: sourceIDs,
-			SourceNodeRevision: revision, ManualConfirmation: r.Action != "submit"}
-		if kind == "video" {
-			request.VideoInputContract = videoInputContractVersion
-		}
-		encoded, err := json.Marshal(request)
-		if err != nil {
-			return nil, err
+		if !bytes.Equal(baseline, currentPlan) || currentCredential != credential {
+			return nil, generationInputChanged
 		}
 		now := time.Now().UTC().Format(time.RFC3339Nano)
-		task := Task{ID: uuid.NewString(), NodeID: args.NodeID, CreatedBySession: r.SessionID, Type: kind,
+		task := Task{ID: uuid.NewString(), NodeID: args.NodeID, CreatedBySession: r.SessionID, Type: request.Type,
 			Status: "pending", CreatedAt: now, UpdatedAt: now,
-			Mode: input.Mode, Provider: input.Profile.Provider, Model: input.Profile.Model, ChannelID: input.Profile.ChannelID}
+			Mode: request.Mode, Provider: request.Profile.Provider, Model: request.Profile.Model, ChannelID: request.Profile.ChannelID}
 		_, err = tx.ExecContext(ctx, `INSERT INTO tasks(id,node_id,session_id,type,status,input,created_at,updated_at)
   VALUES(?,?,?,?,?,?,?,?)`, task.ID, task.NodeID, task.CreatedBySession, task.Type, task.Status, string(encoded), now, now)
 		if err != nil {
@@ -142,6 +163,69 @@ func (p *project) submit(ctx context.Context, r Request, providers providerRegis
 			EventSeq int64 `json:"eventSeq"`
 		}{task, seq}, err
 	})
+}
+
+var generationInputChanged = &requestError{http.StatusConflict, "生成节点、素材连线或所用渠道已经变化，请核对当前输入后重新提交"}
+
+func (p *project) planSubmission(ctx context.Context, tx *sql.Tx, status Status, r Request, args submitArgs,
+	providers providerRegistry, expectedMode, providerVersion string) (generationRequest, error) {
+	if r.Action == "submit" {
+		if !status.AutoGenerate {
+			return generationRequest{}, automaticDisabled
+		}
+		var stageRunning bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM workflow_turns WHERE session_id=? AND status='running')`,
+			r.SessionID).Scan(&stageRunning); err != nil {
+			return generationRequest{}, err
+		}
+		if stageRunning {
+			return generationRequest{}, &requestError{http.StatusForbidden, "工作流阶段需要在 Canvas 手动授权生成"}
+		}
+	}
+	kind, snapshot, revision, err := submissionNode(ctx, tx, args.NodeID)
+	if err != nil {
+		return generationRequest{}, err
+	}
+	if args.ExpectedRevision != nil && *args.ExpectedRevision != revision {
+		return generationRequest{}, revisionConflict
+	}
+	if kind == "video" && r.Action == "submit" {
+		if err := checkAutomaticVideoDraft(ctx, tx, snapshot, workflowRef{ID: args.NodeID, Revision: revision}); err != nil {
+			return generationRequest{}, err
+		}
+	}
+	input, pinned, sourceIDs, err := generationInput(ctx, tx, p.dir, args.NodeID, kind, snapshot)
+	if err != nil {
+		return generationRequest{}, err
+	}
+	if expectedMode != "" && (input.Type != "video" || input.Mode != expectedMode) {
+		return generationRequest{}, invalid("当前视频节点的生成方式与请求不匹配")
+	}
+	if providers == nil {
+		return generationRequest{}, providerUnavailable
+	}
+	id := args.ProfileID
+	if id == "" {
+		id = pinned
+	}
+	input.providerVersion = providerVersion
+	prepare := providers.Prepare
+	if settings, ok := providers.(*ProviderSettings); ok {
+		prepare = settings.prepareLocked
+	}
+	if err := prepare(&input, id); err != nil {
+		return generationRequest{}, err
+	}
+	group, err := readSourceGroup(ctx, tx, args.NodeID)
+	if err != nil {
+		return generationRequest{}, err
+	}
+	request := generationRequest{GenerationInput: input, SourceGroup: &group, SourceNodeIDs: sourceIDs,
+		SourceNodeRevision: revision, ManualConfirmation: r.Action != "submit"}
+	if kind == "video" {
+		request.VideoInputContract = videoInputContractVersion
+	}
+	return request, nil
 }
 
 func submissionNode(ctx context.Context, tx *sql.Tx, id string) (kind, snapshot string, revision int64, err error) {
