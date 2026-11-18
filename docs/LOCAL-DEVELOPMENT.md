@@ -1,5 +1,7 @@
 # Windows 本地开发
 
+> 本页面向源码开发与候选包维护。已持有插件包的创作者可直接使用[安装指南](user/installation.md)。
+
 ## 首次准备
 
 使用 Windows x64、Node.js 24 或更新版本及其 npm、Go 1.25 或更新版本。首次安装运行时和构建依赖需要访问 npm registry。项目本地使用 DSH `0.2.1-rc.3` 和 pnpm `11.25.0`。DSH 在首次链接插件时会调用 pnpm。

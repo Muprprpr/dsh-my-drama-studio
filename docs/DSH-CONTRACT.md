@@ -1,5 +1,7 @@
 # DSH 契约审计
 
+> 本页保留项目起步时的仓库审计及后续 DSH rc.3 契约核对。文中原 README 的渠道与模型设置现见[模型与视频渠道](user/models-and-providers.md)。
+
 - 目标仓库只有 README、LICENSE 和本地任务书，未发现插件骨架、Go 模块或启动脚本。保留原有 `.gitignore` 的 `/task` 规则。
 - 实际 Windows launcher 为 DeepSeek Harness 安装目录下的 `resources/runtime/cli/bin/dsh.cmd`。`--version` 返回 `0.2.1-rc.3`。该脚本通过 Electron 的 Node 模式启动安装包内 `@deepseek-ai/dsh-desktop-host/lib/cli.js`。相邻源码仓库 HEAD 是 `fcc0ad4621`，已合并 0.2.2-rc.1。源码核查固定在 `dsh-v0.2.1-rc.3` 标签。
 - Web 入口使用 `dsh web --patch <patch> --host 127.0.0.1 --port <port>`。外部绝对路径 overlay 以已安装 CLI 启动。Host ESM 导出 `apply(ctx)`，Browser 由 `exports["./client"]` 和 `dsh.client.platform=web` 声明，工件调用 `window.__ModuleLoader__.load({id,factory(require)})`。React、React JSX Runtime 和 React DOM 使用壳内共享实例。参见同版本 `docs/subsystems/client-modules.md`、`packages/client/modules/README.md`、`apps/web/tests/fixtures/plugins/fixture-input-extension`。

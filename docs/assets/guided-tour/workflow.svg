@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 70" width="840" height="70" role="img" aria-labelledby="title desc">
+  <title id="title">从创意到成片验收的内置制作流程</title>
+  <desc id="desc">把创意写成拍摄脚本，拆分镜并生成镜头，再逐镜回看、确认成片验收包。</desc>
+  <style>
+    .signal { opacity: 0; }
+    @media (prefers-reduced-motion: no-preference) {
+      .signal { animation: travel 1.7s ease-in-out 2; }
+      .second { animation-delay: .76s; }
+    }
+    @keyframes travel {
+      0% { transform: translateX(0); opacity: 0; }
+      15% { opacity: 1; }
+      68% { transform: translateX(60px); opacity: 1; }
+      85%, 100% { transform: translateX(60px); opacity: 0; }
+    }
+  </style>
+  <rect x="1" y="1" width="838" height="68" rx="15" fill="#23314b" stroke="#53627a"/>
+  <g fill="none" stroke="#9eacbf" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M226 35h73l-7-5m7 5-7 5m215-5h73l-7-5m7 5-7 5"/>
+  </g>
+  <g fill="#ffd79a"><circle class="signal" cx="232" cy="35" r="3.5"/><circle class="signal second" cx="513" cy="35" r="3.5"/></g>
+  <g fill="none" stroke="#f4c38a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M34 20h21v29H34zm5 8h11m-11 6h11m-11 7h6"/>
+    <path d="M325 23h30v24h-30zm3 20 8-9 5 5 5-7 7 11"/><circle cx="334" cy="29" r="1.8"/>
+    <rect x="611" y="23" width="31" height="24" rx="4"/><path d="m623 29 9 6-9 6z"/>
+  </g>
+  <g font-family="system-ui, 'Microsoft YaHei', sans-serif" font-size="23" font-weight="600" fill="#fff5e6">
+    <text x="68" y="43">创意与脚本</text><text x="367" y="43">分镜与生成</text><text x="655" y="43">成片验收</text>
+  </g>
+</svg>

@@ -1,5 +1,7 @@
 # Drama Canvas UI/UX V2
 
+> 本页保留 UI/UX V2 当时的验收及原始截图。当前操作请看[画布与镜头生成](user/canvas.md)，新版截图见[素材说明](assets/README.md)。
+
 本文 U0–U5 记录 UI/UX V2 当时的验收。当前人工原位编辑与删除权限见 [工程架构](ARCHITECTURE.md)。显式派生仍可追加新版本。
 
 ## U0 实际审计

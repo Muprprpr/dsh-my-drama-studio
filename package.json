@@ -10,6 +10,7 @@
     "dist/client.js",
     "dist/host.js",
     "dist/studio.exe",
+    "docs/",
     "dsh.bundle.patch",
     "resources/manifest.json",
     "resources/skills",
